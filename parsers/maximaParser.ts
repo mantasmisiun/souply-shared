@@ -620,13 +620,36 @@ function parseFooter(lines: MaximaLine[]): MaximaFooter {
       if (mok) total = parseNum(mok[1]);
     }
 
-    // Data ir laikas 2026-04-04 14:49:30
-    const dtMatch = text.match(
-      /Data\s+ir\s+laikas\s+(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})/i
+    // Receipt datetime. Maxima prints this several ways depending on
+    // the POS template + OCR noise:
+    //   `Data ir laikas 2026-04-04 14:49:30`       (canonical)
+    //   `LAIKAS 2026-04-04 18:15:30`               (shorter template)
+    //   `2026-04-15 18:15:30 LAIKAS`               (OCR reversed order)
+    //   `2026-04-24 12:44:55 +****5775`            (bare, on the card row)
+    //
+    // Match broadly: any `YYYY-MM-DD HH:MM:SS` tuple on a line that
+    // also mentions `LAIKAS` / `Data ir laikas`, OR — as a fallback
+    // when the label is missing — take the FIRST bare timestamp in
+    // the footer. Prefer the labelled form if both exist (LAIKAS line
+    // is the transaction time; bare timestamps may be receipt-check
+    // stamps that differ by seconds-to-days).
+    const labelledDt = text.match(
+      /(?:LAIKAS|Data\s+ir\s+laikas)[^\d]*(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})/i,
     );
-    if (dtMatch) {
-      date = dtMatch[1];
-      time = dtMatch[2];
+    const reversedDt = text.match(
+      /(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})\s+(?:LAIKAS|Data\s+ir\s+laikas)/i,
+    );
+    const bareDt = text.match(/(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})/);
+    // Priority: labelled → reversed-labelled → bare (only if nothing else found).
+    if (labelledDt) {
+      date = labelledDt[1];
+      time = labelledDt[2];
+    } else if (reversedDt) {
+      date = reversedDt[1];
+      time = reversedDt[2];
+    } else if (!date && bareDt) {
+      date = bareDt[1];
+      time = bareDt[2];
     }
 
     // Kvito Nr. 363753  — single number, possibly followed by more tokens.
