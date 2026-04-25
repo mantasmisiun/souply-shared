@@ -652,9 +652,28 @@ function parseFooter(lines: MaximaLine[]): MaximaFooter {
       time = bareDt[2];
     }
 
-    // Kvito Nr. 363753  — single number, possibly followed by more tokens.
-    const nrMatch = text.match(/Kvito\s+Nr\.?\s+(\S+)/i);
-    if (nrMatch && !receiptNo) receiptNo = nrMatch[1];
+    // Receipt number. Three sources, in priority order:
+    //   1. `Kvito Nr. 363753` on one line (canonical).
+    //   2. `Kvito Nr.` label + digits on the NEXT line (OCR often
+    //      splits the label from the value when the print is wide).
+    //   3. `Dokumento numeris: 8107` in the VMI verification section
+    //      — universal fallback present on every Maxima receipt.
+    if (!receiptNo) {
+      const sameLine = text.match(/Kvito\s+Nr\.?\s+(\S+)/i);
+      if (sameLine) {
+        receiptNo = sameLine[1];
+      } else if (/^Kvito\s+Nr\.?\s*$/i.test(text) && i + 1 < lines.length) {
+        // Label alone on this line — grab first non-empty token from
+        // the next line. Must be digit-ish to avoid consuming noise.
+        const next = lines[i + 1].text.trim();
+        const digits = next.match(/^(\d{3,})/);
+        if (digits) receiptNo = digits[1];
+      }
+    }
+    if (!receiptNo) {
+      const docMatch = text.match(/Dokumento\s+numeris:?\s*(\S+)/i);
+      if (docMatch) receiptNo = docMatch[1];
+    }
 
     // Sutaupėte 13,40
     if (/sutaup[eėè]te/i.test(text)) {
