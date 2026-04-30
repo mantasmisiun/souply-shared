@@ -154,13 +154,13 @@ const DISCOUNT_HEADER_RE = /(?:nuo\s*la\s*ida\s+prekei|sutaup[eė]t)/i;
 // gender plurals (`depozitiniai` / `depozitinės`). Missing this
 // caused burger-patty rows to absorb the PET deposit header as their
 // name prefix.
-const DEPOSIT_LINE_RE = /\b(?:pet|skardin[eė])\s*\(depozitin[eėi][sa]?[is]?\)/i;
+export const DEPOSIT_LINE_RE = /\b(?:pet|skardin[eė])\s*\(depozitin[eėi][sa]?[is]?\)/i;
 // Checkout-only non-catalog items: disposable bags (maišelis) and
 // reusable shopping bags (maišas — "Didelis pirkinių maišas MAXIMA").
 // Charged per piece but not products a shopper "buys" in the price-
 // comparison sense. Treated like deposits — stop walk-back on them
 // and skip them if they end up as a row's name.
-const NON_CATALOG_LINE_RE = /\b(?:vienkartinis|didelis|pirkini[uų])?\s*(?:plastikinis|popierinis)?\s*mai[sš](?:elis|as)\b/i;
+export const NON_CATALOG_LINE_RE = /\b(?:vienkartinis|didelis|pirkini[uų])?\s*(?:plastikinis|popierinis)?\s*mai[sš](?:elis|as)\b/i;
 
 // ───────── helpers ─────────
 
@@ -587,7 +587,7 @@ function parseProducts(lines: MaximaLine[]): MaximaProduct[] {
   return products;
 }
 
-function cleanProductName(name: string): string {
+export function cleanProductName(name: string): string {
   let cleaned = name;
   cleaned = cleaned.replace(/,?\s*\d+[\.,]?\d*\s*(g|kg|ml|l|vnt\.?)\s*$/i, "").trim();
   cleaned = cleaned.replace(/,\s*$/, "").trim();

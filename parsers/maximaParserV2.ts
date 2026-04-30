@@ -4,15 +4,15 @@
  * V2 splits parsing into TWO independent steps so each can be
  * inspected and refined without mixing concerns:
  *
- *   STEP 1 — Band detection (this file's only export today).
- *     Locate the y-coordinate boundaries between products in the
- *     receipt. The output is a list of contiguous vertical bands
- *     covering the products region. Each band fully owns ALL the
- *     receipt lines for one product: the price, the unit-qty row,
- *     every discount line, and any PET-deposit block that follows
- *     the product. Bands are exactly contiguous —
- *     `bands[i].yBottom === bands[i+1].yTop` — so the visualiser
- *     shows clean dividers with no gaps.
+ *   STEP 1 — Band detection + line classification.
+ *     `findProductBandsV2` returns `{ bands, internals }`:
+ *       - `bands[]` carries the y-coord boundaries between products
+ *         (contiguous: `bands[i].yBottom === bands[i+1].yTop`) for
+ *         the visual overlay and image cropping.
+ *       - `internals[]` carries each band's typed line content —
+ *         the anchor row, pre-anchor name fragments, and every
+ *         post-anchor line tagged with its role (unit-qty,
+ *         discount-label, deposit-name, taisymas-*, same-row, …).
  *
  *     Boundary set produced for N detected products:
  *       y0 = midpoint between the last header line and the first
@@ -22,24 +22,35 @@
  *       yN = midpoint between the last product line and the first
  *            footer line (= bands[N-1].yBottom)
  *
- *   STEP 2 — Per-band content extraction (NOT YET IMPLEMENTED).
- *     A separate parser will run between each band's (yTop, yBottom)
- *     and produce the structured product (name, price, promoPrice,
- *     quantity, unit, etc.) without considering anything outside the
- *     band. Step 2's strategy (re-OCR the crop vs. use the existing
- *     OCR slice) will live there, not here.
+ *   STEP 2 — Per-band content extraction (consumes `internals`).
+ *     Converts each `BandInternal` into a `MaximaProduct` (name,
+ *     price, promoPrice, quantity, unit, etc.) without touching
+ *     OCR data outside the band. Lives in a sibling module that
+ *     reads the typed entries directly — no string parsing of the
+ *     trace dump, no re-classification.
  *
  * Splitting like this lets us debug each phase visually: if step 1's
  * boundaries are wrong, the band rectangles drawn over the receipt
  * image will be in the wrong place; if step 2's extraction is wrong,
  * the rectangles are right but the parsed fields are not.
+ *
+ * `traceProductBandsV2` renders the same `internals` data as a
+ * paste-friendly text dump — the trace and step 2 can never
+ * disagree about a line's role.
  */
 
 import {
     splitMergedLines,
     findHeaderEnd,
     regionOf,
+    parseNum,
+    cleanProductName,
+    parseHeader,
+    parseFooter,
+    NON_CATALOG_LINE_RE,
     type MaximaLine,
+    type MaximaProduct,
+    type MaximaParseResult,
 } from './maximaParser.js';
 
 // ───────── regexes ─────────
@@ -421,29 +432,30 @@ function extendBand(
  * absorbed deposits (whose price line is itself a positive-price
  * anchor) NOT spawn a duplicate band.
  *
- * If `eventsPerBand` is supplied, each band's extension events are
- * appended as a fresh array (1:1 with the returned bands).
+ * `eventsPerBand` is appended in lockstep with the returned bands —
+ * every band's extension events are recorded so step 2 (per-band
+ * content extraction) and the trace dump can both read the same
+ * underlying classification without re-running extension.
  */
 function buildBands(
     lines: MaximaLine[],
-    eventsPerBand?: { sliceIdx: number; reason: TraceReason }[][],
+    eventsPerBand: { sliceIdx: number; reason: TraceReason }[][],
 ): InternalBand[] {
     const anchorIndices = findAnchors(lines);
     const bands: InternalBand[] = [];
     let coveredUpTo = -1;
     for (const anchorIdx of anchorIndices) {
         if (anchorIdx <= coveredUpTo) continue;
-        const events: { sliceIdx: number; reason: TraceReason }[] | undefined =
-            eventsPerBand ? [] : undefined;
+        const events: { sliceIdx: number; reason: TraceReason }[] = [];
         const lastIdx = extendBand(lines, anchorIdx, events);
         bands.push({ anchorIdx, lastIdx });
-        if (eventsPerBand && events) eventsPerBand.push(events);
+        eventsPerBand.push(events);
         coveredUpTo = lastIdx;
     }
     return bands;
 }
 
-// ───────── public API: step 1 only ─────────
+// ───────── public API ─────────
 
 export interface ProductBand {
     /**
@@ -456,19 +468,76 @@ export interface ProductBand {
     yBottom: number;
 }
 
-export interface ReceiptBandPlan {
-    /** Bands covering the products region, in y-order. */
-    bands: ProductBand[];
+/**
+ * One classified line inside a band. `sliceIdx` is the line's
+ * position in the products slice (after `splitMergedLines` +
+ * header strip), included so callers can cross-reference against
+ * the trace dump.
+ */
+export interface BandLineEntry {
+    line: MaximaLine;
+    sliceIdx: number;
+    reason: TraceReason;
 }
 
 /**
- * Step 1: find product band boundaries. Pure (no I/O), so safe on
- * any platform. Bands are made contiguous and the first/last bands
- * are extended to the header/footer dividers so consumers can use
- * `(yTop, yBottom)` directly as a crop region.
+ * Per-band typed content. Step 2 (per-band content extraction)
+ * reads from these directly: name from `preName` + `postAnchor`
+ * entries tagged `same-row`, price from `anchor`, unit-qty from
+ * the matching `postAnchor` entry, etc. The trace dump iterates
+ * the same data to render its line-by-line view, so step 1's
+ * classification is the single source of truth.
  */
-export function findProductBandsV2(lines: MaximaLine[]): ReceiptBandPlan {
-    const processed = splitMergedLines(lines);
+export interface BandInternal {
+    /** 0-based; matches the index in `bands`. Visual band number = bandIdx + 1. */
+    bandIdx: number;
+    /** Positive-price line that anchored this band. */
+    anchor: BandLineEntry;
+    /** Name fragments appearing before the anchor, in slice order. */
+    preName: BandLineEntry[];
+    /**
+     * Lines absorbed downward from the anchor, in slice order.
+     * Excludes the terminal stop sentinel (carried separately on
+     * `stop` so consumers know what *would-have-been* the next
+     * line if extension hadn't stopped).
+     */
+    postAnchor: BandLineEntry[];
+    /** Why extension stopped + which slice idx caused it. */
+    stop: {
+        sliceIdx: number;
+        reason: 'stop-next-anchor' | 'stop-footer-sep' | 'stop-end-of-input';
+    };
+}
+
+export interface ReceiptBandPlan {
+    /** Bands covering the products region, in y-order. */
+    bands: ProductBand[];
+    /** Per-band typed content, 1:1 with `bands`. */
+    internals: BandInternal[];
+}
+
+/**
+ * Internal context object — carries everything the public API and
+ * the trace dump need without re-running `splitMergedLines` /
+ * `findHeaderEnd` / band detection twice.
+ */
+interface BandsContext {
+    processed: MaximaLine[];
+    headerEnd: number;
+    footerStart: number;
+    productSlice: MaximaLine[];
+    bands: ProductBand[];
+    internals: BandInternal[];
+}
+
+/**
+ * Run the full step-1 pipeline (split → header/footer detect →
+ * anchor → extend → boundary smoothing) and produce both the
+ * y-coord band list and the per-band typed content. All public
+ * entry points delegate here so the work happens exactly once.
+ */
+function computeBandsContext(rawLines: MaximaLine[]): BandsContext {
+    const processed = splitMergedLines(rawLines);
     const headerEnd = findHeaderEnd(processed);
     const footerStart = findFooterStartV2(processed, headerEnd);
     const productSlice = processed.slice(headerEnd, footerStart);
@@ -486,8 +555,11 @@ export function findProductBandsV2(lines: MaximaLine[]): ReceiptBandPlan {
         bottomBoundY = (processed[footerStart - 1].yBottom + processed[footerStart].yTop) / 2;
     }
 
-    const internalBands = buildBands(productSlice);
+    const eventsPerBand: { sliceIdx: number; reason: TraceReason }[][] = [];
+    const internalBands = buildBands(productSlice, eventsPerBand);
+
     const bands: ProductBand[] = [];
+    const internals: BandInternal[] = [];
     for (let bi = 0; bi < internalBands.length; bi++) {
         const band = internalBands[bi];
         // Lines before the first anchor are loose name fragments —
@@ -497,6 +569,38 @@ export function findProductBandsV2(lines: MaximaLine[]): ReceiptBandPlan {
         const bandLines = productSlice.slice(sliceStart, band.lastIdx + 1);
         const region = regionOf(bandLines);
         bands.push({ yTop: region.yTop, yBottom: region.yBottom });
+
+        const events = eventsPerBand[bi];
+        const preName: BandLineEntry[] = [];
+        for (let k = sliceStart; k < band.anchorIdx; k++) {
+            preName.push({ line: productSlice[k], sliceIdx: k, reason: 'name' });
+        }
+        const stopEv = events.find(
+            (e) => e.reason === 'stop-next-anchor' || e.reason === 'stop-footer-sep',
+        );
+        const postAnchor: BandLineEntry[] = events
+            .filter((e) => e.reason !== 'stop-next-anchor' && e.reason !== 'stop-footer-sep')
+            .map((e) => ({ line: productSlice[e.sliceIdx], sliceIdx: e.sliceIdx, reason: e.reason }));
+        const stop = stopEv
+            ? {
+                  sliceIdx: stopEv.sliceIdx,
+                  reason: stopEv.reason as 'stop-next-anchor' | 'stop-footer-sep',
+              }
+            : {
+                  sliceIdx: productSlice.length,
+                  reason: 'stop-end-of-input' as const,
+              };
+        internals.push({
+            bandIdx: bi,
+            anchor: {
+                line: productSlice[band.anchorIdx],
+                sliceIdx: band.anchorIdx,
+                reason: 'anchor',
+            },
+            preName,
+            postAnchor,
+            stop,
+        });
     }
 
     // Make adjacent bands share an exact divider, and extend the
@@ -511,7 +615,21 @@ export function findProductBandsV2(lines: MaximaLine[]): ReceiptBandPlan {
         if (bottomBoundY !== undefined) bands[bands.length - 1].yBottom = bottomBoundY;
     }
 
-    return { bands };
+    return { processed, headerEnd, footerStart, productSlice, bands, internals };
+}
+
+/**
+ * Step 1: find product band boundaries + per-band typed content.
+ * Pure (no I/O), so safe on any platform. Bands are made contiguous
+ * and the first/last bands are extended to the header/footer
+ * dividers so consumers can use `(yTop, yBottom)` directly as a
+ * crop region. `internals` carries the same line-level
+ * classification the trace dump renders, so step 2 doesn't need to
+ * re-derive it.
+ */
+export function findProductBandsV2(lines: MaximaLine[]): ReceiptBandPlan {
+    const ctx = computeBandsContext(lines);
+    return { bands: ctx.bands, internals: ctx.internals };
 }
 
 // ───────── diagnostic trace (dev tool) ─────────
@@ -533,23 +651,21 @@ const fmtY = (line: MaximaLine): string =>
  * "band 4 is wrong", finding the offending row is a single visual
  * scan of the trace.
  *
+ * Reads from `computeBandsContext` so the classification the trace
+ * shows is byte-for-byte the same one step 2 sees in `internals`.
+ *
  * Pure: no console.log inside; the caller decides what to do with
  * the returned string.
  */
 export function traceProductBandsV2(rawLines: MaximaLine[]): string {
-    const processed = splitMergedLines(rawLines);
-    const headerEnd = findHeaderEnd(processed);
-    const footerStart = findFooterStartV2(processed, headerEnd);
-    const productSlice = processed.slice(headerEnd, footerStart);
-
-    const eventsPerBand: { sliceIdx: number; reason: TraceReason }[][] = [];
-    const internal = buildBands(productSlice, eventsPerBand);
+    const ctx = computeBandsContext(rawLines);
+    const { processed, headerEnd, footerStart, productSlice, internals } = ctx;
 
     const out: string[] = [];
     out.push(
         `lines: total=${rawLines.length} afterSplit=${processed.length} ` +
             `headerEnd=${headerEnd} footerStart=${footerStart} ` +
-            `productSlice=[${headerEnd}..${footerStart}) bands=${internal.length}`,
+            `productSlice=[${headerEnd}..${footerStart}) bands=${internals.length}`,
     );
     if (headerEnd > 0) {
         const lastHeader = processed[headerEnd - 1];
@@ -561,33 +677,18 @@ export function traceProductBandsV2(rawLines: MaximaLine[]): string {
     }
     out.push('');
 
-    // Build a per-line tag map so we can render the slice in order
-    // and show every line's role exactly once.
+    // Build a per-line tag map directly from internals so the
+    // trace and step 2 can never disagree about a line's role.
     type Tag = { bandIdx1: number; reason: TraceReason };
     const tags = new Map<number, Tag>();
-    for (let bi = 0; bi < internal.length; bi++) {
-        const band = internal[bi];
-        const bandIdx1 = bi + 1;
-
-        // Pre-anchor "name" lines: indices between previous band's
-        // lastIdx+1 (or 0 for band 0) and this band's anchorIdx.
-        const nameStart = bi === 0 ? 0 : internal[bi - 1].lastIdx + 1;
-        for (let k = nameStart; k < band.anchorIdx; k++) {
-            tags.set(k, { bandIdx1, reason: 'name' });
-        }
-        tags.set(band.anchorIdx, { bandIdx1, reason: 'anchor' });
-        for (const ev of eventsPerBand[bi]) {
-            // The terminal stop event's sliceIdx points at the line
-            // that *caused* the stop — that line belongs to the next
-            // band's "name" range, NOT this one. Don't tag it here.
-            if (ev.reason === 'stop-next-anchor' || ev.reason === 'stop-footer-sep') continue;
-            tags.set(ev.sliceIdx, { bandIdx1, reason: ev.reason });
-        }
+    for (const band of internals) {
+        const bandIdx1 = band.bandIdx + 1;
+        for (const e of band.preName) tags.set(e.sliceIdx, { bandIdx1, reason: e.reason });
+        tags.set(band.anchor.sliceIdx, { bandIdx1, reason: band.anchor.reason });
+        for (const e of band.postAnchor) tags.set(e.sliceIdx, { bandIdx1, reason: e.reason });
     }
 
-    // Render the slice. Untagged lines are surprising — they only
-    // appear if there are no anchors at all (no products detected).
-    if (internal.length === 0) {
+    if (internals.length === 0) {
         out.push('NO ANCHORS FOUND. All product-region lines:');
         for (let i = 0; i < productSlice.length; i++) {
             const ln = productSlice[i];
@@ -610,22 +711,310 @@ export function traceProductBandsV2(rawLines: MaximaLine[]): string {
         }
         if (tag.bandIdx1 !== currentBand) {
             currentBand = tag.bandIdx1;
-            const band = internal[currentBand - 1];
-            const stopEv = eventsPerBand[currentBand - 1].find(
-                (e) => e.reason === 'stop-next-anchor' || e.reason === 'stop-footer-sep',
-            );
-            const stopReason = stopEv ? stopEv.reason : 'stop-end-of-input';
-            const stopAt = stopEv ? stopEv.sliceIdx : productSlice.length;
+            const band = internals[currentBand - 1];
+            const lastIdx = band.postAnchor.length > 0
+                ? band.postAnchor[band.postAnchor.length - 1].sliceIdx
+                : band.anchor.sliceIdx;
             out.push('');
             out.push(
-                `── band ${currentBand}: anchor=slice[${band.anchorIdx}] ` +
-                    `lastIdx=slice[${band.lastIdx}] ` +
-                    `${stopReason}=slice[${stopAt}]`,
+                `── band ${currentBand}: anchor=slice[${band.anchor.sliceIdx}] ` +
+                    `lastIdx=slice[${lastIdx}] ` +
+                    `${band.stop.reason}=slice[${band.stop.sliceIdx}]`,
             );
         }
         out.push(
             `  slice[${i}] ${fmtY(ln)} reason=${tag.reason} band=${tag.bandIdx1} "${TRUNC(ln.text)}"`,
         );
+    }
+    return out.join('\n');
+}
+
+// ───────── step 2: per-band content extraction ─────────
+
+/**
+ * Outcome of running step 2 on a single band. `product` is null
+ * when the band represents something we don't surface as a
+ * shopping-cart product (deposits, plastic bags, TAISYMAS refunds)
+ * OR when the anchor couldn't be parsed at all. `warnings` is
+ * always populated for skipped bands (the skip reason) and may
+ * also carry diagnostic notes on emitted products (relaxed-anchor
+ * fallback, unit-qty regex miss, reconcile mismatch).
+ */
+export interface ExtractResult {
+    product: MaximaProduct | null;
+    warnings: string[];
+}
+
+const RECONCILE_TOLERANCE_EUR = 0.02;
+
+/**
+ * Convert one classified band into a `MaximaProduct` (or skip it).
+ *
+ * Inputs come from step 1's `BandInternal` — anchor + name fragments
+ * + post-anchor lines, all already tagged with reasons. Step 2's job
+ * is purely field extraction: regex out the numeric/string content
+ * and check the receipt's own arithmetic for sanity.
+ *
+ * Skips:
+ *   - any band whose `postAnchor` contains a `taisymas-*` event
+ *     (refund, net-zero — drop the line)
+ *   - any band whose joined name reduces to a non-catalog or
+ *     deposit-only string (plastic bag, "PET (depozitinis)" alone)
+ *
+ * Reconcile self-check:
+ *   For bands with an extracted unit-qty, verifies that
+ *   `pricePerUnit × quantity ≈ price` (tolerance €0.02). Mismatch
+ *   surfaces a warning with the full math so the operator can
+ *   eyeball which factor went wrong (qty? ppu? price?). Warning
+ *   is informational — the product is still emitted.
+ */
+export function extractMaximaProduct(internal: BandInternal): ExtractResult {
+    const warnings: string[] = [];
+
+    // TAISYMAS refund: net zero, drop.
+    const hasTaisymas = internal.postAnchor.some(
+        (e) =>
+            e.reason === 'taisymas-header' ||
+            e.reason === 'taisymas-name' ||
+            e.reason === 'taisymas-amount' ||
+            e.reason === 'taisymas-qty',
+    );
+    if (hasTaisymas) {
+        const refundedName = internal.preName.map((e) => e.line.text).join(' ').trim();
+        return {
+            product: null,
+            warnings: [`skip:taisymas-refund "${refundedName.slice(0, 60)}"`],
+        };
+    }
+
+    // Price from anchor. Strict form first, relaxed (no A/B) as
+    // fallback so the few OCR-dropped-letter receipts still produce
+    // a price — but flag the fallback so it's visible.
+    const anchorText = internal.anchor.line.text.trim();
+    let price: number;
+    const strictPriceMatch = anchorText.match(STANDALONE_PRICE_RE);
+    if (strictPriceMatch) {
+        price = parseNum(strictPriceMatch[1]);
+    } else if (RELAXED_PRICE_RE.test(anchorText)) {
+        price = parseNum(anchorText);
+        warnings.push(`anchor RELAXED form "${anchorText}" → ${price.toFixed(2)}`);
+    } else {
+        return {
+            product: null,
+            warnings: [`skip:anchor-parse-failed "${anchorText}"`],
+        };
+    }
+
+    // Name = pre-anchor fragments + same-row continuations that
+    // appear BEFORE any deposit-name on this band. A `same-row`
+    // event after a deposit-name is the deposit's right-column
+    // total ("0,10"), not a name continuation — exclude it.
+    const nameLineEntries: BandLineEntry[] = [...internal.preName];
+    let depositSeen = false;
+    for (const e of internal.postAnchor) {
+        if (e.reason === 'deposit-name') {
+            depositSeen = true;
+            continue;
+        }
+        if (e.reason === 'same-row' && !depositSeen) {
+            nameLineEntries.push(e);
+        }
+    }
+    const rawName = nameLineEntries.map((e) => e.line.text).join(' ').trim();
+
+    // Non-catalog filter — plastic bags, deposit-only entries.
+    if (NON_CATALOG_LINE_RE.test(rawName)) {
+        return {
+            product: null,
+            warnings: [`skip:non-catalog "${rawName.slice(0, 60)}"`],
+        };
+    }
+    if (DEPOSIT_LINE_RE.test(rawName)) {
+        return {
+            product: null,
+            warnings: [`skip:deposit-only "${rawName.slice(0, 60)}"`],
+        };
+    }
+
+    const name = cleanProductName(rawName);
+
+    // Unit-qty extraction: strict form first (carries unit), then
+    // the unit-less fallback. If the band had a `unit-qty` event
+    // but neither regex matches the line text, that's a step-1/step-2
+    // disagreement worth surfacing — the band absorption rule
+    // accepted the line but the field-extraction regex didn't.
+    let pricePerUnit: number | null = null;
+    let quantity = 1;
+    let unit = 'vnt';
+    const unitQtyEntry = internal.postAnchor.find((e) => e.reason === 'unit-qty');
+    if (unitQtyEntry) {
+        const text = unitQtyEntry.line.text;
+        const strictMatch = text.match(UNIT_QTY_RE);
+        if (strictMatch) {
+            pricePerUnit = parseNum(strictMatch[1]);
+            quantity = parseNum(strictMatch[2]);
+            const rawUnit = strictMatch[3].toLowerCase();
+            // Normalize OCR variants: `kq`/`ka` → `kg`, `maišš.` → `maiš`,
+            // `pakel.` → `pak`, anything else → `vnt`.
+            if (rawUnit.startsWith('k')) unit = 'kg';
+            else if (rawUnit.startsWith('mai')) unit = 'maiš';
+            else if (rawUnit.startsWith('pak')) unit = 'pak';
+            else unit = 'vnt';
+        } else {
+            const noUnitMatch = text.match(UNIT_QTY_NOUNIT_RE);
+            if (noUnitMatch) {
+                pricePerUnit = parseNum(noUnitMatch[1]);
+                quantity = parseNum(noUnitMatch[2]);
+                unit = 'vnt';
+            } else {
+                warnings.push(
+                    `unit-qty tag present but no regex matched: "${text}"`,
+                );
+            }
+        }
+    }
+
+    // promoPrice from the first discount/neg event we see. The
+    // signed amount is the savings; promoPrice = price - |amount|.
+    let promoPrice: number | null = null;
+    for (const e of internal.postAnchor) {
+        if (e.reason === 'discount-amount' || e.reason === 'bare-negative') {
+            const m = e.line.text.trim().match(NEG_AMOUNT_RE);
+            if (m) {
+                const amount = parseNum(m[1]);
+                promoPrice = Math.round((price - amount) * 100) / 100;
+                break;
+            }
+        }
+        if (e.reason === 'inline-discount') {
+            const m = e.line.text.match(INLINE_NEG_AMOUNT_RE);
+            if (m) {
+                const amount = parseNum(m[1]);
+                promoPrice = Math.round((price - amount) * 100) / 100;
+                break;
+            }
+        }
+    }
+
+    // Reconcile self-check on bands that have an extracted unit-qty.
+    // Receipt's own arithmetic: `ppu × qty` should match the printed
+    // line price. Mismatch beyond €0.02 means OCR scrambled one of
+    // the three numbers — log it but still emit the product.
+    if (pricePerUnit !== null) {
+        const expected = pricePerUnit * quantity;
+        const delta = Math.abs(expected - price);
+        if (delta > RECONCILE_TOLERANCE_EUR) {
+            warnings.push(
+                `reconcile MISMATCH: ppu=${pricePerUnit.toFixed(2)} × qty=${quantity} = ` +
+                    `${expected.toFixed(2)} but price=${price.toFixed(2)} (Δ=${delta.toFixed(2)})`,
+            );
+        }
+    }
+
+    // Stitch raw lines + bbox region for downstream consumers.
+    const allEntries: BandLineEntry[] = [
+        ...internal.preName,
+        internal.anchor,
+        ...internal.postAnchor,
+    ];
+    const allLines = allEntries.map((e) => e.line);
+    const region = regionOf(allLines);
+    const rawLines = allLines.map((l) => l.text);
+
+    const product: MaximaProduct = {
+        name,
+        price,
+        promoPrice,
+        quantity,
+        unit,
+        pricePerUnit,
+        rawLines,
+        region,
+    };
+    return { product, warnings };
+}
+
+/**
+ * V2's full-receipt parser. Matches V1's `parseMaximaReceipt`
+ * shape so callers can drop V2 in without changing downstream
+ * code (matching service, comparison harness, etc.).
+ *
+ * Header and footer reuse V1's parsers verbatim — V2 owns only
+ * the products array. Step 1 (band detection) and step 2
+ * (per-band content extraction) feed the products field; bands
+ * that resolve to deposits, plastic bags, or TAISYMAS refunds
+ * are silently dropped to match what truth files contain.
+ */
+export function parseMaximaReceiptV2(rawLines: MaximaLine[]): MaximaParseResult {
+    const ctx = computeBandsContext(rawLines);
+    const header = parseHeader(ctx.processed.slice(0, ctx.headerEnd));
+    const footer = parseFooter(ctx.processed.slice(ctx.footerStart));
+    const products: MaximaProduct[] = [];
+    for (const internal of ctx.internals) {
+        const { product } = extractMaximaProduct(internal);
+        if (product) products.push(product);
+    }
+    return { header, products, footer };
+}
+
+/**
+ * Per-band extraction trace, copy-paste-friendly. Companion to
+ * `traceProductBandsV2` for step 2 — same band ordering, one row
+ * per band, with the extracted product fields and the reconcile
+ * status inline so a single glance spots arithmetic drift.
+ *
+ * Format conventions:
+ *   - `OK`/`WARN`/`SKIP` prefix per band
+ *   - `reconcile:✓` or `reconcile:✗ Δ=X` for bands with unit-qty
+ *   - `reconcile:n/a` for single-pack non-weighable rows
+ *   - Multiple warnings on one band print on extra indented lines
+ */
+export function traceMaximaExtractV2(rawLines: MaximaLine[]): string {
+    const ctx = computeBandsContext(rawLines);
+    const out: string[] = [];
+    out.push(`bands=${ctx.internals.length}`);
+    for (const internal of ctx.internals) {
+        const bandNum = internal.bandIdx + 1;
+        const { product, warnings } = extractMaximaProduct(internal);
+        const skipMsg = warnings.find((w) => w.startsWith('skip:'));
+        if (!product) {
+            // Skip + maybe additional warnings.
+            const skip = skipMsg ?? 'no product emitted';
+            out.push(`band ${bandNum}: SKIP ${skip}`);
+            for (const w of warnings) {
+                if (w === skipMsg) continue;
+                out.push(`        WARN ${w}`);
+            }
+            continue;
+        }
+        // Reconcile state derived from warnings — the extractor
+        // already computed it, no need to redo the math.
+        const mismatch = warnings.find((w) => w.startsWith('reconcile MISMATCH'));
+        let reconcile: string;
+        if (product.pricePerUnit === null) {
+            reconcile = 'reconcile:n/a';
+        } else if (mismatch) {
+            const expected = (product.pricePerUnit * product.quantity).toFixed(2);
+            const delta = Math.abs(product.pricePerUnit * product.quantity - product.price).toFixed(2);
+            reconcile =
+                `reconcile:${product.pricePerUnit.toFixed(2)}×${product.quantity}=${expected} ✗ Δ=${delta}`;
+        } else {
+            const expected = (product.pricePerUnit * product.quantity).toFixed(2);
+            reconcile =
+                `reconcile:${product.pricePerUnit.toFixed(2)}×${product.quantity}=${expected} ✓`;
+        }
+        const status = mismatch ? 'WARN' : warnings.length > 0 ? 'NOTE' : 'OK';
+        const promo = product.promoPrice === null ? 'null' : product.promoPrice.toFixed(2);
+        const ppu = product.pricePerUnit === null ? 'null' : product.pricePerUnit.toFixed(2);
+        out.push(
+            `band ${bandNum}: ${status}  name="${TRUNC(product.name, 60)}"  ` +
+                `price=${product.price.toFixed(2)}  promo=${promo}  ` +
+                `qty=${product.quantity}  unit=${product.unit}  ppu=${ppu}  ${reconcile}`,
+        );
+        for (const w of warnings) {
+            if (w === mismatch) continue;
+            out.push(`        ${w}`);
+        }
     }
     return out.join('\n');
 }
