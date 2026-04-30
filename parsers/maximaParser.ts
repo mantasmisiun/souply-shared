@@ -164,11 +164,11 @@ const NON_CATALOG_LINE_RE = /\b(?:vienkartinis|didelis|pirkini[uų])?\s*(?:plast
 
 // ───────── helpers ─────────
 
-function parseNum(str: string): number {
+export function parseNum(str: string): number {
   return parseFloat(sanitizeNumStr(str).replace(",", ".").replace(/\s/g, ""));
 }
 
-function regionOf(lines: MaximaLine[]): Region {
+export function regionOf(lines: MaximaLine[]): Region {
   if (lines.length === 0) return { yTop: 0, yBottom: 0, xLeft: 0, xRight: 0 };
   return {
     yTop: Math.min(...lines.map((l) => l.yTop)),
@@ -191,7 +191,7 @@ export function isMaximaReceipt(lines: string[]): boolean {
  * Split OCR rows that have a price trailing at the end into two pseudo-lines
  * so downstream parsing sees name/discount and price/savings separately.
  */
-function splitMergedLines(lines: MaximaLine[]): MaximaLine[] {
+export function splitMergedLines(lines: MaximaLine[]): MaximaLine[] {
   const out: MaximaLine[] = [];
   for (const line of lines) {
     const text = line.text.trim();
@@ -245,7 +245,7 @@ function splitMergedLines(lines: MaximaLine[]): MaximaLine[] {
 const stripDiacritics = (s: string): string =>
   s.normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
 
-function findHeaderEnd(lines: MaximaLine[]): number {
+export function findHeaderEnd(lines: MaximaLine[]): number {
   // Products start after `Kvitas bazėje:` or at the first standalone price.
   for (let i = 0; i < Math.min(lines.length, 25); i++) {
     if (/kvitas\s+bazeje/.test(stripDiacritics(lines[i].text))) return i + 1;
@@ -258,7 +258,7 @@ function findHeaderEnd(lines: MaximaLine[]): number {
   return Math.min(7, lines.length);
 }
 
-function findFooterStart(lines: MaximaLine[], afterIdx: number): number {
+export function findFooterStart(lines: MaximaLine[], afterIdx: number): number {
   for (let i = afterIdx; i < lines.length; i++) {
     const text = lines[i].text;
     if (/suteiktos\s+naudos/i.test(text)) return i;
@@ -273,7 +273,7 @@ function findFooterStart(lines: MaximaLine[], afterIdx: number): number {
 
 // ───────── header ─────────
 
-function parseHeader(lines: MaximaLine[]): MaximaHeader {
+export function parseHeader(lines: MaximaLine[]): MaximaHeader {
   let storeCode = "";
   let storeAddress = "";
   let pvmCode = "";
@@ -596,7 +596,7 @@ function cleanProductName(name: string): string {
 
 // ───────── footer ─────────
 
-function parseFooter(lines: MaximaLine[]): MaximaFooter {
+export function parseFooter(lines: MaximaLine[]): MaximaFooter {
   let total: number | null = null;
   let date = "";
   let time = "";
