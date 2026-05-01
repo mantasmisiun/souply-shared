@@ -140,13 +140,22 @@ const DISCOUNT_RE = new RegExp(`^-\\s*(\\d+[.,]\\s?${D}{1,2})\\s*[A-Z]?\\s*$`);
 // `[.,_]` accepts `_` as an OCR-mangled decimal separator.
 // `[€£]` accepts `£` as an OCR variant of `€` (thermal receipts
 // frequently ghost the `€` glyph into `£`).
+//
+// `[>×|]?\s*` BEFORE the `x` multiplier — phone-photo OCR
+// frequently prepends a stray `>` to the multiplier (seen in the
+// wild: `0,37 >x 6,000 €/vnt.` and `0,29 >X 2,000 €/vnt.`). The
+// `?` keeps the legit `<ppu> x <qty>` shape matching unchanged;
+// the optional noise just absorbs OCR drift. Without this the
+// unit-line classifies as 'name', leaks into the product name,
+// and qty stays 1 (so a multi-buy of 6 reads as quantity=1).
 const UNIT_LINE_RE = new RegExp(
-    `^\\s*(?:(\\d+[.,_]\\s?${D}{1,2})\\s*)?[xkXК]\\s*(\\d+(?:[.,_]\\s?${D}{1,3})?)\\s*(kg|[€£]\\s*/\\s*vnt\\.?|[€£]\\s*/\\s*kg)`,
+    `^\\s*(?:(\\d+[.,_]\\s?${D}{1,2})\\s*)?[>×|]?\\s*[xkXК]\\s*(\\d+(?:[.,_]\\s?${D}{1,3})?)\\s*(kg|[€£]\\s*/\\s*vnt\\.?|[€£]\\s*/\\s*kg)`,
     'i'
 );
 // OCR-split unit line halves. Decimal optional in both (integer
-// quantities like `x 2 €/vnt.` happen).
-const UNIT_HEAD_RE = new RegExp(`^\\s*\\d+[.,_]\\s?${D}{1,2}\\s*[xkXК]\\s*$`);
+// quantities like `x 2 €/vnt.` happen). Same `>` tolerance as
+// UNIT_LINE_RE.
+const UNIT_HEAD_RE = new RegExp(`^\\s*\\d+[.,_]\\s?${D}{1,2}\\s*[>×|]?\\s*[xkXК]\\s*$`);
 const UNIT_TAIL_RE = new RegExp(
     `^\\s*${D}+(?:[.,_]\\s?${D}{1,3})?\\s*(kg|[€£]\\s*/\\s*vnt\\.?|[€£]\\s*/\\s*kg)\\s*$`,
     'i'
@@ -204,15 +213,31 @@ const BARCODE_ONLY_RE = new RegExp(
 // word (`UŽstatas` → `1>statas` / `o02000 1>statas`). The `\W?`
 // between the lead char and `stat` tolerates that.
 const DEPOSIT_RE = /(?:u[žz]stat[ao]|[i1l]\W?stat[o0]|[i1l]\W?statas?)/i;
-// Non-catalog checkout bags. Broadened from the prefix-anchored form
-// to match the bag noun anywhere — OCR routinely fragments the line
-// into pieces (`irk.maišeli`, `Pop-pr`) where the prefix isn't on
-// the same fragment as the `maišeli` tail.
-const NON_CATALOG_RE = /\bmai[sš]\w*/i;
-// Discount summary header. Tolerates `Nuolalda` (i↔l swap seen on
-// low-contrast OCR) alongside the canonical `Nuolaida`. Also matches
-// the Lidl Plus loyalty prefix.
-const DISCOUNT_HEADER_RE = /(?:lidl\s*plus\s+)?nuo[li]a[li]d[aos]?/i;
+// Non-catalog checkout bags. Match the bag word anywhere on the
+// line so OCR-fragmented forms (`irk.maišeli`, `Pop-pr` + bag
+// tail) still trip the skip. The stem suffix is required —
+// `el(is|iai|i)?`, `as`, or `ai` — so packaging abbreviations
+// (`Grikių kruopos maiš.`) and unrelated `maiš-` words
+// (`maišyti` to mix, `maišinim` mixing-noun, `maišelyje` locative
+// of `maišelis` — though that one's still about bags, just a
+// rarer case) don't false-match.
+//
+// Forms matched:
+//   maišel, maišelis, maišeli, maišeliai, maišelio, … (diminutive)
+//   maišas, maišai                                    (plain bag)
+//
+// Forms intentionally NOT matched:
+//   maiš.        — packaging-abbreviation suffix on real products
+//   maišyti      — verb "to mix"
+//   maišinim*    — mixing-related noun
+const NON_CATALOG_RE = /\bmai[sš](?:el|as|ai)\w*/i;
+// Discount-header line. Tolerates `Nuolalda` (i↔l swap on low-
+// contrast OCR) alongside canonical `Nuolaida`, and the standalone
+// `LIDL PLUS kupono` form (where the line has the loyalty prefix
+// but no `nuolaida` word — the nuolaida value sits on the NEXT
+// row). Either token alone is enough to mark the line as a
+// discount-cluster member: `lidl plus` or `nuolaida`.
+const DISCOUNT_HEADER_RE = /(?:lidl\s*plus|nuo[li]a[li]d[aos]?)/i;
 // Header end marker. Either the `#00NNNNN` document-number line OR
 // the `Kvitas NNNNN/NN` row — whichever comes LATER. Some receipts
 // put `#00NNNNN` before `Kvitas N/N` (seen on 08-29, 08-20, 09-13),
@@ -301,7 +326,13 @@ function findFooterStart(lines: LidlLine[], afterIdx: number): number {
         if (/^\s*moketi\b/.test(t)) return i;
         if (/^\s*mokejimas\s+kortele/.test(t)) return i;
         if (/^\s*bekontak/.test(t)) return i;
-        if (/^-{5,}$/.test(t.trim())) return i;
+        // Dashed (`---`) or equal-sign (`===`) separator — Lidl
+        // prints `===========` between the product list and the
+        // PVM table. Catching it here keeps the visual band of
+        // the LAST product from extending down into the
+        // separator row when the V2 fold accepts everything to
+        // the end of productSlice.
+        if (/^[=-]{5,}$/.test(t.trim())) return i;
     }
     return lines.length;
 }
@@ -354,361 +385,6 @@ function stripBarcodePrefix(name: string): string {
     return m ? m[2].trim() : name;
 }
 
-function parseProducts(lines: LidlLine[]): LidlProduct[] {
-    const products: LidlProduct[] = [];
-    const priceIndices: number[] = [];
-    // Deposit priceIdx set — `0,10 !` / `0,60 !` rows use `!` instead
-    // of a VAT letter. Collect separately so walk-back from the NEXT
-    // priceIdx stops at them (they're non-catalog, shouldn't leak
-    // into a real product's name), but we DON'T create a product row
-    // for them.
-    const depositIndices = new Set<number>();
-    for (let i = 0; i < lines.length; i++) {
-        const t = lines[i].text.trim();
-        if (PRICE_DEPOSIT_RE.test(t)) {
-            depositIndices.add(i);
-            continue;
-        }
-        if (DISCOUNT_RE.test(t)) continue;
-        if (PRICE_RE.test(t) || PRICE_OCR_RE.test(t)) priceIndices.push(i);
-    }
-
-    const usedLines = new Set<number>();
-
-    for (let pi = 0; pi < priceIndices.length; pi++) {
-        const priceIdx = priceIndices[pi];
-        if (usedLines.has(priceIdx)) continue;
-
-        const priceLine = lines[priceIdx];
-        const priceText = priceLine.text.trim();
-        const strictMatch = priceText.match(PRICE_RE);
-        let price: number;
-        if (strictMatch) {
-            price = parseNum(strictMatch[1]);
-        } else {
-            // PRICE_OCR_RE anchor (Cat AA) — space-separator price.
-            // Reconstruct value as `${intPart}.${fracPart}`.
-            const ocrMatch = priceText.match(PRICE_OCR_RE)!;
-            price = parseNum(`${ocrMatch[1]}.${ocrMatch[2]}`);
-        }
-
-        usedLines.add(priceIdx);
-
-        let quantity = 1;
-        let unit = 'vnt';
-        let pricePerUnit: number | null = null;
-
-        const prevPriceIdx = pi > 0 ? priceIndices[pi - 1] : -1;
-        const nextPriceIdx =
-            pi + 1 < priceIndices.length ? priceIndices[pi + 1] : lines.length;
-        const rawLines: string[] = [];
-        const consumedLines: LidlLine[] = [priceLine];
-        const nameLines: string[] = [];
-        let lookback = priceIdx - 1;
-        let skippedNonCatalog = false;
-        // Cat FF / Cat GG — post-price forward scan at same-y (±20 px).
-        // OCR sometimes emits `name → barcode → price` in that order
-        // but SORTS same-y lines by x-position, so barcode (left column)
-        // and unit line (center) can land AFTER price (right column) in
-        // the array. Backward walk-back never sees them. Forward-scan
-        // here pre-seeds barcodesConsumed (FF) and captures qty + ppu
-        // from post-price unit lines (GG) before walk-back starts.
-        let barcodesConsumed = 0;
-        const priceY = priceLine.yTop;
-        const POST_PRICE_Y_TOL = 20;
-        const postScanEnd = Math.min(priceIdx + 4, nextPriceIdx);
-        for (let k = priceIdx + 1; k < postScanEnd; k++) {
-            if (usedLines.has(k)) continue;
-            if (lines[k].yTop - priceY > POST_PRICE_Y_TOL) break;
-            const kText = lines[k].text.trim();
-            if (!kText) continue;
-            if (BARCODE_ONLY_RE.test(kText)) {
-                // Cat FF: count the barcode so Cat M can fire during
-                // walk-back. Mark used so Cat CC (forward-walk fallback)
-                // and subsequent priceIdx passes don't re-read it.
-                if (barcodesConsumed === 0) barcodesConsumed = 1;
-                usedLines.add(k);
-                consumedLines.push(lines[k]);
-                continue;
-            }
-            const unitMatchPost = kText.match(UNIT_LINE_RE);
-            if (unitMatchPost) {
-                // Cat GG: post-price unit line belongs to THIS product.
-                if (unitMatchPost[1] && pricePerUnit === null) {
-                    pricePerUnit = parseNum(unitMatchPost[1]);
-                }
-                if (quantity === 1) quantity = parseNum(unitMatchPost[2]);
-                if (unit === 'vnt' && /kg/i.test(unitMatchPost[3])) unit = 'kg';
-                usedLines.add(k);
-                consumedLines.push(lines[k]);
-                continue;
-            }
-            const lenientPost = kText.match(UNIT_LENIENT_RE);
-            if (lenientPost) {
-                // Cat HH post-price variant — lenient unit-line prefix
-                // without a clean suffix. Capture qty + ppu, consume so
-                // the trailing garbage doesn't leak anywhere.
-                if (pricePerUnit === null) pricePerUnit = parseNum(lenientPost[1]);
-                if (quantity === 1) quantity = parseNum(lenientPost[2]);
-                usedLines.add(k);
-                consumedLines.push(lines[k]);
-                continue;
-            }
-            // Unrecognised — don't consume, and don't keep scanning
-            // (next satellites live further from priceY anyway).
-            break;
-        }
-        // `barcodesConsumed` tracks whether walk-back (or Cat FF pre-
-        // seed) has seen the price's OWN barcode. Lidl products are
-        // typically name → barcode → price, so seeing a SECOND barcode
-        // during walk-back after ≥1 name line means we've crossed into
-        // the PREVIOUS product's block (Cat M). Pre-seeded above from
-        // post-price scan so same-y OCR order doesn't break the check.
-
-        while (lookback > prevPriceIdx && nameLines.length < 3) {
-            const prev = lines[lookback];
-            const prevText = prev.text.trim();
-
-            if (!prevText || usedLines.has(lookback)) {
-                lookback--;
-                continue;
-            }
-            if (PRICE_RE.test(prevText)) break;
-            // PRICE_OCR_RE — space-decimal variant (Cat AA). Same
-            // STOP semantics as strict PRICE_RE.
-            if (PRICE_OCR_RE.test(prevText)) break;
-            // Deposit price row (`0,10 !`) — same STOP semantics as
-            // regular price, plus we already skipped it in the
-            // priceIdx loop via depositIndices.
-            if (PRICE_DEPOSIT_RE.test(prevText)) break;
-            if (DISCOUNT_RE.test(prevText)) break;
-            if (DISCOUNT_HEADER_RE.test(prevText)) break;
-            // Header-tail `Kvitas N/N` that escaped findHeaderEnd
-            // (e.g. when `#NNNNN` and `Kvitas N/N` are both in the
-            // first 20 lines but sort order differs from expected):
-            // treat as absolute stop.
-            if (KVITAS_ROW_RE.test(prevText)) break;
-            if (DEPOSIT_RE.test(prevText)) {
-                skippedNonCatalog = true;
-                break;
-            }
-            if (NON_CATALOG_RE.test(prevText)) {
-                skippedNonCatalog = true;
-                break;
-            }
-            // Lenient price-like fragment (OCR-mangled `.99`, `0 59 A`,
-            // `049 A`, `O,43_`, `,29 A`, `|69 A`). Treat as walk-back
-            // stop — the previous product's (broken) price shouldn't
-            // leak into our name even when we can't extract its value.
-            if (PRICE_LIKE_RE.test(prevText)) break;
-
-            // Unit/weight line: capture quantity + pricePerUnit and
-            // DON'T add to name. Capture group 1 (unit price) is
-            // optional — when OCR drops it, we still get qty and unit.
-            const unitMatch = prevText.match(UNIT_LINE_RE);
-            if (unitMatch) {
-                if (unitMatch[1]) pricePerUnit = parseNum(unitMatch[1]);
-                quantity = parseNum(unitMatch[2]);
-                unit = /kg/i.test(unitMatch[3]) ? 'kg' : 'vnt';
-                consumedLines.push(prev);
-                usedLines.add(lookback);
-                lookback--;
-                continue;
-            }
-            // Unit-line fragments — OCR split a single unit line into
-            // two rows (`1,29 x` + `2,000 €/vnt.`). Consume either
-            // half as metadata, don't absorb into name. If we see
-            // both halves we'll have already captured the pricePerUnit
-            // from whichever came with the leading numeric group.
-            if (UNIT_HEAD_RE.test(prevText)) {
-                const headMatch = prevText.match(/(\d+[.,]\s?\d{1,2})/);
-                if (headMatch && pricePerUnit === null) {
-                    pricePerUnit = parseNum(headMatch[1]);
-                }
-                consumedLines.push(prev);
-                usedLines.add(lookback);
-                lookback--;
-                continue;
-            }
-            if (UNIT_TAIL_RE.test(prevText)) {
-                const tailMatch = prevText.match(/(\d+[.,_]\s?\d{1,3})\s*(kg|[€£])/i);
-                if (tailMatch && quantity === 1) {
-                    quantity = parseNum(tailMatch[1]);
-                    unit = /kg/i.test(tailMatch[2]) ? 'kg' : 'vnt';
-                }
-                consumedLines.push(prev);
-                usedLines.add(lookback);
-                lookback--;
-                continue;
-            }
-            // Bare `€/vnt.` / `£/vnt.` / `€/kg` orphan (Cat V) — consume
-            // as metadata without extracting qty/unit so it doesn't get
-            // pushed as a product name.
-            if (UNIT_ORPHAN_RE.test(prevText)) {
-                consumedLines.push(prev);
-                usedLines.add(lookback);
-                lookback--;
-                continue;
-            }
-            // Cat X — weighable with garbage PREFIX (e.g. `CEoX 0,343 kg`).
-            // Capture qty + unit from the tail, discard the letter
-            // prefix. Only triggered when the cleaner UNIT_* regexes
-            // above already failed.
-            const weightLenient = prevText.match(UNIT_WEIGHT_LENIENT_RE);
-            if (weightLenient) {
-                if (quantity === 1) {
-                    quantity = parseNum(weightLenient[1]);
-                    unit = /kg/i.test(weightLenient[2]) ? 'kg' : 'vnt';
-                }
-                consumedLines.push(prev);
-                usedLines.add(lookback);
-                lookback--;
-                continue;
-            }
-            // Cat HH — unit-line prefix with trailing garbage (typical
-            // cause: OCR mashed the next product's name onto the unit
-            // line). Extract qty + ppu from the clean prefix, consume
-            // the whole line so nothing leaks into name.
-            const lenientMatch = prevText.match(UNIT_LENIENT_RE);
-            if (lenientMatch) {
-                if (pricePerUnit === null) pricePerUnit = parseNum(lenientMatch[1]);
-                if (quantity === 1) quantity = parseNum(lenientMatch[2]);
-                consumedLines.push(prev);
-                usedLines.add(lookback);
-                lookback--;
-                continue;
-            }
-            // Cat W — multi-buy qty smooshed with a name continuation
-            // (`2,000 Su ban.`). OCR merged the quantity from a broken
-            // unit line with the tail of a wrapped name. Capture the
-            // qty, push ONLY the continuation tail as name.
-            const multibuyContMatch = prevText.match(MULTIBUY_CONTINUATION_RE);
-            if (multibuyContMatch) {
-                if (quantity === 1) quantity = parseNum(multibuyContMatch[1]);
-                const tail = multibuyContMatch[2].trim();
-                // Respect Cat M + Cat DD before pushing (same checks
-                // as the regular name path below).
-                if (!(barcodesConsumed >= 1 && nameLines.length >= 1)) {
-                    nameLines.unshift(tail);
-                }
-                consumedLines.push(prev);
-                usedLines.add(lookback);
-                lookback--;
-                continue;
-            }
-
-            // Pure-barcode line: consume without adding to name.
-            // If we've already captured a name AND this is a SECOND
-            // barcode, stop — we're straddling two products.
-            if (BARCODE_ONLY_RE.test(prevText)) {
-                if (barcodesConsumed >= 1 && nameLines.length >= 1) break;
-                barcodesConsumed++;
-                consumedLines.push(prev);
-                usedLines.add(lookback);
-                lookback--;
-                continue;
-            }
-
-            // Regular name line (possibly with leading inline barcode
-            // — strip it). When the line had an inline barcode we
-            // count it against `barcodesConsumed` the same way a
-            // standalone barcode would — otherwise Cat M's break
-            // below misses the receipt-09-13 case where the first
-            // product's barcode is inline with its name.
-            const stripped = stripBarcodePrefix(prevText);
-            const hadInlineBarcode = stripped !== prevText;
-            // Cat M: after a barcode has been consumed (standalone OR
-            // inline) AND we've already collected ≥1 name line, any
-            // further name push means we've crossed into the PREVIOUS
-            // product. Stop before absorbing. Catches:
-            //   - Kakav/Sūrelis smoosh (y=500 / y=510 same-y layout)
-            //   - Silkių/Virtos smoosh (same pattern)
-            //   - Kvitas-absorption when `#NNNNN` + `Kvitas N/N` +
-            //     inline-barcode-first-product all line up
-            if (barcodesConsumed >= 1 && nameLines.length >= 1) break;
-            // Cat DD: inline-barcode line with name already collected
-            // → this line belongs to the PREVIOUS product (whose own
-            // price anchor is lost to OCR). Stop before absorbing so
-            // the two products' names don't merge. The orphaned
-            // barcode+name will be picked up by the forward-walk
-            // fallback (Cat CC) on the previous price anchor.
-            if (hadInlineBarcode && nameLines.length >= 1) break;
-            if (hadInlineBarcode) barcodesConsumed++;
-            nameLines.unshift(stripped);
-            consumedLines.push(prev);
-            usedLines.add(lookback);
-            lookback--;
-        }
-
-        if (skippedNonCatalog) continue;
-
-        // Cat CC: forward-walk fallback. When walk-back yielded no
-        // name (priceIdx sits directly after another priceIdx with
-        // nothing in between), scan FORWARD from priceIdx+1 looking
-        // for an inline-barcode+name or bare name line. Bounds:
-        //   - stop at next priceIdx
-        //   - stop at any stop-condition line (unit line OK to skip)
-        //   - stop after 4 lines forward (hard cap)
-        // Used by OCR'd receipts where price column and name column
-        // misalign — the name for price P1 ends up BELOW P1 and
-        // ABOVE the next price P2 (inline with P2's barcode line).
-        if (nameLines.length === 0) {
-            const nextPriceIdx =
-                pi + 1 < priceIndices.length ? priceIndices[pi + 1] : lines.length;
-            const hardCap = Math.min(priceIdx + 5, nextPriceIdx);
-            for (let fwd = priceIdx + 1; fwd < hardCap; fwd++) {
-                if (usedLines.has(fwd)) continue;
-                const fwdText = lines[fwd].text.trim();
-                if (!fwdText) continue;
-                if (PRICE_RE.test(fwdText) || PRICE_OCR_RE.test(fwdText)) break;
-                if (PRICE_DEPOSIT_RE.test(fwdText)) break;
-                if (DISCOUNT_RE.test(fwdText)) break;
-                if (DISCOUNT_HEADER_RE.test(fwdText)) break;
-                if (DEPOSIT_RE.test(fwdText)) break;
-                if (NON_CATALOG_RE.test(fwdText)) break;
-                if (PRICE_LIKE_RE.test(fwdText)) break;
-                // Skip unit/barcode-only lines — they're metadata, not names.
-                if (
-                    UNIT_LINE_RE.test(fwdText) ||
-                    UNIT_HEAD_RE.test(fwdText) ||
-                    UNIT_TAIL_RE.test(fwdText) ||
-                    UNIT_ORPHAN_RE.test(fwdText) ||
-                    BARCODE_ONLY_RE.test(fwdText)
-                ) {
-                    continue;
-                }
-                // Candidate name line — strip inline barcode prefix.
-                const nameCandidate = stripBarcodePrefix(fwdText);
-                if (!nameCandidate || /^\d+[.,]?\d*$/.test(nameCandidate)) break;
-                nameLines.push(nameCandidate);
-                consumedLines.push(lines[fwd]);
-                usedLines.add(fwd);
-                break;
-            }
-        }
-
-        const name = nameLines.join(' ').trim();
-        rawLines.push(...nameLines, priceText);
-
-        if (!name) continue;
-        if (/^\d+[.,]?\d*$/.test(name)) continue;
-        if (NON_CATALOG_RE.test(name)) continue;
-        if (DEPOSIT_RE.test(name)) continue;
-
-        products.push({
-            name,
-            price,
-            promoPrice: null,
-            quantity,
-            unit,
-            pricePerUnit,
-            rawLines,
-            region: regionOf(consumedLines),
-        });
-    }
-
-    return products;
-}
 
 // ───────── footer ─────────
 
@@ -722,11 +398,18 @@ function parseFooter(lines: LidlLine[]): LidlFooter {
     for (let i = 0; i < lines.length; i++) {
         const t = lines[i].text.trim();
 
-        // `Mokėti` + `N,NN` on separate lines or same.
+        // `Mokėti` + `N,NN` — try same-line first (MLKit often
+        // fuses label + amount when the row prints them close
+        // together), fall back to the neighbour rows.
         if (/^mok[eė]ti\b/i.test(t)) {
-            const neighbour = lines[i + 1]?.text ?? lines[i - 1]?.text ?? '';
-            const m = neighbour.match(/(\d+[.,]\s?\d{1,2})/);
-            if (m) total = parseNum(m[1]);
+            const sameLine = t.match(/(\d+[.,]\s?\d{1,2})/);
+            if (sameLine) {
+                total = parseNum(sameLine[1]);
+            } else {
+                const neighbour = lines[i + 1]?.text ?? lines[i - 1]?.text ?? '';
+                const m = neighbour.match(/(\d+[.,]\s?\d{1,2})/);
+                if (m) total = parseNum(m[1]);
+            }
         }
         // Aggregated discount (`Nuolaida 0,68`).
         if (/^nuolaid[aos]?\s*$/i.test(t)) {
@@ -756,53 +439,983 @@ function parseFooter(lines: LidlLine[]): LidlFooter {
     };
 }
 
-/**
- * Lithuanian receipts wrap long product names to a second line, and
- * the second line typically starts with a preposition / conjunction
- * (`su` = "with", `ir` = "and", `be` = "without"). When walk-back
- * from a price can't cross the previous product's price line to
- * grab the wrapped-name head, the orphan tail ends up as its own
- * product with a gibberish-fragment name like `su karam. įdaru`.
- *
- * Post-pass: if a product name starts with a continuation word, use
- * the PREVIOUS product's name as a prefix so the matcher sees the
- * full name (`Vanil.plombyras vafl.puodelyje su karam. įdaru`)
- * instead of the bare fragment. The two products stay separate —
- * they may be genuinely distinct SKUs at different unit prices.
- */
-// Cat Y — leading punctuation allowed before the continuation word.
-// OCR sometimes keeps a stray period/comma from the prior line as a
-// prefix on the wrapped tail (`.ir šok` from a name ending in `...šok.`),
-// which previously prevented the prefix match and let the 6-char
-// fragment fluke high-confidence char-similarity matches in the catalog.
-const CONTINUATION_LEADING_PUNCT_RE = /^[\s.,:;\-]+/;
-const CONTINUATION_HEAD_RE = /^[\s.,:;\-]*(su|ir|be|i[sš]|po|prie|j[eiaouy]|i)\s+/i;
-function prefixOrphanContinuations(products: LidlProduct[]): LidlProduct[] {
-    for (let i = 1; i < products.length; i++) {
-        const name = products[i].name.trim();
-        if (CONTINUATION_HEAD_RE.test(name)) {
-            const cleaned = name.replace(CONTINUATION_LEADING_PUNCT_RE, '');
-            products[i].name = `${products[i - 1].name} ${cleaned}`.trim();
-        }
-    }
-    return products;
-}
-
 // ───────── public entry points ─────────
 
-export function parseLidlReceipt(lines: LidlLine[]): LidlParseResult {
-    const headerEnd = findHeaderEnd(lines);
-    const footerStart = findFooterStart(lines, headerEnd);
-    return {
-        header: parseHeader(lines.slice(0, headerEnd)),
-        products: prefixOrphanContinuations(
-            parseProducts(lines.slice(headerEnd, footerStart))
-        ),
-        footer: parseFooter(lines.slice(footerStart)),
-    };
+/**
+ * Full receipt parse: header + products + footer.
+ *
+ * Convention (matches Rimi V2 / Norfa V2): rows with a multi-buy
+ * or weighable unit-line have their `price` and `promoPrice`
+ * normalized to PER-UNIT values here. Downstream code recovers
+ * the line total as `price × quantity`. Single-pack rows
+ * (quantity = 1) keep `price` as the line total.
+ *
+ * Internally uses the V2 hard-walled band detector
+ * (`findReceiptBandsLidl`) + per-band extractor
+ * (`extractLidlProduct`).
+ */
+export function parseLidlReceipt(rawLines: LidlLine[]): LidlParseResult {
+    const headerEnd = findHeaderEnd(rawLines);
+    const footerStart = findFooterStart(rawLines, headerEnd);
+    const header = parseHeader(rawLines.slice(0, headerEnd));
+    const footer = parseFooter(rawLines.slice(footerStart));
+    const plan = findReceiptBandsLidl(rawLines);
+    const products: LidlProduct[] = [];
+    for (const internal of plan.productInternals) {
+        const { product } = extractLidlProduct(internal);
+        if (!product) continue;
+        if (product.pricePerUnit !== null && product.quantity > 0) {
+            product.price = product.pricePerUnit;
+            if (product.promoPrice !== null) {
+                product.promoPrice =
+                    Math.round((product.promoPrice / product.quantity) * 100) / 100;
+            }
+        }
+        products.push(product);
+    }
+    return { header, products, footer };
 }
 
 export function parseLidlHeaderOnly(lines: LidlLine[]): LidlHeader {
     const headerEnd = findHeaderEnd(lines);
     return parseHeader(lines.slice(0, headerEnd));
+}
+
+// ─────────────────────────────────────────────────────────────────
+// V2 step 1: hard-walled bands
+// ─────────────────────────────────────────────────────────────────
+//
+// Same architecture as Rimi/Norfa V2:
+//   1. Find anchors (lines matching PRICE_RE or PRICE_OCR_RE — Lidl
+//      anchors are bare prices like `2,49 A` or OCR-mangled `1 29 A`,
+//      always at the END of a product's row group). Deposit rows
+//      with a `!` suffix (PRICE_DEPOSIT_RE) are NOT anchored — they
+//      attach to the PREVIOUS product (the bottle/can).
+//   2. No per-product tail content. Unlike Norfa (per-row Nuolaida)
+//      Lidl prints discounts AGGREGATED at the bottom of the receipt
+//      (`Lidl Plus nuolaida` + `-X,XX A`), so a band's effective
+//      bottom is just its anchor.yBottom plus any deposit row that
+//      attaches to it.
+//   3. Wall between bands = midpoint between (this band's last
+//      bottom) and the yTop of the next anchor.
+//   4. Lines are assigned to bands by strict y-CENTER membership
+//      against (topWall, bottomWall]. Nothing crosses a wall.
+//
+// Step 1 (this commit): produce typed bands for the dev-tool
+// overlay + per-line classification trace. Per-band content
+// extraction (step 2) and Analize integration (step 3) come after
+// the bands are visually validated against staged Lidl receipts.
+
+export type LidlBandKind =
+    | 'store-name'
+    | 'store-address'
+    | 'product'
+    | 'receipt-no'
+    | 'datetime'
+    | 'total';
+
+// Header-band detectors. Both run on the header slice only, so a
+// product-name line containing the word `Lidl` (rare but possible)
+// can't false-match into the store-name band.
+//
+// STORE_NAME — matches the chain marker `LIDL`/`LDL`/`UAB "Lidl`
+// (V1's isLidlReceipt accepts the same set tolerantly).
+const LIDL_STORE_NAME_LINE_RE = /\bLID?L\b|LIDL\s+LIETUVA|UAB\s*"?\s*LIDL/i;
+
+// ADDRESS — same shape as Norfa's: `<word> <number>, <word>` with
+// optional `g.` street suffix and OCR letter-for-digit tolerance on
+// the house number. Lidl addresses are typically `Gedimino g. 35,
+// Radviliškis` or — when OCR drops the `g.` — `Gedimino .35.
+// Radviliškis`. The lenient form (no comma) is handled by the V1
+// ADDRESS_LENIENT_RE; here we go with the same comma-anchored
+// pattern as Norfa for consistency.
+const LIDL_ADDRESS_LINE_RE =
+    /[A-ZĄČĘĖĮŠŲŪŽa-ząčęėįšųūž]{3,}\s*(?:g[.,]?\s*)?[\d0OoIlL]+(?:[-/][\d0OoIlL]+)?\s*,\s*[A-ZĄČĘĖĮŠŲŪŽa-ząčęėįšųūž]{3,}/;
+
+export interface LidlReceiptBand {
+    kind: LidlBandKind;
+    yTop: number;
+    yBottom: number;
+    /** `#1`/`#2` for product bands; `addr`/`nr`/`date`/`sum` otherwise. */
+    label: string;
+}
+
+export type LidlLineReason =
+    | 'name'
+    | 'anchor'
+    | 'unit'
+    | 'barcode'
+    | 'deposit'
+    | 'discount-header'
+    | 'discount-eur'
+    | 'other';
+
+export interface LidlBandLineEntry {
+    line: LidlLine;
+    sliceIdx: number;
+    reason: LidlLineReason;
+}
+
+export interface LidlBandInternal {
+    bandIdx: number;
+    anchor: LidlBandLineEntry;
+    preName: LidlBandLineEntry[];
+    postAnchor: LidlBandLineEntry[];
+}
+
+export interface LidlReceiptBandPlan {
+    bands: LidlReceiptBand[];
+    productInternals: LidlBandInternal[];
+}
+
+interface LidlProductBandInternal {
+    anchorIdx: number;
+    /** Lines with center > topWall belong here. */
+    topWall: number;
+    /** Lines with center <= bottomWall belong here. */
+    bottomWall: number;
+}
+
+// Anchor predicate. Accepts both clean (`2,49 A`) and OCR-mangled
+// (`1 29 A`) price lines. Rejects deposit rows (`0,10 !`) — those
+// fold into the previous product's band as tail content, not as
+// their own anchor.
+const isPositivePriceLineV2 = (line: LidlLine): boolean => {
+    const t = line.text.trim();
+    if (PRICE_DEPOSIT_RE.test(t)) return false;
+    return PRICE_RE.test(t) || PRICE_OCR_RE.test(t);
+};
+
+// Deposit row — bottle/can deposit price line `0,10 !` OR a leading
+// deposit-name line `*Užstatas …`. Either form folds into the
+// previous product's band (since deposits aren't standalone
+// catalog products on Lidl).
+const isDepositRow = (line: LidlLine): boolean => {
+    const t = line.text.trim();
+    return PRICE_DEPOSIT_RE.test(t) || DEPOSIT_RE.test(t);
+};
+
+const classifyLineReasonV2 = (line: LidlLine): LidlLineReason => {
+    const t = line.text.trim();
+    if (PRICE_RE.test(t) || PRICE_OCR_RE.test(t)) return 'anchor';
+    if (PRICE_DEPOSIT_RE.test(t) || DEPOSIT_RE.test(t)) return 'deposit';
+    if (UNIT_LINE_RE.test(t) || UNIT_HEAD_RE.test(t) || UNIT_TAIL_RE.test(t)) return 'unit';
+    // Pure-barcode line ONLY. A name line that happens to start with
+    // a barcode prefix (`7600526 Sviyturys …`) classifies as 'name'
+    // because the prefix is part of the OCR'd name we want to emit.
+    if (BARCODE_ONLY_RE.test(t)) return 'barcode';
+    if (DISCOUNT_HEADER_RE.test(t)) return 'discount-header';
+    if (DISCOUNT_RE.test(t)) return 'discount-eur';
+    return /[A-Za-zĄČĘĖĮŠŲŪŽąčęėįšųūž]{3,}/.test(t) ? 'name' : 'other';
+};
+
+// Fused-anchor tail regexes — match the price portion at the END of
+// a name+price row. Lidl prints product rows in two visually separate
+// columns (name on left, price on right) but MLKit reads them as a
+// single OCR line on phone-photographed thermal prints. Without this
+// split, every PRICE_RE/PRICE_OCR_RE check fails (the line is the
+// whole row, not just the price tail) and the V2 band detector
+// produces zero anchors → zero product bands.
+//
+// VAT letter is REQUIRED in the price tail (PRICE_RE allows it
+// optional, but for fused-tail extraction we lean on it as a guard
+// against false-matches: a name ending in `0,5` (e.g. `Pienas 0,5 l`)
+// must NOT be split. The VAT letter is a reliable Lidl-specific
+// terminator that doesn't appear inside product names.
+//
+// Deposit tail (`!` suffix) gets its own regex — it serves as the
+// trigger for folding the deposit row into the previous product's
+// band tail. Without splitting the deposit's `0,60 !` off, the row's
+// `Užstatas` keyword sits glued to the unit-line text and the V2
+// pipeline can't see it as a separate deposit half.
+const FUSED_DEPOSIT_TAIL_RE = new RegExp(
+    `\\s+(\\d+[.,]\\s?${D}{1,2}\\s*!)\\s*$`,
+);
+const FUSED_PRICE_TAIL_RE = new RegExp(
+    `\\s+(\\d+[.,]\\s?${D}{1,2}\\s*[A-Z])\\s*$`,
+);
+// OCR-mangled price tail — comma read as whitespace (`1 29 A`).
+// Trailing VAT letter still required.
+const FUSED_PRICE_TAIL_OCR_RE = new RegExp(
+    `\\s+(${D}{1,2}\\s+${D}{2}\\s*[A-Z])\\s*$`,
+);
+
+// Fused-anchor HEAD regexes — match the price portion at the START
+// of a name+price row. MLKit OCR on phone-photographed Lidl
+// receipts sometimes sorts the right-column price box BEFORE the
+// left-column name within an OCR line group (seen in the wild:
+// `0,39 A 7609624 Akmens druska`, `1,99 A 7610767 Lyd. sūris …`).
+// Without head-split these lines classify as 'name', the embedded
+// anchor is missed, and adjacent products collapse into one band.
+//
+// Same VAT-letter / `!` terminator as the tail variants — guards
+// against false-matches where a name happens to start with a
+// decimal-looking token (`0,5 l Pienas …`).
+const FUSED_DEPOSIT_HEAD_RE = new RegExp(
+    `^(\\d+[.,]\\s?${D}{1,2}\\s*!)\\s+`,
+);
+const FUSED_PRICE_HEAD_RE = new RegExp(
+    `^(\\d+[.,]\\s?${D}{1,2}\\s*[A-Z])\\s+`,
+);
+const FUSED_PRICE_HEAD_OCR_RE = new RegExp(
+    `^(${D}{1,2}\\s+${D}{2}\\s*[A-Z])\\s+`,
+);
+
+// Fused-anchor MIDDLE regexes — price wedged between name and an
+// adjacent barcode. Two MLKit orderings seen in the wild:
+//
+//   tail-with-barcode: `<name> <price> <VAT> <barcode>`
+//     (`Viskis 40 % 22,99 F 7602419`,
+//      `Grikių kruopos maiš. 1,89 A 7601585`)
+//
+//   head-with-barcode: `<barcode> <price> <VAT> <name>`
+//     (`0080227 1,29 A Obuoliai fasuoti`)
+//
+// Plain head/tail splitters miss these because the price isn't at a
+// terminal position. The barcode flanking is the strong context
+// signal that the middle token IS a price (and not e.g. a digit-
+// looking fragment inside the name).
+//
+// Capture group layout differs from plain head/tail: middle-tail
+// captures price (group 1) + trailing barcode (group 2) so we can
+// reattach the barcode to the name half.
+const FUSED_DEPOSIT_TAIL_BARCODE_RE = new RegExp(
+    `\\s+(\\d+[.,]\\s?${D}{1,2}\\s*!)\\s+(${BC}{4,10})\\s*$`,
+);
+const FUSED_PRICE_TAIL_BARCODE_RE = new RegExp(
+    `\\s+(\\d+[.,]\\s?${D}{1,2}\\s*[A-Z])\\s+(${BC}{4,10})\\s*$`,
+);
+const FUSED_DEPOSIT_HEAD_BARCODE_RE = new RegExp(
+    `^(${BC}{4,10})\\s+(\\d+[.,]\\s?${D}{1,2}\\s*!)\\s+`,
+);
+const FUSED_PRICE_HEAD_BARCODE_RE = new RegExp(
+    `^(${BC}{4,10})\\s+(\\d+[.,]\\s?${D}{1,2}\\s*[A-Z])\\s+`,
+);
+
+const splitFusedAnchorLineLidl = (line: LidlLine): [LidlLine, LidlLine] | null => {
+    const trimmed = line.text.trim();
+    // Already a clean anchor / deposit price — nothing to split.
+    if (PRICE_RE.test(trimmed)) return null;
+    if (PRICE_OCR_RE.test(trimmed)) return null;
+    if (PRICE_DEPOSIT_RE.test(trimmed)) return null;
+
+    // Deposit tail wins over price tail since the `!` is a more
+    // specific terminator (PRICE_RE allows trailing `[A-Z]?`, so a
+    // VAT-letter price tail won't false-match `!`). PRICE_TAIL_OCR
+    // is the lowest-priority match because its space-separated
+    // decimal can shadow legitimate digit-letter sequences in names.
+    let tailMatch = trimmed.match(FUSED_DEPOSIT_TAIL_RE);
+    if (!tailMatch) tailMatch = trimmed.match(FUSED_PRICE_TAIL_RE);
+    if (!tailMatch) tailMatch = trimmed.match(FUSED_PRICE_TAIL_OCR_RE);
+    if (tailMatch) {
+        const namePart = trimmed.slice(0, tailMatch.index).trim();
+        const tailPart = tailMatch[1];
+        if (!namePart) return null;
+        // Name must contain at least one letter — otherwise the
+        // leading section is just digits and we'd be cutting a
+        // legit standalone price line in half.
+        if (!/[A-Za-zĄČĘĖĮŠŲŪŽąčęėįšųūž]/.test(namePart)) return null;
+        return [
+            { ...line, text: namePart },
+            { ...line, text: tailPart },
+        ];
+    }
+
+    // Tail-with-barcode — `<name> <price> <VAT> <barcode>$`. The
+    // barcode at end gets reattached to the name half so the
+    // remaining text reads naturally for downstream extraction.
+    let tailBcMatch = trimmed.match(FUSED_DEPOSIT_TAIL_BARCODE_RE);
+    if (!tailBcMatch) tailBcMatch = trimmed.match(FUSED_PRICE_TAIL_BARCODE_RE);
+    if (tailBcMatch) {
+        const before = trimmed.slice(0, tailBcMatch.index).trim();
+        const tailPart = tailBcMatch[1];
+        const barcode = tailBcMatch[2];
+        const namePart = `${before} ${barcode}`.trim();
+        if (!before) return null;
+        if (!/[A-Za-zĄČĘĖĮŠŲŪŽąčęėįšųūž]/.test(before)) return null;
+        return [
+            { ...line, text: namePart },
+            { ...line, text: tailPart },
+        ];
+    }
+
+    // Head split — same VAT/`!` requirement as tail variants. Both
+    // halves keep the source line's y-coords; the slice ends up with
+    // namePart at idx N and headPart at idx N+1, so anchorIdx points
+    // to the head and the wall logic still correctly assigns the
+    // name-half (same y-center) to the same band.
+    let headMatch = trimmed.match(FUSED_DEPOSIT_HEAD_RE);
+    if (!headMatch) headMatch = trimmed.match(FUSED_PRICE_HEAD_RE);
+    if (!headMatch) headMatch = trimmed.match(FUSED_PRICE_HEAD_OCR_RE);
+    if (headMatch) {
+        const headPart = headMatch[1];
+        const namePart = trimmed.slice(headMatch[0].length).trim();
+        if (!namePart) return null;
+        if (!/[A-Za-zĄČĘĖĮŠŲŪŽąčęėįšųūž]/.test(namePart)) return null;
+        return [
+            { ...line, text: namePart },
+            { ...line, text: headPart },
+        ];
+    }
+
+    // Head-with-barcode — `^<barcode> <price> <VAT> <name>`. The
+    // leading barcode gets reattached to the name half.
+    let headBcMatch = trimmed.match(FUSED_DEPOSIT_HEAD_BARCODE_RE);
+    if (!headBcMatch) headBcMatch = trimmed.match(FUSED_PRICE_HEAD_BARCODE_RE);
+    if (headBcMatch) {
+        const barcode = headBcMatch[1];
+        const headPart = headBcMatch[2];
+        const after = trimmed.slice(headBcMatch[0].length).trim();
+        const namePart = `${barcode} ${after}`.trim();
+        if (!after) return null;
+        if (!/[A-Za-zĄČĘĖĮŠŲŪŽąčęėįšųūž]/.test(after)) return null;
+        return [
+            { ...line, text: namePart },
+            { ...line, text: headPart },
+        ];
+    }
+
+    return null;
+};
+
+// Same-row OCR consolidation. MLKit on phone-photographed Lidl
+// receipts sometimes emits the price tail as a separate box from
+// its product name even though they're on the same physical row.
+// Without merging, the price box becomes its own anchor and the
+// preceding name box ends up in the previous band, swapping names
+// across products. Threshold mirrors Norfa's: yTop diff < 30 px AND
+// the smaller box's center sits inside the larger box's vertical
+// span.
+const ROW_MERGE_YTOP_THRESHOLD_PX = 30;
+const ROW_MERGE_CENTER_RATIO = 0.4;
+
+const mergeRowFragmentsLidl = (rawLines: LidlLine[]): LidlLine[] => {
+    const out: LidlLine[] = [];
+    for (const line of rawLines) {
+        const last = out.length > 0 ? out[out.length - 1] : null;
+        if (!last) {
+            out.push({ ...line });
+            continue;
+        }
+        const yDiff = Math.abs(line.yTop - last.yTop);
+        const minH = Math.min(
+            line.yBottom - line.yTop,
+            last.yBottom - last.yTop,
+        );
+        const lineCenter = (line.yTop + line.yBottom) / 2;
+        const lastCenter = (last.yTop + last.yBottom) / 2;
+        const sameRow =
+            yDiff < ROW_MERGE_YTOP_THRESHOLD_PX &&
+            minH > 0 &&
+            Math.abs(lineCenter - lastCenter) < minH * ROW_MERGE_CENTER_RATIO;
+        if (!sameRow) {
+            out.push({ ...line });
+            continue;
+        }
+        last.text = `${last.text.trim()} ${line.text.trim()}`
+            .replace(/\s+/g, ' ')
+            .trim();
+        last.yTop = Math.min(last.yTop, line.yTop);
+        last.yBottom = Math.max(last.yBottom, line.yBottom);
+        last.xLeft = Math.min(last.xLeft, line.xLeft);
+        last.xRight = Math.max(last.xRight, line.xRight);
+    }
+    return out;
+};
+
+const findProductAnchorsLidlV2 = (productSlice: LidlLine[]): number[] => {
+    const centerOf = (line: LidlLine) => (line.yTop + line.yBottom) / 2;
+    const anchors: number[] = [];
+    for (let i = 0; i < productSlice.length; i++) {
+        if (!isPositivePriceLineV2(productSlice[i])) continue;
+        // Skip deposit's own price line — folded into the previous
+        // band as tail content (same policy as Norfa). isPositivePrice
+        // already rejects PRICE_DEPOSIT (`0,10 !`); this guard catches
+        // the case where the deposit-name marker (`*Užstatas …`)
+        // immediately precedes a CLEAN price line on the next OCR
+        // row.
+        const prev = i > 0 ? productSlice[i - 1] : null;
+        if (prev && isDepositRow(prev)) continue;
+
+        // Drop near-duplicate anchors (MLKit double-emit). Same
+        // policy as Norfa V2: if a previous anchor's center is
+        // within minH * 0.5 px of this candidate, treat as dup.
+        const myCenter = centerOf(productSlice[i]);
+        const myH = productSlice[i].yBottom - productSlice[i].yTop;
+        let isDup = false;
+        for (let a = anchors.length - 1; a >= 0; a--) {
+            const prevAnchorIdx = anchors[a];
+            const prevCenter = centerOf(productSlice[prevAnchorIdx]);
+            const prevH =
+                productSlice[prevAnchorIdx].yBottom -
+                productSlice[prevAnchorIdx].yTop;
+            const minH = Math.min(myH, prevH);
+            const dist = Math.abs(myCenter - prevCenter);
+            if (dist < minH * 0.5) {
+                isDup = true;
+                break;
+            }
+            if (minH > 0 && dist > minH * 5) break;
+        }
+        if (isDup) continue;
+        anchors.push(i);
+    }
+    return anchors;
+};
+
+/**
+ * Build hard-walled product bands. Tail = anchor.yBottom plus any
+ * deposit row that immediately follows. Wall placed at midpoint
+ * between tail bottom and the next non-deposit line top.
+ */
+const findProductBandsInternalLidlV2 = (
+    productSlice: LidlLine[],
+): LidlProductBandInternal[] => {
+    const anchorIdxs = findProductAnchorsLidlV2(productSlice);
+    if (anchorIdxs.length === 0) return [];
+
+    const tailBottoms: number[] = [];
+    for (let bi = 0; bi < anchorIdxs.length; bi++) {
+        const anchorIdx = anchorIdxs[bi];
+        const anchor = productSlice[anchorIdx];
+        const nextAnchorTop = bi + 1 < anchorIdxs.length
+            ? productSlice[anchorIdxs[bi + 1]].yTop
+            : Number.POSITIVE_INFINITY;
+
+        let lastBottom = anchor.yBottom;
+        for (let k = anchorIdx + 1; k < productSlice.length; k++) {
+            const line = productSlice[k];
+            if (line.yTop >= nextAnchorTop) break;
+            if (anchorIdxs.includes(k)) break;
+            // Specific accept-list — fold ONLY recognised post-
+            // product content categories. A bare 'name' line
+            // between two anchors is the next product's name (a
+            // multi-line product whose unit-half sits one row
+            // BELOW its name) and must NOT be absorbed into the
+            // current band; rejecting it lets the wall settle
+            // between the anchor and the name, and the name then
+            // lands in the next band's preName.
+            //
+            // Categories accepted:
+            //
+            // 1. Unit-lines — multi-buy / weighable continuation
+            //    BELOW an anchor (`7604564 Šv.alus 5%  2,90 F` +
+            //    `1,45 x 2,000 €/vnt.`), and the unit-half of a
+            //    multi-OCR-line deposit row (`0,10 x 6 €/vnt.`).
+            // 2. Deposit markers — `*Užstatas …` name lines, the
+            //    `Išimta (Užstatas) + 0001015 grąžinimas` deposit-
+            //    return cluster, and bare deposit-price lines
+            //    (`0,60 !`).
+            // 3. Per-item discount cluster — `Lidl Plus nuolaida`
+            //    header, the `LIDL PLUS kupono` coupon header
+            //    (DISCOUNT_HEADER_RE was widened to match either
+            //    `lidl plus` OR `nuolaida` so both forms fold),
+            //    and the companion `Nuolaida -X,XX A` value line
+            //    (or its bare `-X,XX A` half when MLKit splits).
+            //
+            // Termination is tight: clean anchors are filtered
+            // out via `anchorIdxs.includes(k)`, and a head-fused
+            // name half sits at the same y as its anchor so
+            // `line.yTop >= nextAnchorTop` catches it before the
+            // walk leaks into the next product.
+            const t = line.text.trim();
+            if (
+                isDepositRow(line) ||
+                UNIT_LINE_RE.test(t) ||
+                UNIT_HEAD_RE.test(t) ||
+                UNIT_TAIL_RE.test(t) ||
+                PRICE_DEPOSIT_RE.test(t) ||
+                DISCOUNT_HEADER_RE.test(t) ||
+                DISCOUNT_RE.test(t)
+            ) {
+                lastBottom = Math.max(lastBottom, line.yBottom);
+                continue;
+            }
+            break;
+        }
+        tailBottoms.push(lastBottom);
+    }
+
+    const bands: LidlProductBandInternal[] = [];
+    for (let bi = 0; bi < anchorIdxs.length; bi++) {
+        const anchorIdx = anchorIdxs[bi];
+        const topWall =
+            bi === 0
+                ? Number.NEGATIVE_INFINITY
+                : bands[bi - 1].bottomWall;
+
+        const tailBottom = tailBottoms[bi];
+        let firstNextTop = Number.POSITIVE_INFINITY;
+        for (const line of productSlice) {
+            const center = (line.yTop + line.yBottom) / 2;
+            if (center > tailBottom && line.yTop < firstNextTop) {
+                firstNextTop = line.yTop;
+            }
+        }
+        const bottomWall = Number.isFinite(firstNextTop)
+            ? (tailBottom + firstNextTop) / 2
+            : tailBottom;
+
+        bands.push({ anchorIdx, topWall, bottomWall });
+    }
+    return bands;
+};
+
+interface LidlBandsContext {
+    headerEnd: number;
+    footerStart: number;
+    productSlice: LidlLine[];
+    bands: LidlReceiptBand[];
+    productInternals: LidlBandInternal[];
+}
+
+const computeBandsContextLidlV2 = (rawLines: LidlLine[]): LidlBandsContext => {
+    const headerEnd = findHeaderEnd(rawLines);
+    const footerStart = findFooterStart(rawLines, headerEnd);
+    const headerSlice = rawLines.slice(0, headerEnd);
+    // Two-stage normalisation:
+    //   1. mergeRowFragments — consolidate same-row OCR fragments
+    //      (left-column name + right-column price emitted as two
+    //      separate boxes).
+    //   2. splitFusedAnchorLine — split lines that fuse name + VAT-
+    //      letter price tail into two virtual lines (name + anchor).
+    // Order matters: merge MUST run first. The split's two halves
+    // inherit y-coords from the source line, so if merge ran second
+    // it would see them as same-row text and concatenate them
+    // straight back, undoing the split.
+    const rawProductSlice = rawLines.slice(headerEnd, footerStart);
+    const mergedProductSlice = mergeRowFragmentsLidl(rawProductSlice);
+    const productSlice: LidlLine[] = [];
+    for (const line of mergedProductSlice) {
+        const split = splitFusedAnchorLineLidl(line);
+        if (split) productSlice.push(split[0], split[1]);
+        else productSlice.push(line);
+    }
+    const footerSlice = rawLines.slice(footerStart);
+
+    const bands: LidlReceiptBand[] = [];
+
+    // Header bands — store-name and store-address.
+    for (const line of headerSlice) {
+        if (LIDL_STORE_NAME_LINE_RE.test(line.text)) {
+            bands.push({
+                kind: 'store-name',
+                yTop: line.yTop,
+                yBottom: line.yBottom,
+                label: 'store',
+            });
+            break;
+        }
+    }
+    for (const line of headerSlice) {
+        if (LIDL_ADDRESS_LINE_RE.test(line.text)) {
+            bands.push({
+                kind: 'store-address',
+                yTop: line.yTop,
+                yBottom: line.yBottom,
+                label: 'addr',
+            });
+            break;
+        }
+    }
+
+    // Product bands.
+    const internal = findProductBandsInternalLidlV2(productSlice);
+    const productBands: LidlReceiptBand[] = [];
+    const productInternals: LidlBandInternal[] = [];
+    const sliceTop = productSlice.length > 0
+        ? Math.min(...productSlice.map((l) => l.yTop))
+        : 0;
+    const sliceBottom = productSlice.length > 0
+        ? Math.max(...productSlice.map((l) => l.yBottom))
+        : 0;
+    const centerOf = (line: LidlLine) => (line.yTop + line.yBottom) / 2;
+
+    for (let bi = 0; bi < internal.length; bi++) {
+        const band = internal[bi];
+        const memberIdxs: number[] = [];
+        for (let k = 0; k < productSlice.length; k++) {
+            const c = centerOf(productSlice[k]);
+            if (c > band.topWall && c <= band.bottomWall) memberIdxs.push(k);
+        }
+        if (memberIdxs.length === 0) continue;
+
+        const visTop = Number.isFinite(band.topWall) ? band.topWall : sliceTop;
+        const visBottom = Number.isFinite(band.bottomWall) ? band.bottomWall : sliceBottom;
+        productBands.push({
+            kind: 'product',
+            yTop: visTop,
+            yBottom: visBottom,
+            label: `#${bi + 1}`,
+        });
+
+        const preName: LidlBandLineEntry[] = [];
+        const postAnchor: LidlBandLineEntry[] = [];
+        for (const k of memberIdxs) {
+            if (k === band.anchorIdx) continue;
+            const line = productSlice[k];
+            const entry: LidlBandLineEntry = {
+                line,
+                sliceIdx: k,
+                reason: classifyLineReasonV2(line),
+            };
+            if (k < band.anchorIdx) preName.push(entry);
+            else postAnchor.push(entry);
+        }
+        productInternals.push({
+            bandIdx: productInternals.length,
+            anchor: {
+                line: productSlice[band.anchorIdx],
+                sliceIdx: band.anchorIdx,
+                reason: 'anchor',
+            },
+            preName,
+            postAnchor,
+        });
+    }
+    bands.push(...productBands);
+
+    // Receipt-no band — Lidl prints it at the TOP (`Kvitas N/N
+    // #00NNNNN`), unlike Norfa where it sits at the bottom. Scan
+    // headerSlice first; fall back to footerSlice for receipts
+    // where the header row got eaten by an aggressive headerEnd
+    // boundary. Prefer KVITAS_ROW_RE (`Kvitas 48263/232`) over
+    // RECEIPT_NO_RE (`#00048263`) because the Kvitas row is the
+    // user-readable form; if MLKit fused them onto one OCR line
+    // KVITAS_ROW_RE still wins (it's the leading token).
+    let receiptNoLine: LidlLine | null = null;
+    for (const line of headerSlice) {
+        if (KVITAS_ROW_RE.test(line.text)) {
+            receiptNoLine = line;
+            break;
+        }
+    }
+    if (!receiptNoLine) {
+        for (const line of headerSlice) {
+            if (RECEIPT_NO_RE.test(line.text.trim())) {
+                receiptNoLine = line;
+                break;
+            }
+        }
+    }
+    if (!receiptNoLine) {
+        for (const line of footerSlice) {
+            const t = line.text.trim();
+            if (KVITAS_ROW_RE.test(t) || RECEIPT_NO_RE.test(t)) {
+                receiptNoLine = line;
+                break;
+            }
+        }
+    }
+    if (receiptNoLine) {
+        bands.push({
+            kind: 'receipt-no',
+            yTop: receiptNoLine.yTop,
+            yBottom: receiptNoLine.yBottom,
+            label: 'nr',
+        });
+    }
+    for (const line of footerSlice) {
+        if (/(\d{4}-\d{2}-\d{2})\s+(\d{1,2}:\d{2})/.test(line.text)) {
+            bands.push({
+                kind: 'datetime',
+                yTop: line.yTop,
+                yBottom: line.yBottom,
+                label: 'date',
+            });
+            break;
+        }
+    }
+    // Total band — prefer `Mokėti` (final amount paid) over
+    // `Tarpinė suma` (subtotal before discounts/redemptions). On
+    // receipts where Lidl Plus discounts are aggregated at the
+    // bottom or Lidl-points are redeemed, the two values diverge
+    // and Mokėti is the canonical "what the customer paid" line.
+    // Two-pass: prefer Mokėti, fall back to Tarpinė suma if
+    // Mokėti isn't present.
+    let totalLine: LidlLine | null = null;
+    for (const line of footerSlice) {
+        if (/^\s*moketi\b/.test(stripDiacritics(line.text))) {
+            totalLine = line;
+            break;
+        }
+    }
+    if (!totalLine) {
+        for (const line of footerSlice) {
+            if (/^\s*tarpine\s+sum/.test(stripDiacritics(line.text))) {
+                totalLine = line;
+                break;
+            }
+        }
+    }
+    if (totalLine) {
+        bands.push({
+            kind: 'total',
+            yTop: totalLine.yTop,
+            yBottom: totalLine.yBottom,
+            label: 'sum',
+        });
+    }
+
+    return {
+        headerEnd,
+        footerStart,
+        productSlice,
+        bands,
+        productInternals,
+    };
+};
+
+/**
+ * Step 1 entry point: produce typed bands for the dev-tool overlay.
+ * Per-band content extraction (step 2) lands as a separate function
+ * once these bands are visually validated against staged receipts.
+ */
+export function findReceiptBandsLidl(rawLines: LidlLine[]): LidlReceiptBandPlan {
+    const ctx = computeBandsContextLidlV2(rawLines);
+    return { bands: ctx.bands, productInternals: ctx.productInternals };
+}
+
+/** Copy-paste-friendly trace of the band layout + per-line classification. */
+export function traceReceiptBandsLidl(rawLines: LidlLine[]): string {
+    const ctx = computeBandsContextLidlV2(rawLines);
+    const out: string[] = [];
+    const TRUNC = (s: string, n = 80): string =>
+        s.length <= n ? s : s.slice(0, n - 1) + '…';
+    const fmtY = (line: LidlLine): string =>
+        `y=${Math.round(line.yTop)}..${Math.round(line.yBottom)}`;
+
+    out.push(
+        `lines: total=${rawLines.length} ` +
+            `headerEnd=${ctx.headerEnd} footerStart=${ctx.footerStart} ` +
+            `bands=${ctx.bands.length}`,
+    );
+    if (ctx.headerEnd > 0 && ctx.headerEnd <= rawLines.length) {
+        const lastH = rawLines[ctx.headerEnd - 1];
+        out.push(`  lastHeaderLine: ${fmtY(lastH)} "${TRUNC(lastH.text)}"`);
+    }
+    if (ctx.footerStart < rawLines.length) {
+        const firstF = rawLines[ctx.footerStart];
+        out.push(`  firstFooterLine: ${fmtY(firstF)} "${TRUNC(firstF.text)}"`);
+    }
+    out.push('');
+
+    out.push(`bands=${ctx.productInternals.length}`);
+    for (let i = 0; i < ctx.productInternals.length; i++) {
+        const internal = ctx.productInternals[i];
+        const bandNum = internal.bandIdx + 1;
+        out.push(`band ${bandNum}:`);
+        for (const e of internal.preName) {
+            out.push(`  pre  [${e.reason.padEnd(15)}] ${fmtY(e.line)} "${TRUNC(e.line.text)}"`);
+        }
+        out.push(
+            `  ANC  [anchor         ] ${fmtY(internal.anchor.line)} "${TRUNC(internal.anchor.line.text)}"`,
+        );
+        for (const e of internal.postAnchor) {
+            out.push(`  post [${e.reason.padEnd(15)}] ${fmtY(e.line)} "${TRUNC(e.line.text)}"`);
+        }
+    }
+    return out.join('\n');
+}
+
+// ─────────────────────────────────────────────────────────────────
+// V2 step 2: per-band extraction
+// ─────────────────────────────────────────────────────────────────
+
+export interface LidlExtractResult {
+    product: LidlProduct | null;
+    warnings: string[];
+}
+
+// Deposit-return cluster (`Išimta (Užstatas)` + `0001015 Užstato
+// grąžinimas -0,90 !`) — refund for returned empties from a
+// previous trip. Per project policy, drop entirely during step 2:
+// not a product, doesn't apply to product price, doesn't surface
+// anywhere downstream. Both header and the negative price-half
+// caught here.
+const DEPOSIT_RETURN_RE = /(?:i[sš]imta|gr[aą][zž]inima)/i;
+// Bare negative deposit-return price `-0,90 !` — the price-half
+// after splitFusedAnchorLine peels it off the cluster name. None
+// of the standard regexes (PRICE_RE, PRICE_DEPOSIT_RE, DISCOUNT_RE)
+// match this exact shape (negative + `!` suffix), so it gets a
+// dedicated detector.
+const NEGATIVE_DEPOSIT_PRICE_RE = new RegExp(
+    `^-\\s*\\d+[.,]\\s?${D}{1,2}\\s*!\\s*$`,
+);
+
+const extractDiscountAmount = (text: string): number | null => {
+    // Capture a `-N,NN` token anywhere in the line. Used for both
+    // `Nuolaida -0,32 A` (label + value on one row) and the bare
+    // `-0,32 A` half. parseNum drops the negation.
+    const m = text.match(/-\s*(\d+[.,]\s?\d{1,2})/);
+    return m ? parseNum(m[1]) : null;
+};
+
+export function extractLidlProduct(internal: LidlBandInternal): LidlExtractResult {
+    const warnings: string[] = [];
+    const anchorText = internal.anchor.line.text.trim();
+
+    // Parse the anchor: clean PRICE_RE (`N,NN A`) wins, fall back
+    // to PRICE_OCR_RE (`N NN A` — comma read as whitespace by OCR).
+    let price: number;
+    const strict = anchorText.match(PRICE_RE);
+    if (strict) {
+        price = parseNum(strict[1]);
+    } else {
+        const ocr = anchorText.match(PRICE_OCR_RE);
+        if (!ocr) {
+            return {
+                product: null,
+                warnings: [`skip:anchor-parse-failed "${anchorText}"`],
+            };
+        }
+        price = parseNum(`${ocr[1]}.${ocr[2]}`);
+    }
+
+    let quantity = 1;
+    let unit = 'vnt';
+    let pricePerUnit: number | null = null;
+    let promoPrice: number | null = null;
+    const nameLines: string[] = [];
+
+    // preName walk: collect the product name and detect the
+    // multi-buy / weighable unit-line. Lidl's UNIT_LINE_RE shape
+    // is `<ppu> x <qty> <€/vnt.|kg>` (opposite ordering from
+    // Norfa's qty-first weighable). Discount lines that y-sorted
+    // ahead of the name go into promoPrice; deposit / deposit-
+    // return clusters are dropped silently.
+    for (const entry of internal.preName) {
+        const text = entry.line.text.trim();
+        if (!text) continue;
+        if (DEPOSIT_RETURN_RE.test(text)) continue;
+        if (NEGATIVE_DEPOSIT_PRICE_RE.test(text)) continue;
+        if (DEPOSIT_RE.test(text)) continue;
+        if (PRICE_DEPOSIT_RE.test(text)) continue;
+        // Discount fragment that y-sorted ahead of the name (rare
+        // for Lidl; the usual position is postAnchor). Capture
+        // promo if it's the first one seen.
+        if (DISCOUNT_HEADER_RE.test(text) || DISCOUNT_RE.test(text)) {
+            const d = extractDiscountAmount(text);
+            if (d !== null && promoPrice === null) {
+                promoPrice = Math.round((price - d) * 100) / 100;
+            }
+            continue;
+        }
+        // Product unit-line: `<ppu> x <qty> <unit>`. Captures qty
+        // (group 2) + ppu (group 1) + unit suffix (group 3). The
+        // suffix tells us `kg` vs `vnt`.
+        const unitMatch = text.match(UNIT_LINE_RE);
+        if (unitMatch) {
+            if (unitMatch[1] && pricePerUnit === null) {
+                pricePerUnit = parseNum(unitMatch[1]);
+            }
+            quantity = parseNum(unitMatch[2]);
+            unit = /kg/i.test(unitMatch[3] || '') ? 'kg' : 'vnt';
+            continue;
+        }
+        // Bare unit-fragment (`€/vnt.` alone) and pure-barcode
+        // lines — neither contributes to the name.
+        if (UNIT_ORPHAN_RE.test(text)) continue;
+        if (BARCODE_ONLY_RE.test(text)) continue;
+
+        nameLines.push(text);
+    }
+
+    // postAnchor walk: only the discount value matters here for
+    // the product's promoPrice. Everything else (deposit cluster,
+    // deposit's own unit-line, deposit-return cluster) is dropped.
+    for (const entry of internal.postAnchor) {
+        const text = entry.line.text.trim();
+        if (!text) continue;
+        if (DEPOSIT_RETURN_RE.test(text)) continue;
+        if (NEGATIVE_DEPOSIT_PRICE_RE.test(text)) continue;
+        if (DISCOUNT_HEADER_RE.test(text) || DISCOUNT_RE.test(text)) {
+            const d = extractDiscountAmount(text);
+            if (d !== null && promoPrice === null) {
+                promoPrice = Math.round((price - d) * 100) / 100;
+            }
+            continue;
+        }
+        // Deposit name + bare deposit-price + deposit unit-line —
+        // present in the band for visual completeness but contribute
+        // nothing to the displayed product. Ignored.
+    }
+
+    // Build name. After fused-anchor splitting the barcode can land
+    // either at the start (`7600526 Švyturys …`) or end (`Viskis
+    // 40 % 7602419` / `Vištų kiaušiniai L 7610894`) of the joined
+    // text. Strip both ends.
+    let head = nameLines.join(' ').replace(/\s+/g, ' ').trim();
+    head = stripBarcodePrefix(head);
+    head = head.replace(new RegExp(`\\s+${BC}{4,10}\\s*$`), '').trim();
+    const name = head;
+
+    if (!name) {
+        return { product: null, warnings: ['skip:no-name'] };
+    }
+    if (NON_CATALOG_RE.test(name)) {
+        return {
+            product: null,
+            warnings: [`skip:non-catalog "${name.slice(0, 60)}"`],
+        };
+    }
+    if (DEPOSIT_RE.test(name)) {
+        return {
+            product: null,
+            warnings: [`skip:deposit-only "${name.slice(0, 60)}"`],
+        };
+    }
+    if (/^\d+[.,]?\d*$/.test(name)) {
+        return {
+            product: null,
+            warnings: [`skip:numeric-only-name "${name}"`],
+        };
+    }
+
+    const allLines = [
+        ...internal.preName.map((e) => e.line),
+        internal.anchor.line,
+        ...internal.postAnchor.map((e) => e.line),
+    ];
+
+    return {
+        product: {
+            name,
+            price,
+            promoPrice,
+            quantity,
+            unit,
+            pricePerUnit,
+            rawLines: allLines.map((l) => l.text),
+            region: regionOf(allLines),
+        },
+        warnings,
+    };
+}
+
+/** Per-band extraction trace, copy-paste-friendly companion to traceReceiptBandsLidl. */
+export function traceLidlExtract(rawLines: LidlLine[]): string {
+    const ctx = computeBandsContextLidlV2(rawLines);
+    const out: string[] = [];
+    const TRUNC = (s: string, n = 60): string =>
+        s.length <= n ? s : s.slice(0, n - 1) + '…';
+    out.push(`bands=${ctx.productInternals.length}`);
+    for (let i = 0; i < ctx.productInternals.length; i++) {
+        const internal = ctx.productInternals[i];
+        const { product, warnings } = extractLidlProduct(internal);
+        if (!product) {
+            out.push(`band ${i + 1}: SKIP  ${warnings[0] ?? 'unknown'}`);
+            continue;
+        }
+        const promo = product.promoPrice === null ? 'null' : product.promoPrice.toFixed(2);
+        const ppu = product.pricePerUnit === null ? 'null' : product.pricePerUnit.toFixed(2);
+        const status = warnings.length > 0 ? 'NOTE' : 'OK';
+        out.push(
+            `band ${i + 1}: ${status}  name="${TRUNC(product.name)}"  ` +
+                `price=${product.price.toFixed(2)}  promo=${promo}  ` +
+                `qty=${product.quantity}  unit=${product.unit}  ppu=${ppu}`,
+        );
+        for (const w of warnings) out.push(`        ${w}`);
+    }
+    return out.join('\n');
 }
