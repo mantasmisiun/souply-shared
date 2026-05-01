@@ -440,8 +440,22 @@ export function parseFooter(lines: MaximaLine[]): MaximaFooter {
       }
     }
     if (!receiptNo) {
-      const docMatch = text.match(/Dokumento\s+numeris:?\s*(\S+)/i);
-      if (docMatch) receiptNo = docMatch[1];
+      // "Dokumento numeris: 17571" on a single line. Require ≥3 digits
+      // for the value so a bare ":" left over by `:?` backtracking
+      // (when MLKit emits the label and value as two separate boxes
+      // on the same physical row) doesn't get captured.
+      const docMatch = text.match(/Dokumento\s+numeris:?\s+(\d{3,})/i);
+      if (docMatch) {
+        receiptNo = docMatch[1];
+      } else if (/Dokumento\s+numeris:?\s*$/i.test(text) && i + 1 < lines.length) {
+        // Label-only line — value sits on the next OCR entry (typical
+        // column-split: label left, digits right, sorted into separate
+        // entries by yTop ordering). Same shape as the Kvito Nr.
+        // two-line fallback above.
+        const next = lines[i + 1].text.trim();
+        const m = next.match(/^(\d{3,})/);
+        if (m) receiptNo = m[1];
+      }
     }
 
     // Sutaupėte 13,40
