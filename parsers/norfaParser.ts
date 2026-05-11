@@ -525,7 +525,7 @@ const NORFA_STORE_NAME_LINE_RE = /NORFOS|MA[ŽZ]MENA|UAB\s+NORF/i;
 // `[\d0OoIlL]` class used for product prices — seen in the wild:
 // `Vilties g.l, Dainų kaimas` where MLKit read `1` as lowercase `l`).
 const NORFA_ADDRESS_LINE_RE =
-    /[A-ZĄČĘĖĮŠŲŪŽa-ząčęėįšųūž]{3,}\s*(?:g[.,]?\s*)?[\d0OoIlL]+(?:[-/][\d0OoIlL]+)?\s*,\s*[A-ZĄČĘĖĮŠŲŪŽa-ząčęėįšųūž]{3,}/;
+    /[A-ZĄČĘĖĮŠŲŪŽa-ząčęėįšųūž]{3,}\s*(?:g[.,]?\s*)?[\d0OoIlL]+[A-Za-z]?(?:[-/][\d0OoIlL]+[A-Za-z]?)?\s*,\s*[A-ZĄČĘĖĮŠŲŪŽa-ząčęėįšųūž]{3,}/;
 
 export interface NorfaReceiptBand {
     kind: NorfaBandKind;
