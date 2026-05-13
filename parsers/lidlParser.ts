@@ -27,7 +27,7 @@
  * StoreProducts pointing at existing Maxima/Rimi/IKI Products.
  */
 
-import type { RegionKind, LabeledRegion } from './rimiParser';
+import type { RegionKind, LabeledRegion } from './rimiParser.js';
 
 export interface Region {
     yTop: number;

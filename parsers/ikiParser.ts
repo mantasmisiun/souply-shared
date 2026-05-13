@@ -28,7 +28,7 @@
  * screenshot stacks the same way it handles PDF pages.
  */
 
-import type { RegionKind, LabeledRegion } from './rimiParser';
+import type { RegionKind, LabeledRegion } from './rimiParser.js';
 
 export interface Region {
   yTop: number;

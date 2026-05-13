@@ -22,7 +22,7 @@
  *     of `1,22`) — same `[.,]\s?` pattern as the Maxima parser.
  */
 
-import type { RegionKind, LabeledRegion } from './rimiParser';
+import type { RegionKind, LabeledRegion } from './rimiParser.js';
 
 export interface Region {
     yTop: number;
