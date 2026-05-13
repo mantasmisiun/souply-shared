@@ -28,6 +28,8 @@
  * screenshot stacks the same way it handles PDF pages.
  */
 
+import type { RegionKind, LabeledRegion } from './rimiParser';
+
 export interface Region {
   yTop: number;
   yBottom: number;
@@ -54,6 +56,7 @@ export interface IkiProduct {
   region: Region;
 }
 
+/** Per-line bbox tracking — see rimiParser for the rationale. */
 export interface IkiHeader {
   chainName: string;
   storeCode: string;
@@ -62,6 +65,7 @@ export interface IkiHeader {
   pvmCode: string;
   rawText: string;
   region: Region;
+  lineRegions: LabeledRegion[];
 }
 
 export interface IkiFooter {
@@ -72,6 +76,7 @@ export interface IkiFooter {
   totalSavings: number | null;
   rawText: string;
   region: Region;
+  lineRegions: LabeledRegion[];
 }
 
 export interface IkiParseResult {
@@ -158,6 +163,7 @@ function findFooterStart(lines: IkiLine[], after: number): number {
 function parseHeader(lines: IkiLine[]): IkiHeader {
   let storeName = "";
   let storeAddress = "";
+  const lineRegions: LabeledRegion[] = [];
 
   for (const line of lines) {
     const text = line.text.trim();
@@ -174,6 +180,16 @@ function parseHeader(lines: IkiLine[]): IkiHeader {
       } else {
         storeAddress = rest;
       }
+      // Both store name and address come from the same OCR line on IKI
+      // receipts, so a single bbox covers them — label the band as
+      // storeAddress (matches the legend rendering elsewhere).
+      lineRegions.push({
+        kind: 'storeAddress',
+        yTop: line.yTop,
+        yBottom: line.yBottom,
+        xLeft: line.xLeft,
+        xRight: line.xRight,
+      });
       break;
     }
   }
@@ -186,6 +202,7 @@ function parseHeader(lines: IkiLine[]): IkiHeader {
     pvmCode: "",
     rawText: lines.map((l) => l.text).join("\n"),
     region: regionOf(lines),
+    lineRegions,
   };
 }
 
@@ -330,23 +347,49 @@ function parseFooter(lines: IkiLine[]): IkiFooter {
   let total: number | null = null;
   let totalSavings: number | null = null;
 
+  // Per-line tracker. IKI's footer parser only captures `total` from this
+  // function (date/time/receiptNo live in the parent — see parseIkiReceipt
+  // below — and are tracked there, not here). Tagged with `kind` for
+  // per-field colour + label.
+  const seen = new Set<string>();
+  const lineRegions: LabeledRegion[] = [];
+  const trackLine = (line: IkiLine, kind: RegionKind) => {
+    const key = `${kind}:${line.yTop}:${line.xLeft}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    lineRegions.push({
+      kind,
+      yTop: line.yTop,
+      yBottom: line.yBottom,
+      xLeft: line.xLeft,
+      xRight: line.xRight,
+    });
+  };
+
   for (const line of lines) {
     const text = line.text;
 
     // Prefer "Mokėta suma" (what was actually paid) as the headline total.
     // Falls back to "Pirkinių suma" if "Mokėta suma" is not present.
     const mokMatch = text.match(MOKETA_RE);
-    if (mokMatch) total = parseNum(mokMatch[1]);
+    if (mokMatch) {
+      total = parseNum(mokMatch[1]);
+      trackLine(line, 'total');
+    }
 
     if (total === null) {
       const pirkMatch = text.match(PIRKINIU_RE);
-      if (pirkMatch) total = parseNum(pirkMatch[1]);
+      if (pirkMatch) {
+        total = parseNum(pirkMatch[1]);
+        trackLine(line, 'total');
+      }
     }
 
     const sutMatch = text.match(SUTAUPYTA_RE);
     if (sutMatch) totalSavings = parseNum(sutMatch[1]);
   }
 
+  lineRegions.sort((a, b) => a.yTop - b.yTop);
   return {
     total,
     date: "",
@@ -355,6 +398,7 @@ function parseFooter(lines: IkiLine[]): IkiFooter {
     totalSavings,
     rawText: lines.map((l) => l.text).join("\n"),
     region: regionOf(lines),
+    lineRegions,
   };
 }
 
@@ -364,17 +408,26 @@ export function parseIkiReceipt(lines: IkiLine[]): IkiParseResult {
   // Date/time are in the header area on IKI; we still surface them via the
   // footer object to match the Rimi/Maxima interface the downstream UI reads.
   // Order can be either `YYYY MM DD HH:MM` or `HH:MM YYYY MM DD` — parse them
-  // independently so either layout works.
+  // independently so either layout works. Tracking the source lines so the
+  // Kvitas-tab photo can band them precisely.
   let date = "";
   let time = "";
+  let dateLine: IkiLine | undefined;
+  let timeLine: IkiLine | undefined;
   for (const line of lines.slice(0, 8)) {
     if (!date) {
       const d = line.text.match(DATE_ONLY_RE);
-      if (d) date = `${d[1]}-${d[2]}-${d[3]}`;
+      if (d) {
+        date = `${d[1]}-${d[2]}-${d[3]}`;
+        dateLine = line;
+      }
     }
     if (!time) {
       const t = line.text.match(TIME_ONLY_RE);
-      if (t) time = `${t[1]}:${t[2]}`;
+      if (t) {
+        time = `${t[1]}:${t[2]}`;
+        timeLine = line;
+      }
     }
     if (date && time) break;
   }
@@ -415,6 +468,33 @@ export function parseIkiReceipt(lines: IkiLine[]): IkiParseResult {
 
   if (date) footer.date = date;
   if (time) footer.time = time;
+
+  // Push date/time line bboxes into the header's per-line regions —
+  // they physically live in the top region of IKI receipts even
+  // though the data is surfaced under the footer object. Same physical
+  // line is the combined `dateTime` kind; distinct lines get split
+  // `date` / `time` kinds — matches the Rimi parser convention.
+  const pushIfNew = (line: IkiLine | undefined, kind: RegionKind) => {
+    if (!line) return;
+    const exists = header.lineRegions.some(
+      (r) => r.yTop === line.yTop && r.yBottom === line.yBottom && r.kind === kind,
+    );
+    if (exists) return;
+    header.lineRegions.push({
+      kind,
+      yTop: line.yTop,
+      yBottom: line.yBottom,
+      xLeft: line.xLeft,
+      xRight: line.xRight,
+    });
+  };
+  if (dateLine && timeLine && dateLine === timeLine) {
+    pushIfNew(dateLine, 'dateTime');
+  } else {
+    pushIfNew(dateLine, 'date');
+    pushIfNew(timeLine, 'time');
+  }
+  header.lineRegions.sort((a, b) => a.yTop - b.yTop);
 
   // IKI's in-app receipt view doesn't expose a receipt number, so there's no
   // natural unique key. Synthesize one from date+time+total: the same receipt

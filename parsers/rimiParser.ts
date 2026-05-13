@@ -48,6 +48,32 @@ export interface Region {
     xRight: number;
 }
 
+/**
+ * Logical kind for a parsed field's bbox. The mobile photo view groups
+ * regions by kind to colour and label each band ("Suma", "Data ir
+ * laikas", "Kvito Nr.", …). Add new kinds at the end so persisted
+ * receipts stay forward-compatible.
+ *
+ * `storeName` is reserved but not currently emitted — name comes from
+ * the server's store-match by address. The kind exists so future
+ * parser work can label it without a new schema bump.
+ */
+export type RegionKind =
+    | 'storeName'
+    | 'storeAddress'
+    | 'storeCode'
+    | 'total'
+    | 'date'
+    | 'time'
+    | 'dateTime'
+    | 'receiptNo';
+
+/** A `Region` with the logical field it covers. Used in
+ *  `header.lineRegions` / `footer.lineRegions` post-Phase-6. */
+export interface LabeledRegion extends Region {
+    kind: RegionKind;
+}
+
 /** Input line: text plus its bounding box on the source image. */
 export interface RimiLine {
     text: string;
@@ -75,6 +101,11 @@ export interface RimiHeader {
     pvmCode: string;
     rawText: string;
     region: Region;
+    /** Per-field source-line bboxes tagged with their `kind` — store
+     *  code, address, etc. Mobile renders one band per entry, coloured
+     *  by kind; falls back to the block-`region` bbox when empty
+     *  (legacy receipts). */
+    lineRegions: LabeledRegion[];
 }
 
 export interface RimiFooter {
@@ -85,6 +116,10 @@ export interface RimiFooter {
     totalSavings: number | null;
     rawText: string;
     region: Region;
+    /** Per-field source-line bboxes tagged with their `kind` — total,
+     *  date/time, receipt №. Mobile renders one band per entry,
+     *  coloured by kind; falls back to `region` when empty. */
+    lineRegions: LabeledRegion[];
 }
 
 export interface RimiParseResult {
@@ -180,7 +215,22 @@ const LAIKAS_LABEL_RE = /\bLAIKAS\b/i;
 // `Mokėti` total label. Match the LABEL only — the amount lives
 // on a separate OCR line on most Rimi receipts. `\b` keeps
 // `Mokestis` and `Mokėtina` from false-matching.
-const TOTAL_LABEL_RE = /^\s*Mok[eėèé]ti\b/i;
+//
+// Diacritic char class is wider than just Lithuanian ė because OCR
+// engines (MLKit included) sometimes substitute `ė` with `ê` (e with
+// circumflex) or `ë` (e with diaeresis) when the model treats the
+// Lithuanian over-dot as a generic accent. Observed in the wild on a
+// PDFium-rendered Rimi receipt: the Mokėti row OCR'd as "Mokêti"
+// and the strict `[eėèé]` class missed it, leaving total=null. The
+// UI then fell back to the server's currentChain estimate (a wildly
+// different number) which read as a parser bug to the user.
+//
+// Reused by parseFooter's path-1 same-line moketiMatch regex too —
+// any expansion here must propagate to that regex (and to parts of
+// the parser that look for Lithuanian "ė" variants in similar
+// label words like `sutaupėte`).
+const E_DIACRITIC_CLASS = '[eėèéêëē]';
+const TOTAL_LABEL_RE = new RegExp(`^\\s*Mok${E_DIACRITIC_CLASS}ti\\b`, 'i');
 
 // Address heuristic — primary path is the canonical street suffix
 // abbreviation (`g.`/`pr.`/`al.`/`pl.`/`a.`).
@@ -592,10 +642,33 @@ export function parseHeader(lines: RimiLine[]): RimiHeader {
     let houseNumber = '';
     let city = '';
 
+    // Per-line region tracker: when a line yields a captured field
+    // (store identity, street, house/city), record its bbox once so
+    // the Kvitas-tab photo can show precise bands instead of one
+    // big block over the whole header. Each entry is tagged with its
+    // `kind` so the mobile renderer can colour and label per field.
+    const seen = new Set<string>();
+    const lineRegions: LabeledRegion[] = [];
+    const trackLine = (line: RimiLine, kind: RegionKind) => {
+        const key = `${kind}:${line.yTop}:${line.xLeft}`;
+        if (seen.has(key)) return;
+        seen.add(key);
+        lineRegions.push({
+            kind,
+            yTop: line.yTop,
+            yBottom: line.yBottom,
+            xLeft: line.xLeft,
+            xRight: line.xRight,
+        });
+    };
+
     for (const line of lines) {
         const text = line.text.trim();
         const codeMatch = text.match(/\bT(\d{3,4})\b/);
-        if (codeMatch && /RIMI|LIETUVA/i.test(text)) storeCode = 'T' + codeMatch[1];
+        if (codeMatch && /RIMI|LIETUVA/i.test(text)) {
+            storeCode = 'T' + codeMatch[1];
+            trackLine(line, 'storeCode');
+        }
 
         const pvmMatch = text.match(/(LT|IT)\d{9,12}/);
         if (pvmMatch) pvmCode = pvmMatch[0];
@@ -609,6 +682,7 @@ export function parseHeader(lines: RimiLine[]): RimiHeader {
             if (sm) {
                 streetName = sm[1];
                 streetSuffix = sm[2].toLowerCase();
+                trackLine(line, 'storeAddress');
             }
         }
         if (!houseNumber) {
@@ -616,6 +690,7 @@ export function parseHeader(lines: RimiLine[]): RimiHeader {
             if (cm) {
                 houseNumber = cm[1];
                 city = cm[2];
+                trackLine(line, 'storeAddress');
             }
         }
     }
@@ -629,6 +704,7 @@ export function parseHeader(lines: RimiLine[]): RimiHeader {
         storeAddress = `${houseNumber}, ${city}`;
     }
 
+    lineRegions.sort((a, b) => a.yTop - b.yTop);
     return {
         chainName: 'RIMI',
         storeCode,
@@ -636,6 +712,7 @@ export function parseHeader(lines: RimiLine[]): RimiHeader {
         pvmCode,
         rawText: lines.map((l) => l.text).join('\n'),
         region: regionOf(lines),
+        lineRegions,
     };
 }
 
@@ -681,6 +758,26 @@ export function parseFooter(lines: RimiLine[]): RimiFooter {
     let receiptNo = '';
     let totalSavings: number | null = null;
 
+    // Per-line region tracker (see parseHeader). Captures the lines
+    // that yielded total / date / time / receiptNo so the photo view
+    // bands each one precisely. Tagged with `kind` for per-field
+    // colour + label on the mobile renderer.
+    const seen = new Set<string>();
+    const lineRegions: LabeledRegion[] = [];
+    const trackLine = (line: RimiLine | undefined, kind: RegionKind) => {
+        if (!line) return;
+        const key = `${kind}:${line.yTop}:${line.xLeft}`;
+        if (seen.has(key)) return;
+        seen.add(key);
+        lineRegions.push({
+            kind,
+            yTop: line.yTop,
+            yBottom: line.yBottom,
+            xLeft: line.xLeft,
+            xRight: line.xRight,
+        });
+    };
+
     // OCR digit confusions on Rimi: `1`↔`l`/`I`, `0`↔`O`/`o`. Both
     // halves of the amount need to tolerate them — receipts in the
     // wild produce things like "Mokėti 25, O4" (cents read `O4`) and
@@ -692,8 +789,12 @@ export function parseFooter(lines: RimiLine[]): RimiFooter {
     const DIGIT_CHARS = '\\dOoIl';
     const SEPARATOR = `[.,\\s][^${DIGIT_CHARS}]*`;
 
+    // AMOUNT_RE accepts trailing junk (currency code, VAT letter, OCR
+    // smudge) — anchored start so a stray prefix can't slide the
+    // integer into the cents; tail is lenient because Rimi prints
+    // amounts as "25,04 EUR" or "25,04 A" depending on layout.
     const AMOUNT_RE = new RegExp(
-        `^([${DIGIT_CHARS}]+)${SEPARATOR}([${DIGIT_CHARS}]{2})$`,
+        `^([${DIGIT_CHARS}]+)${SEPARATOR}([${DIGIT_CHARS}]{2})(?:\\b|$)`,
     );
     const parseAmount = (s: string): number | null => {
         const m = s.trim().match(AMOUNT_RE);
@@ -706,40 +807,96 @@ export function parseFooter(lines: RimiLine[]): RimiFooter {
     for (let i = 0; i < lines.length; i++) {
         const text = lines[i].text.trim();
 
+        // Path 1: same-line "Mokėti N,NN". Uses the expanded diacritic
+        // class so OCR variants like "Mokêti"/"Mokëti" still match.
+        // The `total === null` guard prevents a later partial-match
+        // (e.g. on a Mokestis-derived line that slips through) from
+        // overwriting the first canonical match.
         const moketiMatch = text.match(
             new RegExp(
-                `Mok[eėèé]ti\\s+([${DIGIT_CHARS}]+)${SEPARATOR}([${DIGIT_CHARS}]{2})`,
+                `Mok${E_DIACRITIC_CLASS}ti\\s+([${DIGIT_CHARS}]+)${SEPARATOR}([${DIGIT_CHARS}]{2})`,
                 'i',
             ),
         );
-        if (moketiMatch) {
+        if (moketiMatch && total === null) {
             const intVal = parseInt(ocrDigit(moketiMatch[1]), 10);
             const cents = ocrDigit(moketiMatch[2]);
-            if (!isNaN(intVal)) total = parseFloat(intVal + '.' + cents);
+            if (!isNaN(intVal)) {
+                total = parseFloat(intVal + '.' + cents);
+                trackLine(lines[i], 'total');
+            }
         }
 
-        // "Mokėti" alone — the amount sits on the same physical row
-        // in the right-column. MLKit emits the two as separate text
-        // lines and y-sort can place either first. Scan a window of
-        // nearby lines and accept the candidate whose y-CENTER is
-        // close to the Mokėti line's center (same-row signature).
-        if (/^Mok[eėèé]ti$/i.test(text) && total === null) {
+        // "Mokėti" label scan — three layouts in the wild:
+        //   A) Same physical row, two OCR boxes: `Mokėti   25,04`.
+        //      Identified by y-RANGE OVERLAP between ml and cand
+        //      (more lenient than the previous center-distance check
+        //      which rejected pairs with mismatched text heights).
+        //   B) Stacked-but-nearby: `Mokėti` on one row, `25,04` on
+        //      the next. Forward-scan within a few lines.
+        //   C) MLKit DROPPED the integer half of the amount entirely
+        //      (observed on a PDFium-rendered Rimi receipt: the bold
+        //      "6,89" was OCR'd as just "89" with no separator, so
+        //      parseAmount can't recover it). Fall back to the FIRST
+        //      parseable amount further down the footer — typically
+        //      the VAT row's Suma-su-PVM column, which equals total.
+        //      The forward scan is bounded so unrelated content
+        //      below the footer can't false-positive.
+        //
+        // Uses TOTAL_LABEL_RE (word-boundary, not strict end-anchor)
+        // so OCR-trailing tokens like "Mokėti EUR" / "Mokėti :" still
+        // trigger the scan.
+        //
+        // trackLine(ml, 'total') runs UNCONDITIONALLY when the label
+        // is found — mirrors V2's `findReceiptBandsRimi` semantics so
+        // the band is always emitted even if no amount can be
+        // extracted from nearby lines. Without this the receipt-
+        // detail view shows no Suma band on receipts whose amount
+        // OCR is broken, even though V2 finds the label cleanly.
+        if (TOTAL_LABEL_RE.test(text) && total === null) {
             const ml = lines[i];
-            const mlCenter = (ml.yTop + ml.yBottom) / 2;
-            const mlH = ml.yBottom - ml.yTop;
+            trackLine(ml, 'total');
+            const isSameRow = (cand: RimiLine): boolean =>
+                Math.max(ml.yTop, cand.yTop) < Math.min(ml.yBottom, cand.yBottom);
+
+            let chosenCand: RimiLine | undefined;
+            let chosenAmount: number | null = null;
+
+            // Pass A — same-row scan (canonical Rimi layout).
             for (let k = Math.max(0, i - 3); k <= Math.min(lines.length - 1, i + 3); k++) {
                 if (k === i) continue;
                 const cand = lines[k];
-                const candCenter = (cand.yTop + cand.yBottom) / 2;
-                const candH = cand.yBottom - cand.yTop;
-                const minH = Math.min(mlH, candH);
-                if (minH <= 0) continue;
-                if (Math.abs(candCenter - mlCenter) >= minH * 0.5) continue;
+                if (!isSameRow(cand)) continue;
                 const amount = parseAmount(cand.text);
                 if (amount !== null) {
-                    total = amount;
+                    chosenCand = cand;
+                    chosenAmount = amount;
                     break;
                 }
+            }
+
+            // Pass B — forward scan up to 10 lines past Mokėti.
+            // Walks forward only so a discount/savings row above
+            // can't false-positive. Stops at the `Kvito Nr.` line
+            // (definitive end of the total/payment block) so
+            // unrelated amounts further down can't slip in.
+            if (chosenAmount === null) {
+                const KVITO_NR_STOP = /^Kvito\s+Nr/i;
+                for (let k = i + 1; k <= Math.min(lines.length - 1, i + 10); k++) {
+                    const cand = lines[k];
+                    if (KVITO_NR_STOP.test(cand.text.trim())) break;
+                    const amount = parseAmount(cand.text);
+                    if (amount !== null) {
+                        chosenCand = cand;
+                        chosenAmount = amount;
+                        break;
+                    }
+                }
+            }
+
+            if (chosenAmount !== null && chosenCand) {
+                total = chosenAmount;
+                trackLine(chosenCand, 'total');
             }
         }
 
@@ -750,6 +907,7 @@ export function parseFooter(lines: RimiLine[]): RimiFooter {
             if (dt) {
                 date = dt[1];
                 time = dt[2].replace(/\s/g, '');
+                trackLine(lines[i], 'dateTime');
             } else {
                 // Column-split fallback: the printed footer often has
                 // `LAIKAS  YYYY-MM-DD  HH:MM:SS` or `CR-XXXXX  YYYY-MM-DD HH:MM:SS`
@@ -767,6 +925,8 @@ export function parseFooter(lines: RimiLine[]): RimiFooter {
                     const mlH = ml.yBottom - ml.yTop;
                     let foundDate = dateOnly ? dateOnly[1] : '';
                     let foundTime = timeOnly ? timeOnly[1].replace(/\s/g, '') : '';
+                    let dateLine: RimiLine | undefined = dateOnly ? ml : undefined;
+                    let timeLine: RimiLine | undefined = timeOnly ? ml : undefined;
                     for (
                         let k = Math.max(0, i - 3);
                         k <= Math.min(lines.length - 1, i + 3);
@@ -781,36 +941,78 @@ export function parseFooter(lines: RimiLine[]): RimiFooter {
                         if (Math.abs(candCenter - mlCenter) >= minH * 0.5) continue;
                         if (!foundDate) {
                             const m = cand.text.match(/(\d{4}-\d{2}-\d{2})/);
-                            if (m) foundDate = m[1];
+                            if (m) {
+                                foundDate = m[1];
+                                dateLine = cand;
+                            }
                         }
                         if (!foundTime) {
                             const m = cand.text.match(
                                 /(?:^|[^\d])((?:[01]\d|2[0-3])\s?:\s?[0-5]\d\s?:\s?[0-5]\d)(?!\d)/,
                             );
-                            if (m) foundTime = m[1].replace(/\s/g, '');
+                            if (m) {
+                                foundTime = m[1].replace(/\s/g, '');
+                                timeLine = cand;
+                            }
                         }
                         if (foundDate && foundTime) break;
                     }
                     if (foundDate && foundTime) {
                         date = foundDate;
                         time = foundTime;
+                        // dateLine and timeLine may be the same physical
+                        // line (combined date+time bbox) — `trackLine`'s
+                        // dedup uses kind+coords so we tag the combined
+                        // case as `dateTime` and the split case with
+                        // distinct `date`/`time` kinds so the renderer
+                        // can colour both halves identically.
+                        if (dateLine && timeLine && dateLine === timeLine) {
+                            trackLine(dateLine, 'dateTime');
+                        } else {
+                            trackLine(dateLine, 'date');
+                            trackLine(timeLine, 'time');
+                        }
                     }
                 }
             }
         }
 
-        const nrMatch = text.match(/Kvito\s+Nr\.?\s*(.+)/i);
-        if (nrMatch) {
-            receiptNo = nrMatch[1]
-                .replace(/\s*Kasa\s+\d+.*$/i, '')
-                .replace(/\s+/g, '')
-                .trim();
+        // ReceiptNo: anchor to start of line so "BANKO KVITO NR. NNNN"
+        // (bank slip — not the receipt no) doesn't false-positive. Two
+        // canonical forms — `Kvito Nr. X/Y/Z Kasa NNNN` and `Kvito
+        // numeris XXXXX`. Both use the pre-defined anchored regexes
+        // at the top of the file so the BANKO guard is single-source.
+        //
+        // Rimi receipt numbers are pure digits + slashes — any letter
+        // chars (l, I, O, o) the OCR emits are misreads of 1 / 1 / 0 /
+        // 0. Normalise via ocrDigit before storing so the displayed
+        // receiptNo doesn't contain stray letters (and so DB lookups
+        // that compare against fresh OCR output still match).
+        if (!receiptNo && !BANKO_KVITO_RE.test(text) && RECEIPT_NO_KVITO_NR_RE.test(text)) {
+            const tail = text.replace(/^Kvito\s+Nr\.?\s*/i, '');
+            const cleaned = ocrDigit(
+                tail
+                    .replace(/\s*Kasa\s+\d+.*$/i, '')
+                    .replace(/\s+/g, '')
+                    .trim(),
+            );
+            if (cleaned) {
+                receiptNo = cleaned;
+                trackLine(lines[i], 'receiptNo');
+            }
         }
 
-        const numMatch = text.match(/Kvito\s+numeris\s+(\d+)/i);
-        if (numMatch && !receiptNo) receiptNo = numMatch[1];
+        if (!receiptNo && !BANKO_KVITO_RE.test(text) && RECEIPT_NO_KVITO_NUMERIS_RE.test(text)) {
+            const m = text.match(/^Kvito\s+numeris\s+(\d+)/i);
+            if (m) {
+                receiptNo = ocrDigit(m[1]);
+                trackLine(lines[i], 'receiptNo');
+            }
+        }
 
-        if (/sutaup[eėèé]te/i.test(text)) {
+        // Same OCR diacritic resilience as Mokėti — `sutaupėte`
+        // sometimes OCRs as `sutaupête`.
+        if (new RegExp(`sutaup${E_DIACRITIC_CLASS}te`, 'i').test(text)) {
             const s = text.match(/(\d+[.,]\d{2})/);
             if (s) totalSavings = parseNum(s[1]);
             else if (i + 1 < lines.length) {
@@ -820,6 +1022,7 @@ export function parseFooter(lines: RimiLine[]): RimiFooter {
         }
     }
 
+    lineRegions.sort((a, b) => a.yTop - b.yTop);
     return {
         total,
         date,
@@ -828,6 +1031,7 @@ export function parseFooter(lines: RimiLine[]): RimiFooter {
         totalSavings,
         rawText: lines.map((l) => l.text).join('\n'),
         region: regionOf(lines),
+        lineRegions,
     };
 }
 

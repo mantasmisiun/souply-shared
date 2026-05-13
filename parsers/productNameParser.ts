@@ -15,11 +15,13 @@ const KNOWN_UNITS = new Set(["g", "kg", "ml", "l", "vnt", "oz"]);
  *   "Foo, 150 g"         → strip ", 150 g",   amount=150,  unit="g"
  *   "Foo 150 g"          → strip " 150 g",    amount=150,  unit="g"
  *   "Foo, 935 g / 455 g" → strip trailing,    amount=935,  unit="g"  (prefers g)
- *   "Foo, 500 ml"        → strip ", 500 ml",  amount=null, unit=null (no g)
- *   "Foo, 1 l / 0.5 kg"  → strip trailing,    amount=null, unit=null (no g)
+ *   "Foo, 500 ml"        → strip ", 500 ml",  amount=500,  unit="ml"
+ *   "Foo, 2 l"           → strip ", 2 l",     amount=2,    unit="l"
+ *   "Foo, 1 l / 0.5 kg"  → strip trailing,    amount=1,    unit="l"  (prefers l side)
  *
  * Rule: name is always stripped when a matching suffix is found; amount + unit
- * are only returned when the suffix carries a "g" unit (per spec).
+ * are returned for g, kg, ml, l (prefer g first). "vnt"/"oz" are stripped but
+ * left as null since they don't meaningfully differentiate package sizes.
  * Weighable products skip parsing (amount/unit handled differently upstream).
  */
 export function parseProductName(
@@ -57,9 +59,12 @@ export function parseProductName(
     .replace(/[,\s]+$/, "")
     .trim();
 
-  // Prefer g when picking amount/unit for the created row
-  if (u1 === "g" && n1 != null) return { strippedName, amount: n1, unit: "g" };
-  if (u2 === "g" && n2 != null) return { strippedName, amount: n2, unit: "g" };
+  // Prefer g first (most specific packaged weight), then other measurable units
+  const RETURNABLE = ["g", "kg", "ml", "l"] as const;
+  for (const u of RETURNABLE) {
+    if (u1 === u && n1 != null) return { strippedName, amount: n1, unit: u };
+    if (u2 === u && n2 != null) return { strippedName, amount: n2, unit: u };
+  }
 
   return { strippedName, amount: null, unit: null };
 }

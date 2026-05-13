@@ -38,6 +38,8 @@
  * the receipt's printed numbers.
  */
 
+import type { RegionKind, LabeledRegion } from './rimiParser';
+
 export interface Region {
   yTop: number;
   yBottom: number;
@@ -64,6 +66,9 @@ export interface MaximaProduct {
   region: Region;
 }
 
+/** Per-field source-line bboxes. Mobile renders one band per entry;
+ *  legacy receipts (pre-refactor) won't have it, so it's optional and
+ *  the photo view falls back to the block `region`. */
 export interface MaximaHeader {
   chainName: string;
   storeCode: string;
@@ -71,6 +76,7 @@ export interface MaximaHeader {
   pvmCode: string;
   rawText: string;
   region: Region;
+  lineRegions: LabeledRegion[];
 }
 
 export interface MaximaFooter {
@@ -81,6 +87,7 @@ export interface MaximaFooter {
   totalSavings: number | null;
   rawText: string;
   region: Region;
+  lineRegions: LabeledRegion[];
 }
 
 export interface MaximaParseResult {
@@ -156,7 +163,7 @@ function sanitizeNumStr(s: string): string {
 //   - `Sutaupėte` shows up with `e`/`é`/`è`/`ė` in the middle —
 //     `[eéèė]` covers them all (the `/i` flag only case-folds
 //     ASCII, not the diacritic variants).
-const DISCOUNT_LABEL_RE = /(?:nuo\s*la\s*ida\s+preke\s*i|sutaup[eéèė]t)/i;
+const DISCOUNT_LABEL_RE = /(?:nuo\s*la\s*ida\s+preke\s*i|sutaup[eéèė]t|nuka[ij]?no)/i;
 
 // Refund/correction marker. Maxima prints a `TAISYMAS` header
 // followed by a 2- or 3-line block that mirrors the original
@@ -331,6 +338,26 @@ export function parseHeader(lines: MaximaLine[]): MaximaHeader {
   let storeAddress = "";
   let pvmCode = "";
 
+  // Per-line region tracker — records the bbox of each line that
+  // contributed to a captured field (store identity, address). The
+  // photo view bands each entry independently rather than covering
+  // the whole header with one giant block. Each entry tagged with
+  // `kind` so the renderer can colour and label per field.
+  const seen = new Set<string>();
+  const lineRegions: LabeledRegion[] = [];
+  const trackLine = (line: MaximaLine, kind: RegionKind) => {
+    const key = `${kind}:${line.yTop}:${line.xLeft}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    lineRegions.push({
+      kind,
+      yTop: line.yTop,
+      yBottom: line.yBottom,
+      xLeft: line.xLeft,
+      xRight: line.xRight,
+    });
+  };
+
   for (const line of lines) {
     const text = line.text.trim();
 
@@ -355,14 +382,19 @@ export function parseHeader(lines: MaximaLine[]): MaximaHeader {
       // Levenshtein ratio against a clean DB address and breaks the
       // store match.
       storeAddress = text.replace(/,?\s*Kasa\s+Nr\.?\s*\d+.*$/i, "").trim();
+      trackLine(line, 'storeAddress');
     }
 
     // Occasional "X-NNN MAXIMA" legacy store code — used only as a
     // display label since store matching is done via address.
     const codeMatch = text.match(/\b([A-Z]-\d{3,4})\s+MAXIMA\b/i);
-    if (codeMatch) storeCode = codeMatch[1].toUpperCase();
+    if (codeMatch) {
+      storeCode = codeMatch[1].toUpperCase();
+      trackLine(line, 'storeCode');
+    }
   }
 
+  lineRegions.sort((a, b) => a.yTop - b.yTop);
   return {
     chainName: "MAXIMA",
     storeCode,
@@ -370,6 +402,7 @@ export function parseHeader(lines: MaximaLine[]): MaximaHeader {
     pvmCode,
     rawText: lines.map((l) => l.text).join("\n"),
     region: regionOf(lines),
+    lineRegions,
   };
 }
 
@@ -380,81 +413,100 @@ export function parseFooter(lines: MaximaLine[]): MaximaFooter {
   let receiptNo = "";
   let totalSavings: number | null = null;
 
+  // Per-line region tracker — same intent as parseHeader. Tagged
+  // with `kind` for per-field colour + label.
+  const seen = new Set<string>();
+  const lineRegions: LabeledRegion[] = [];
+  const trackLine = (line: MaximaLine | undefined, kind: RegionKind) => {
+    if (!line) return;
+    const key = `${kind}:${line.yTop}:${line.xLeft}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    lineRegions.push({
+      kind,
+      yTop: line.yTop,
+      yBottom: line.yBottom,
+      xLeft: line.xLeft,
+      xRight: line.xRight,
+    });
+  };
+
   for (let i = 0; i < lines.length; i++) {
     const text = lines[i].text.trim();
 
     // Kvito suma 71,44 — same line or on the next.
     const sumaMatch = text.match(/Kvito\s+suma\s+(\d+[.,]\s?\d{2})/i);
-    if (sumaMatch) total = parseNum(sumaMatch[1]);
+    if (sumaMatch) {
+      total = parseNum(sumaMatch[1]);
+      trackLine(lines[i], 'total');
+    }
     if (/^Kvito\s+suma\s*$/i.test(text) && i + 1 < lines.length) {
       const m = lines[i + 1].text.trim().match(/(\d+[.,]\s?\d{2})/);
-      if (m) total = parseNum(m[1]);
+      if (m) {
+        total = parseNum(m[1]);
+        trackLine(lines[i], 'total');
+        trackLine(lines[i + 1], 'total');
+      }
     }
 
     // Fallback: `Mokėtina suma 71,44` or `f1Mokėtina suma 71,44`.
     if (total === null) {
       const mok = text.match(/Mok[eė]tina\s+suma\s+(\d+[.,]\s?\d{2})/i);
-      if (mok) total = parseNum(mok[1]);
+      if (mok) {
+        total = parseNum(mok[1]);
+        trackLine(lines[i], 'total');
+      }
     }
 
     // Receipt datetime — extract date and time INDEPENDENTLY.
-    // MLKit splits the `Data ir laikas    YYYY-MM-DD HH:MM:SS` row at
-    // the column gap on most receipts, and on some receipts also
-    // splits date and time onto separate lines. The previous
-    // same-line-required regex missed those splits → empty
-    // parsedData.footer.date → API fell back to upload time.
-    //
-    // Tight YYYY-MM-DD pattern (year 20xx, month 01-12, day 01-31)
-    // keeps Inv. Nr.-style hyphenated digit blobs (`1912-0030-3510-`)
-    // out. `\s*` between segments tolerates OCR-introduced
-    // whitespace inside the date (`2026 -01-22`, `2026- 01-22` —
-    // not common but cheap to accept). Time pattern accepts
-    // HH:MM:SS or HH:MM with valid hour (00-23) and minute (00-59)
-    // ranges. First valid date and first valid time win — they
-    // don't have to be on the same line.
     if (!date) {
       const m = text.match(
         /(20\d{2})\s*-\s*(0[1-9]|1[0-2])\s*-\s*(0[1-9]|[12]\d|3[01])/,
       );
-      if (m) date = `${m[1]}-${m[2]}-${m[3]}`;
+      if (m) {
+        date = `${m[1]}-${m[2]}-${m[3]}`;
+        trackLine(lines[i], 'date');
+      }
     }
     if (!time) {
       const m = text.match(
         /(?:^|[^\d])((?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d)?)(?!\d)/,
       );
-      if (m) time = m[1].length === 5 ? `${m[1]}:00` : m[1];
+      if (m) {
+        time = m[1].length === 5 ? `${m[1]}:00` : m[1];
+        trackLine(lines[i], 'time');
+      }
     }
 
-    // Receipt number. Three sources, priority order:
-    //   1. `Kvito Nr. 363753` on one line.
-    //   2. `Kvito Nr.` label + digits on the NEXT line.
-    //   3. `Dokumento numeris: 8107` (universal VMI fallback).
+    // Receipt number — Kvito Nr. on one line, on the next, or Dokumento numeris.
     if (!receiptNo) {
       const sameLine = text.match(/Kvito\s+Nr\.?\s+(\S+)/i);
       if (sameLine) {
         receiptNo = sameLine[1];
+        trackLine(lines[i], 'receiptNo');
       } else if (/^Kvito\s+Nr\.?\s*$/i.test(text) && i + 1 < lines.length) {
         const next = lines[i + 1].text.trim();
         const digits = next.match(/^(\d{3,})/);
-        if (digits) receiptNo = digits[1];
+        if (digits) {
+          receiptNo = digits[1];
+          trackLine(lines[i], 'receiptNo');
+          trackLine(lines[i + 1], 'receiptNo');
+        }
       }
     }
     if (!receiptNo) {
-      // "Dokumento numeris: 17571" on a single line. Require ≥3 digits
-      // for the value so a bare ":" left over by `:?` backtracking
-      // (when MLKit emits the label and value as two separate boxes
-      // on the same physical row) doesn't get captured.
       const docMatch = text.match(/Dokumento\s+numeris:?\s+(\d{3,})/i);
       if (docMatch) {
         receiptNo = docMatch[1];
+        trackLine(lines[i], 'receiptNo');
       } else if (/Dokumento\s+numeris:?\s*$/i.test(text) && i + 1 < lines.length) {
-        // Label-only line — value sits on the next OCR entry (typical
-        // column-split: label left, digits right, sorted into separate
-        // entries by yTop ordering). Same shape as the Kvito Nr.
-        // two-line fallback above.
         const next = lines[i + 1].text.trim();
         const m = next.match(/^(\d{3,})/);
-        if (m) receiptNo = m[1];
+        if (m) {
+          receiptNo = m[1];
+          trackLine(lines[i], 'receiptNo');
+          trackLine(lines[i + 1], 'receiptNo');
+        }
       }
     }
 
@@ -469,6 +521,7 @@ export function parseFooter(lines: MaximaLine[]): MaximaFooter {
     }
   }
 
+  lineRegions.sort((a, b) => a.yTop - b.yTop);
   return {
     total,
     date,
@@ -477,6 +530,7 @@ export function parseFooter(lines: MaximaLine[]): MaximaFooter {
     totalSavings,
     rawText: lines.map((l) => l.text).join("\n"),
     region: regionOf(lines),
+    lineRegions,
   };
 }
 

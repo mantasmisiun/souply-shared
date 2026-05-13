@@ -27,6 +27,8 @@
  * StoreProducts pointing at existing Maxima/Rimi/IKI Products.
  */
 
+import type { RegionKind, LabeledRegion } from './rimiParser';
+
 export interface Region {
     yTop: number;
     yBottom: number;
@@ -53,6 +55,7 @@ export interface LidlProduct {
     region: Region;
 }
 
+/** Per-line bbox tracking — see rimiParser for the rationale. */
 export interface LidlHeader {
     chainName: string;
     storeCode: string;
@@ -60,6 +63,7 @@ export interface LidlHeader {
     pvmCode: string;
     rawText: string;
     region: Region;
+    lineRegions: LabeledRegion[];
 }
 
 export interface LidlFooter {
@@ -70,6 +74,7 @@ export interface LidlFooter {
     totalSavings: number | null;
     rawText: string;
     region: Region;
+    lineRegions: LabeledRegion[];
 }
 
 export interface LidlParseResult {
@@ -354,14 +359,33 @@ const ADDRESS_LENIENT_RE =
 function parseHeader(lines: LidlLine[]): LidlHeader {
     let storeAddress = '';
     let pvmCode = '';
+    const seen = new Set<string>();
+    const lineRegions: LabeledRegion[] = [];
+    const trackLine = (line: LidlLine, kind: RegionKind) => {
+        const key = `${kind}:${line.yTop}:${line.xLeft}`;
+        if (seen.has(key)) return;
+        seen.add(key);
+        lineRegions.push({
+            kind,
+            yTop: line.yTop,
+            yBottom: line.yBottom,
+            xLeft: line.xLeft,
+            xRight: line.xRight,
+        });
+    };
+
     for (const l of lines) {
         const t = l.text.trim();
-        if (!storeAddress && ADDRESS_STRICT_RE.test(t)) storeAddress = t;
-        else if (!storeAddress && ADDRESS_LENIENT_RE.test(t) && !/PVM/i.test(t)) {
+        if (!storeAddress && ADDRESS_STRICT_RE.test(t)) {
             storeAddress = t;
+            trackLine(l, 'storeAddress');
+        } else if (!storeAddress && ADDRESS_LENIENT_RE.test(t) && !/PVM/i.test(t)) {
+            storeAddress = t;
+            trackLine(l, 'storeAddress');
         }
         if (!pvmCode && /PVM\s*mok/i.test(t)) pvmCode = t;
     }
+    lineRegions.sort((a, b) => a.yTop - b.yTop);
     return {
         chainName: 'LIDL',
         storeCode: '',
@@ -369,6 +393,7 @@ function parseHeader(lines: LidlLine[]): LidlHeader {
         pvmCode,
         rawText: lines.map((l) => l.text).join('\n'),
         region: regionOf(lines),
+        lineRegions,
     };
 }
 
@@ -395,23 +420,46 @@ function parseFooter(lines: LidlLine[]): LidlFooter {
     let time = '';
     let receiptNo = '';
 
+    const seen = new Set<string>();
+    const lineRegions: LabeledRegion[] = [];
+    const trackLine = (line: LidlLine | undefined, kind: RegionKind) => {
+        if (!line) return;
+        const key = `${kind}:${line.yTop}:${line.xLeft}`;
+        if (seen.has(key)) return;
+        seen.add(key);
+        lineRegions.push({
+            kind,
+            yTop: line.yTop,
+            yBottom: line.yBottom,
+            xLeft: line.xLeft,
+            xRight: line.xRight,
+        });
+    };
+
     for (let i = 0; i < lines.length; i++) {
         const t = lines[i].text.trim();
 
-        // `Mokėti` + `N,NN` — try same-line first (MLKit often
-        // fuses label + amount when the row prints them close
-        // together), fall back to the neighbour rows.
         if (/^mok[eė]ti\b/i.test(t)) {
             const sameLine = t.match(/(\d+[.,]\s?\d{1,2})/);
             if (sameLine) {
                 total = parseNum(sameLine[1]);
+                trackLine(lines[i], 'total');
             } else {
-                const neighbour = lines[i + 1]?.text ?? lines[i - 1]?.text ?? '';
-                const m = neighbour.match(/(\d+[.,]\s?\d{1,2})/);
-                if (m) total = parseNum(m[1]);
+                const next = lines[i + 1];
+                const prev = lines[i - 1];
+                const nextMatch = next?.text.match(/(\d+[.,]\s?\d{1,2})/);
+                const prevMatch = prev?.text.match(/(\d+[.,]\s?\d{1,2})/);
+                if (nextMatch) {
+                    total = parseNum(nextMatch[1]);
+                    trackLine(lines[i], 'total');
+                    trackLine(next, 'total');
+                } else if (prevMatch) {
+                    total = parseNum(prevMatch[1]);
+                    trackLine(lines[i], 'total');
+                    trackLine(prev, 'total');
+                }
             }
         }
-        // Aggregated discount (`Nuolaida 0,68`).
         if (/^nuolaid[aos]?\s*$/i.test(t)) {
             const neighbour = lines[i + 1]?.text ?? lines[i - 1]?.text ?? '';
             const m = neighbour.match(/(\d+[.,]\s?\d{1,2})/);
@@ -421,13 +469,18 @@ function parseFooter(lines: LidlLine[]): LidlFooter {
         if (dtMatch) {
             date = dtMatch[1].replace(/\s/g, '');
             time = dtMatch[2].replace(/\s/g, '');
+            trackLine(lines[i], 'dateTime');
         }
         if (!receiptNo) {
             const rn = t.match(/dokumento\s+numeris\s*:?\s*(\d+)/i);
-            if (rn) receiptNo = rn[1];
+            if (rn) {
+                receiptNo = rn[1];
+                trackLine(lines[i], 'receiptNo');
+            }
         }
     }
 
+    lineRegions.sort((a, b) => a.yTop - b.yTop);
     return {
         total,
         date,
@@ -436,6 +489,7 @@ function parseFooter(lines: LidlLine[]): LidlFooter {
         totalSavings,
         rawText: lines.map((l) => l.text).join('\n'),
         region: regionOf(lines),
+        lineRegions,
     };
 }
 

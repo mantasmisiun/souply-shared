@@ -22,6 +22,8 @@
  *     of `1,22`) — same `[.,]\s?` pattern as the Maxima parser.
  */
 
+import type { RegionKind, LabeledRegion } from './rimiParser';
+
 export interface Region {
     yTop: number;
     yBottom: number;
@@ -48,6 +50,7 @@ export interface NorfaProduct {
     region: Region;
 }
 
+/** Per-line bbox tracking — see rimiParser for the rationale. */
 export interface NorfaHeader {
     chainName: string;
     storeCode: string;
@@ -55,6 +58,7 @@ export interface NorfaHeader {
     pvmCode: string;
     rawText: string;
     region: Region;
+    lineRegions: LabeledRegion[];
 }
 
 export interface NorfaFooter {
@@ -65,6 +69,7 @@ export interface NorfaFooter {
     totalSavings: number | null;
     rawText: string;
     region: Region;
+    lineRegions: LabeledRegion[];
 }
 
 export interface NorfaParseResult {
@@ -98,9 +103,17 @@ const DEPOSIT_RE = /u[žz]stat[ao]s?\s+u[žz]\s+pakuot/i;
 // `Lojalumo kortelė * * …` — loyalty card row. Not a product; used
 // only as a footer-start marker.
 const LOYALTY_RE = /lojalumo\s+kortel/i;
-// `# Kvito numeris 67833 #` or `# Kvito numeri 60748 #` (OCR drops
-// trailing s sometimes). Everything before this line is header.
-const RECEIPT_NO_HEADER_RE = /kvito\s+numeri/i;
+// Receipt-number label header — two known printed forms:
+//   `# Kvito numeris 67833 #` or `# Kvito numeri 60748 #` (OCR drops
+//   trailing s sometimes), AND
+//   `Kvito Nr. 12345` (short label form, seen at the top and bottom
+//   on some Norfa receipts).
+// Everything before this line is header.
+const RECEIPT_NO_HEADER_RE = /kvito\s+(?:numeri|nr\.?)/i;
+// Capture form for the receipt number itself — same alternation,
+// with the number captured. Used by parseFooter + the top-scan
+// fallback to extract the value.
+const RECEIPT_NO_CAPTURE_RE = /kvito\s+(?:numeri\S*|nr\.?)\s+(\d+)/i;
 // Non-catalog checkout items (plastic bags). Same policy as other
 // parsers — skip them entirely. Two routes catch the bag rows:
 //
@@ -296,6 +309,25 @@ function parseHeader(lines: NorfaLine[]): NorfaHeader {
     let storeAddress = '';
     let storeCode = '';
     let pvmCode = '';
+
+    // Per-line region tracker — tagged with `kind` for per-field
+    // colour + label.
+    const seen = new Set<string>();
+    const lineRegions: LabeledRegion[] = [];
+    const trackLine = (line: NorfaLine | undefined, kind: RegionKind) => {
+        if (!line) return;
+        const key = `${kind}:${line.yTop}:${line.xLeft}`;
+        if (seen.has(key)) return;
+        seen.add(key);
+        lineRegions.push({
+            kind,
+            yTop: line.yTop,
+            yBottom: line.yBottom,
+            xLeft: line.xLeft,
+            xRight: line.xRight,
+        });
+    };
+
     for (let idx = 0; idx < lines.length; idx++) {
         const t = lines[idx].text.trim();
         // Reuse the V2 tagged-band address detector — it tolerates a
@@ -305,22 +337,11 @@ function parseHeader(lines: NorfaLine[]): NorfaHeader {
         if (!storeAddress) {
             const m = t.match(NORFA_ADDRESS_LINE_RE);
             if (m && m.index !== undefined) {
-                // Extract from the address match start (drop any
-                // upstream noise — e.g. `D1_`, `UAB NORFOS MAŽMENA`
-                // when MLKit fuses the chain-name line into the
-                // address line). Otherwise the chain prefix lands
-                // in the matcher's street-only variant and the
-                // levenshtein ratio blows past the 0.3 threshold.
                 storeAddress = t.slice(m.index).trim();
+                trackLine(lines[idx], 'storeAddress');
                 // Multi-line address: when the matched line ends
                 // with a trailing comma, the next line is its
-                // continuation (street → locality → region across
-                // rows). Seen on rural Norfa stores: `Vilties g.1,
-                // Dainų kaimas,` + `Šiaulių kaimiškoji seniūnija,
-                // Šiaulių rajonas`. The store-match endpoint needs
-                // the city/region tokens. Guarded against globbing
-                // unrelated lines (separator dashes, `Kvito numeris`
-                // marker, `Visada laukiame` greeting).
+                // continuation.
                 if (storeAddress.endsWith(',') && idx + 1 < lines.length) {
                     const next = lines[idx + 1].text.trim();
                     if (
@@ -329,17 +350,19 @@ function parseHeader(lines: NorfaLine[]): NorfaHeader {
                         !/kvito|laukiame/i.test(next)
                     ) {
                         storeAddress = `${storeAddress} ${next}`;
+                        trackLine(lines[idx + 1], 'storeAddress');
                     }
                 }
-                // Strip trailing `,` left over when no continuation
-                // line followed (keeps the displayed address tidy
-                // in the header card).
                 storeAddress = storeAddress.replace(/,\s*$/, '');
             }
         }
-        if (!storeCode && /KASA\s*Nr/i.test(t)) storeCode = t.replace(/^.*KASA\s*Nr\.?/i, '').trim();
+        if (!storeCode && /KASA\s*Nr/i.test(t)) {
+            storeCode = t.replace(/^.*KASA\s*Nr\.?/i, '').trim();
+            trackLine(lines[idx], 'storeCode');
+        }
         if (!pvmCode && /PVM\s*mok/i.test(t)) pvmCode = t;
     }
+    lineRegions.sort((a, b) => a.yTop - b.yTop);
     return {
         chainName: 'NORFA',
         storeCode,
@@ -347,6 +370,7 @@ function parseHeader(lines: NorfaLine[]): NorfaHeader {
         pvmCode,
         rawText: lines.map((l) => l.text).join('\n'),
         region: regionOf(lines),
+        lineRegions,
     };
 }
 
@@ -359,36 +383,55 @@ function parseFooter(lines: NorfaLine[]): NorfaFooter {
     let receiptNo = '';
     let totalSavings: number | null = null;
 
+    // Per-line region tracker — tagged with `kind` for per-field
+    // colour + label.
+    const seen = new Set<string>();
+    const lineRegions: LabeledRegion[] = [];
+    const trackLine = (line: NorfaLine | undefined, kind: RegionKind) => {
+        if (!line) return;
+        const key = `${kind}:${line.yTop}:${line.xLeft}`;
+        if (seen.has(key)) return;
+        seen.add(key);
+        lineRegions.push({
+            kind,
+            yTop: line.yTop,
+            yBottom: line.yBottom,
+            xLeft: line.xLeft,
+            xRight: line.xRight,
+        });
+    };
+
     for (let i = 0; i < lines.length; i++) {
         const t = lines[i].text.trim();
 
-        // Standalone `SUMA  N,NN EUR` is the final paid amount —
-        // appears below the `TARPINĖ SUMA` / `PVM1` block at the
-        // very bottom of every receipt. ALWAYS prefer it over
-        // `KVITO SUMA` because they diverge whenever NORFA points
-        // are redeemed (KVITO SUMA = gross items total, SUMA =
-        // gross − redeemed points = what the user actually paid).
         if (/^suma\b/i.test(t)) {
             const m = t.match(/(\d+[.,]\s?\d{1,2})\s*EUR/i);
-            if (m) total = parseNum(m[1]);
+            if (m) {
+                total = parseNum(m[1]);
+                trackLine(lines[i], 'total');
+            }
         }
-        // `KVITO SUMA` + `N,NN EUR` — fallback when MLKit doesn't
-        // pick up the bottom `SUMA` line cleanly. Some receipts
-        // print label and amount on one line, others split across
-        // rows; try the same line first, then fall back to
-        // neighbours. Only sets total when standalone SUMA hasn't.
         if (total === null && /^kvito\s+suma/i.test(t)) {
             const sameLine = t.match(/(\d+[.,]\s?\d{1,2})\s*EUR/i);
             if (sameLine) {
                 total = parseNum(sameLine[1]);
+                trackLine(lines[i], 'total');
             } else {
                 const neighbour = lines[i - 1]?.text ?? lines[i + 1]?.text ?? '';
                 const m = neighbour.match(/(\d+[.,]\s?\d{1,2})\s*EUR/i);
-                if (m) total = parseNum(m[1]);
+                if (m) {
+                    total = parseNum(m[1]);
+                    trackLine(lines[i], 'total');
+                    // Track the actual neighbour we read from.
+                    if (lines[i - 1] && /(\d+[.,]\s?\d{1,2})\s*EUR/i.test(lines[i - 1].text)) {
+                        trackLine(lines[i - 1], 'total');
+                    } else {
+                        trackLine(lines[i + 1], 'total');
+                    }
+                }
             }
         }
         // `NUOLAIDA PREKIŲ SUMAI` — total discount across all items.
-        // Same same-line/neighbour fallback as KVITO SUMA.
         if (/nuolaida\s+preki/i.test(t)) {
             const sameLine = t.match(/(\d+[.,]\s?\d{1,2})\s*EUR/i);
             if (sameLine) {
@@ -404,15 +447,20 @@ function parseFooter(lines: NorfaLine[]): NorfaFooter {
         if (dtMatch) {
             date = dtMatch[1];
             time = dtMatch[2];
+            trackLine(lines[i], 'dateTime');
         }
-        // Receipt number at footer tail — `67833` alone, or
-        // `# Kvito numeris 67833 #` if we didn't catch it earlier.
+        // Receipt number at footer tail — accepts both "Kvito numeris"
+        // and "Kvito Nr." label forms.
         if (!receiptNo) {
-            const rnMatch = t.match(/kvito\s+numeri\S*\s+(\d+)/i);
-            if (rnMatch) receiptNo = rnMatch[1];
+            const rnMatch = t.match(RECEIPT_NO_CAPTURE_RE);
+            if (rnMatch) {
+                receiptNo = rnMatch[1];
+                trackLine(lines[i], 'receiptNo');
+            }
         }
     }
 
+    lineRegions.sort((a, b) => a.yTop - b.yTop);
     return {
         total,
         date,
@@ -421,6 +469,7 @@ function parseFooter(lines: NorfaLine[]): NorfaFooter {
         totalSavings,
         rawText: lines.map((l) => l.text).join('\n'),
         region: regionOf(lines),
+        lineRegions,
     };
 }
 
@@ -447,11 +496,22 @@ export function parseNorfaReceipt(rawLines: NorfaLine[]): NorfaParseResult {
     // Some Norfa receipts print `# Kvito numeris N #` ONLY at the
     // top (inside the header slice that parseFooter doesn't see).
     // Scan the whole receipt as a fallback so headerEnd is included.
+    // When the fallback hits, also push the source line's bbox into
+    // footer.lineRegions so the photo view bands it — without this
+    // the receipt-no field reads but its band silently disappears.
     if (!footer.receiptNo) {
         for (const l of rawLines) {
-            const m = l.text.match(/kvito\s+numeri\S*\s+(\d+)/i);
+            const m = l.text.match(RECEIPT_NO_CAPTURE_RE);
             if (m) {
                 footer.receiptNo = m[1];
+                footer.lineRegions.push({
+                    kind: 'receiptNo',
+                    yTop: l.yTop,
+                    yBottom: l.yBottom,
+                    xLeft: l.xLeft,
+                    xRight: l.xRight,
+                });
+                footer.lineRegions.sort((a, b) => a.yTop - b.yTop);
                 break;
             }
         }
