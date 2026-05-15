@@ -508,12 +508,15 @@ function parseFooter(lines: LidlLine[]): LidlFooter {
  * (`findReceiptBandsLidl`) + per-band extractor
  * (`extractLidlProduct`).
  */
-export function parseLidlReceipt(rawLines: LidlLine[]): LidlParseResult {
+export function parseLidlReceipt(
+    rawLines: LidlLine[],
+    options: LidlParseOptions = {},
+): LidlParseResult {
     const headerEnd = findHeaderEnd(rawLines);
     const footerStart = findFooterStart(rawLines, headerEnd);
     const header = parseHeader(rawLines.slice(0, headerEnd));
     const footer = parseFooter(rawLines.slice(footerStart));
-    const plan = findReceiptBandsLidl(rawLines);
+    const plan = findReceiptBandsLidl(rawLines, options);
     const products: LidlProduct[] = [];
     for (const internal of plan.productInternals) {
         const { product } = extractLidlProduct(internal);
@@ -843,7 +846,16 @@ const splitFusedAnchorLineLidl = (line: LidlLine): [LidlLine, LidlLine] | null =
 const ROW_MERGE_YTOP_THRESHOLD_PX = 30;
 const ROW_MERGE_CENTER_RATIO = 0.4;
 
-const mergeRowFragmentsLidl = (rawLines: LidlLine[]): LidlLine[] => {
+const mergeRowFragmentsLidl = (
+    rawLines: LidlLine[],
+    options: { iosOcr?: boolean } = {},
+): LidlLine[] => {
+    if (options.iosOcr) {
+        return mergeRowFragmentsLidlIosOrdered(rawLines);
+    }
+    // ─── Android path (unchanged) ─────────────────────────────────
+    // In-place growing-cluster merge in encounter order. Keeps
+    // bit-identical behaviour for the Android pipeline.
     const out: LidlLine[] = [];
     for (const line of rawLines) {
         const last = out.length > 0 ? out[out.length - 1] : null;
@@ -873,6 +885,75 @@ const mergeRowFragmentsLidl = (rawLines: LidlLine[]): LidlLine[] => {
         last.yBottom = Math.max(last.yBottom, line.yBottom);
         last.xLeft = Math.min(last.xLeft, line.xLeft);
         last.xRight = Math.max(last.xRight, line.xRight);
+    }
+    return out;
+};
+
+/**
+ * iOS-only: cluster by y-proximity AND order each cluster's fragments
+ * by `xLeft` before concatenating. MLKit on iOS splits each physical
+ * row into 2-4 boxes that arrive in MLKit's reading order — which is
+ * NOT left-to-right within a row. Without xLeft sorting, the merged
+ * text reads `<price> <name> <barcode> <VAT>` and no fused-anchor
+ * regex matches it. With xLeft sorting, the merged text reads as on
+ * the physical receipt (`<barcode> <name> <price> <VAT>` for Lidl)
+ * which the existing `FUSED_PRICE_TAIL_RE` already handles.
+ */
+const mergeRowFragmentsLidlIosOrdered = (rawLines: LidlLine[]): LidlLine[] => {
+    if (rawLines.length === 0) return [];
+    // First pass: build clusters from already-y-sorted input. Two
+    // adjacent lines join the same cluster when their y-centers fall
+    // within ROW_MERGE_CENTER_RATIO * smaller-height. Compared against
+    // the growing cluster's bbox (not just the previous raw line) so
+    // a tall fragment can still pull in shorter neighbours.
+    const clusters: LidlLine[][] = [];
+    let curBbox: { yTop: number; yBottom: number } | null = null;
+    for (const line of rawLines) {
+        if (!curBbox) {
+            clusters.push([line]);
+            curBbox = { yTop: line.yTop, yBottom: line.yBottom };
+            continue;
+        }
+        const minH = Math.min(
+            line.yBottom - line.yTop,
+            curBbox.yBottom - curBbox.yTop,
+        );
+        const lineCenter = (line.yTop + line.yBottom) / 2;
+        const clusterCenter = (curBbox.yTop + curBbox.yBottom) / 2;
+        const yDiff = Math.abs(line.yTop - curBbox.yTop);
+        const sameRow =
+            yDiff < ROW_MERGE_YTOP_THRESHOLD_PX &&
+            minH > 0 &&
+            Math.abs(lineCenter - clusterCenter) < minH * ROW_MERGE_CENTER_RATIO;
+        if (sameRow) {
+            clusters[clusters.length - 1].push(line);
+            curBbox.yTop = Math.min(curBbox.yTop, line.yTop);
+            curBbox.yBottom = Math.max(curBbox.yBottom, line.yBottom);
+        } else {
+            clusters.push([line]);
+            curBbox = { yTop: line.yTop, yBottom: line.yBottom };
+        }
+    }
+
+    const out: LidlLine[] = [];
+    for (const cluster of clusters) {
+        if (cluster.length === 1) {
+            out.push({ ...cluster[0] });
+            continue;
+        }
+        const ordered = cluster.slice().sort((a, b) => a.xLeft - b.xLeft);
+        out.push({
+            text: ordered
+                .map((l) => l.text.trim())
+                .filter(Boolean)
+                .join(' ')
+                .replace(/\s+/g, ' ')
+                .trim(),
+            yTop: Math.min(...ordered.map((l) => l.yTop)),
+            yBottom: Math.max(...ordered.map((l) => l.yBottom)),
+            xLeft: Math.min(...ordered.map((l) => l.xLeft)),
+            xRight: Math.max(...ordered.map((l) => l.xRight)),
+        });
     }
     return out;
 };
@@ -1023,7 +1104,17 @@ interface LidlBandsContext {
     productInternals: LidlBandInternal[];
 }
 
-const computeBandsContextLidlV2 = (rawLines: LidlLine[]): LidlBandsContext => {
+export interface LidlParseOptions {
+    /** True when the OCR source is iOS MLKit. Switches the row-fragment
+     *  merger to xLeft-sorted clustering so multi-fragment rows
+     *  re-assemble in physical reading order. Off by default. */
+    iosOcr?: boolean;
+}
+
+const computeBandsContextLidlV2 = (
+    rawLines: LidlLine[],
+    options: LidlParseOptions = {},
+): LidlBandsContext => {
     const headerEnd = findHeaderEnd(rawLines);
     const footerStart = findFooterStart(rawLines, headerEnd);
     const headerSlice = rawLines.slice(0, headerEnd);
@@ -1038,7 +1129,7 @@ const computeBandsContextLidlV2 = (rawLines: LidlLine[]): LidlBandsContext => {
     // it would see them as same-row text and concatenate them
     // straight back, undoing the split.
     const rawProductSlice = rawLines.slice(headerEnd, footerStart);
-    const mergedProductSlice = mergeRowFragmentsLidl(rawProductSlice);
+    const mergedProductSlice = mergeRowFragmentsLidl(rawProductSlice, options);
     const productSlice: LidlLine[] = [];
     for (const line of mergedProductSlice) {
         const split = splitFusedAnchorLineLidl(line);
@@ -1225,8 +1316,11 @@ const computeBandsContextLidlV2 = (rawLines: LidlLine[]): LidlBandsContext => {
  * Per-band content extraction (step 2) lands as a separate function
  * once these bands are visually validated against staged receipts.
  */
-export function findReceiptBandsLidl(rawLines: LidlLine[]): LidlReceiptBandPlan {
-    const ctx = computeBandsContextLidlV2(rawLines);
+export function findReceiptBandsLidl(
+    rawLines: LidlLine[],
+    options: LidlParseOptions = {},
+): LidlReceiptBandPlan {
+    const ctx = computeBandsContextLidlV2(rawLines, options);
     return { bands: ctx.bands, productInternals: ctx.productInternals };
 }
 

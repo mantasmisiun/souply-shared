@@ -218,6 +218,128 @@ export function isMaximaReceipt(lines: string[]): boolean {
 
 // ───────── preprocessing ─────────
 
+// ───────── iOS MLKit row defragmentation ─────────
+//
+// On iOS, MLKit emits each receipt row as 2-4 separate text boxes at
+// near-identical y-coordinates (price, name, "A" VAT-letter as its own
+// 1-char OCR result, optional barcode), out of x-order. Android emits
+// one logical row per OCR result, so the existing band/anchor logic
+// assumes Android-shaped lines. To make iOS lines look Android-shaped:
+//   1. Group lines whose y-centers fall within a tight band into one
+//      cluster. Threshold mirrors `mergeRowFragmentsLidl` since the
+//      same MLKit fragmentation happens for both chains.
+//   2. Within each cluster, sort by xLeft so the merged text reads
+//      left-to-right as on the physical receipt (name → price → VAT).
+//   3. Concatenate with a single space and adjust the bbox to cover
+//      all fragments.
+//
+// The merger is OFF by default; callers pass `iosOcr: true` from
+// `Platform.OS === 'ios'`. Server-side scripts and Android keep the
+// untouched code path.
+const ROW_MERGE_YTOP_THRESHOLD_PX = 30;
+const ROW_MERGE_CENTER_RATIO = 0.4;
+
+export function mergeRowFragmentsMaxima(lines: MaximaLine[]): MaximaLine[] {
+  if (lines.length <= 1) return lines.slice();
+
+  // Cluster lines by y-proximity. Crucially, the threshold is checked
+  // against the cluster's growing bbox (its earliest yTop and latest
+  // yBottom), NOT against the previous fragment in arrival order.
+  // Without this anchoring, consecutive physical rows whose y-tops sit
+  // ~29 px apart would chain-merge into one ever-growing cluster: row
+  // N merges into N-1 (29 px gap), row N+1 then merges into the cluster
+  // because its gap to the LAST raw line is also 29 px, even though
+  // the cluster has now drifted 58 px from its origin. Anchoring on
+  // the cluster's top yTop caps total cluster height at the threshold.
+  const clusters: MaximaLine[][] = [];
+  let cur: MaximaLine[] = [lines[0]];
+  let curBbox = { yTop: lines[0].yTop, yBottom: lines[0].yBottom };
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i];
+    const yDiff = Math.abs(line.yTop - curBbox.yTop);
+    const minH = Math.min(
+      line.yBottom - line.yTop,
+      curBbox.yBottom - curBbox.yTop,
+    );
+    const lineCenter = (line.yTop + line.yBottom) / 2;
+    const clusterCenter = (curBbox.yTop + curBbox.yBottom) / 2;
+    const sameRow =
+      yDiff < ROW_MERGE_YTOP_THRESHOLD_PX &&
+      minH > 0 &&
+      Math.abs(lineCenter - clusterCenter) < minH * ROW_MERGE_CENTER_RATIO;
+    if (sameRow) {
+      cur.push(line);
+      curBbox.yTop = Math.min(curBbox.yTop, line.yTop);
+      curBbox.yBottom = Math.max(curBbox.yBottom, line.yBottom);
+    } else {
+      clusters.push(cur);
+      cur = [line];
+      curBbox = { yTop: line.yTop, yBottom: line.yBottom };
+    }
+  }
+  clusters.push(cur);
+
+  const out: MaximaLine[] = [];
+  for (const cluster of clusters) {
+    if (cluster.length === 1) {
+      out.push(cluster[0]);
+      continue;
+    }
+    const sorted = cluster.slice().sort((a, b) => a.xLeft - b.xLeft);
+    const joined = sorted
+      .map((l) => l.text.trim())
+      .filter(Boolean)
+      .join(' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    const text = normalizeIosNumberSpacing(joined);
+    const bbox = {
+      yTop: Math.min(...sorted.map((l) => l.yTop)),
+      yBottom: Math.max(...sorted.map((l) => l.yBottom)),
+      xLeft: Math.min(...sorted.map((l) => l.xLeft)),
+      xRight: Math.max(...sorted.map((l) => l.xRight)),
+    };
+
+    // iOS MLKit occasionally drops the trailing VAT-letter "A" / "B"
+    // box from a product row entirely (seen on PRINGLES rows in
+    // Maxima 2025-11-18). The merged text then ends `<name> <price>`
+    // with no VAT terminator, which neither PRICE_RE (requires A/B
+    // at end) nor RELAXED_PRICE_RE (whole-line bare price) matches
+    // as a single string — so no anchor, no band, the previous
+    // product's band visually swallows this row. Splitting into two
+    // virtual lines lets `findAnchors`' relaxed path see a bare price
+    // preceded by a name-like line, which it accepts as an anchor.
+    const tail = RELAXED_PRICE_TAIL_FOR_MERGE_RE.exec(text);
+    if (tail) {
+      out.push({ ...bbox, text: tail[1].trim() });
+      out.push({ ...bbox, text: tail[2].trim() });
+    } else {
+      out.push({ ...bbox, text });
+    }
+  }
+  return out;
+}
+
+// Squash whitespace inside `[sign?] digits , digits` tokens so a merged
+// fragment like `-1 ,48 A` (from MLKit splitting "-1,48" into "-1" and
+// ",48") becomes the canonical `-1,48 A` that `splitMergedLines` and
+// the price-anchor regexes already recognise. The regex is anchored on
+// the digit-space-comma-digit shape so genuine prose like `BRIOCHE, 20
+// %` (no digit before the comma+space) stays untouched.
+const IOS_NUMBER_SQUASH_RE = /(-?\s*\d+)\s+(,\s*\d{1,2})/g;
+const normalizeIosNumberSpacing = (s: string): string =>
+  s.replace(IOS_NUMBER_SQUASH_RE, (_m, head: string, tail: string) =>
+    `${head.replace(/\s+/g, '')}${tail.replace(/\s+/g, '')}`,
+  );
+
+// `<name with at least one letter> <price>` — leading prose, trailing
+// `X,XX` with no VAT letter after. Used to split iOS clusters where
+// the VAT terminator was dropped by MLKit. Anchored at `$` so any line
+// that does have `A`/`B` at the end falls through to the regular
+// `splitMergedLines` path.
+const RELAXED_PRICE_TAIL_FOR_MERGE_RE =
+  /^(.*?\p{L}.*?)\s+(\d+[.,]\d{2})\s*$/u;
+
 /**
  * Split OCR rows that have a price trailing at the end into two
  * pseudo-lines so downstream parsing sees name/discount and
@@ -847,6 +969,17 @@ export interface BandInternal {
   bandIdx: number;
   /** Positive-price line that anchored this band. */
   anchor: BandLineEntry;
+  /**
+   * Phantom band marker — only the visual layer should treat this entry
+   * as a real product slot. iOS MLKit occasionally drops a product's
+   * price line entirely (the row's `<price> <VAT>` boxes never reach
+   * the OCR output), leaving the product's name + savings stranded
+   * between two anchored bands. The parser inserts a phantom band over
+   * that y-range so the receipt overlay still splits the two products
+   * visually; `extractMaximaProduct` returns `{ product: null }` for
+   * these so they don't appear in the parsed products list.
+   */
+  phantom?: boolean;
   /** Name fragments appearing before the anchor, in slice order. */
   preName: BandLineEntry[];
   /**
@@ -884,14 +1017,116 @@ interface BandsContext {
   internals: BandInternal[];
 }
 
+export interface MaximaParseOptions {
+  /** True when the OCR source is iOS MLKit (multi-fragment rows). Runs
+   *  `mergeRowFragmentsMaxima` to glue the fragments back into one
+   *  Android-shaped line per physical receipt row. Off by default. */
+  iosOcr?: boolean;
+}
+
+// A `,\d{2}\s*[AB]$` tail with NO digit before the comma is a price
+// whose integer part MLKit dropped on iOS (seen as `,79 A` instead of
+// `1,79 A` on Maxima 2026-01-12). The combination of a name+broken-
+// price on a single line is a strong signal that the line represents
+// one complete product whose price can't be reconstructed.
+const BROKEN_PRICE_TAIL_COMMA_RE = /(?:^|\s),\d{2}\s*[AB]\s*$/;
+// A `\s\d{1,2}\s+[AB]\s*$` tail with no comma at all — even worse
+// than the above. Seen as `78 A` instead of `3,78 A` on Maxima
+// 2026-01-17 (where MLKit dropped both the integer and the comma).
+// The `(?<![\d,.])` lookbehind ensures we only match when the digits
+// stand alone (not after another digit, comma, or dot) so legitimate
+// `<X>,YY A` prices don't false-trigger.
+const BROKEN_PRICE_TAIL_NO_COMMA_RE = /(?<![\d,.])\d{1,2}\s+[AB]\s*$/;
+const isBrokenPriceTail = (text: string): boolean => {
+  if (BROKEN_PRICE_TAIL_COMMA_RE.test(text)) return true;
+  // Belt-and-braces: don't fire if the line is already a valid
+  // strict-price-tail. `\d{1,2}\s+[AB]$` would otherwise match the
+  // VAT-letter half of a normal `1,99 A` row in edge OCR cases.
+  if (PRICE_RE.test(text)) return false;
+  return BROKEN_PRICE_TAIL_NO_COMMA_RE.test(text);
+};
+
+/**
+ * Scan `productSlice[sliceStart .. anchorIdx)` for two iOS-specific
+ * orphan patterns and return the slice index *after* the orphan so
+ * the caller can carve a phantom band over `[sliceStart, trimPoint)`:
+ *
+ *   1) Orphan-discount: name-like content followed by an adjacent
+ *      (neg-amount, Sutaupėte:) pair. MLKit drops the product's
+ *      price row entirely; only the savings survives.
+ *   2) Orphan-broken-price: a single line that has BOTH a name (any
+ *      letter) AND a `,\d{2}\s*[AB]$` tail with no leading digit
+ *      before the comma. MLKit dropped the integer part of the price.
+ *
+ * Without intervention either pattern's content gets absorbed into
+ * the *next* product's preName, producing one band that visually and
+ * textually covers two products. Returns `null` if no orphan pattern
+ * is present (typical case — preName is empty or just a multi-line
+ * name continuation for the upcoming anchor).
+ */
+function findOrphanDiscountTrimPoint(
+  productSlice: MaximaLine[],
+  sliceStart: number,
+  anchorIdx: number,
+): number | null {
+  let hasNameBefore = false;
+  for (let i = sliceStart; i < anchorIdx; i++) {
+    const text = productSlice[i].text.trim();
+
+    // (2) Orphan-broken-price: this line alone is a complete product
+    // row whose price had its integer (or integer + comma) dropped.
+    // Carve it off as its own phantom — it can't be processed as a
+    // real product because there's no recoverable price, but it
+    // deserves its own visual band so the next product's band
+    // doesn't cover it.
+    if (/\p{L}/u.test(text) && isBrokenPriceTail(text)) {
+      return i + 1;
+    }
+
+    const isNeg = NEG_AMOUNT_RE.test(text);
+    const isDl = DISCOUNT_LABEL_RE.test(text);
+    if (isNeg || isDl) {
+      // (1) Only count as an orphan-discount block when the (neg-
+      // amount, sutaupėte) pair lives next to each other in the
+      // slice. A lone sutaupėte line without its neg-amount sibling
+      // is most likely a partial-OCR artefact of the previous band's
+      // savings — let the regular flow handle it.
+      const nextText = i + 1 < anchorIdx ? productSlice[i + 1].text.trim() : '';
+      const prevText = i - 1 >= sliceStart ? productSlice[i - 1].text.trim() : '';
+      const nextPaired =
+        (isNeg && DISCOUNT_LABEL_RE.test(nextText)) ||
+        (isDl && NEG_AMOUNT_RE.test(nextText));
+      const prevPaired =
+        (isNeg && DISCOUNT_LABEL_RE.test(prevText)) ||
+        (isDl && NEG_AMOUNT_RE.test(prevText));
+      if (hasNameBefore && (nextPaired || prevPaired)) {
+        const endIdx = nextPaired ? i + 1 : i;
+        return endIdx + 1;
+      }
+    } else if (/\p{L}/u.test(text)) {
+      hasNameBefore = true;
+    }
+  }
+  return null;
+}
+
 /**
  * Run the full step-1 pipeline (split → header/footer detect →
  * anchor → extend → boundary smoothing) and produce both the
  * y-coord band list and the per-band typed content. All public
  * entry points delegate here so the work happens exactly once.
  */
-function computeBandsContext(rawLines: MaximaLine[]): BandsContext {
-  const processed = splitMergedLines(rawLines);
+function computeBandsContext(
+  rawLines: MaximaLine[],
+  options: MaximaParseOptions = {},
+): BandsContext {
+  // iOS MLKit: defragment near-same-y boxes into one logical line
+  // before anything else sees the input. After this step the rest of
+  // the parser can treat the stream as Android-shaped.
+  const sourceLines = options.iosOcr
+    ? mergeRowFragmentsMaxima(rawLines)
+    : rawLines;
+  const processed = splitMergedLines(sourceLines);
   const headerEnd = findHeaderEnd(processed);
   const footerStart = findFooterStart(processed, headerEnd);
   const productSlice = processed.slice(headerEnd, footerStart);
@@ -917,14 +1152,61 @@ function computeBandsContext(rawLines: MaximaLine[]): BandsContext {
     // Lines before the first anchor are loose name fragments —
     // attach them to the first band so leading multi-line names
     // aren't lost.
-    const sliceStart = bi === 0 ? 0 : internalBands[bi - 1].lastIdx + 1;
-    const bandLines = productSlice.slice(sliceStart, band.lastIdx + 1);
+    const baseSliceStart = bi === 0 ? 0 : internalBands[bi - 1].lastIdx + 1;
+
+    // iOS-only: scan the gap between the previous band and this band's
+    // anchor for orphan patterns (price-dropped product rows whose
+    // content would otherwise get absorbed into this band's preName).
+    // Run iteratively so a single preName range can host multiple
+    // phantoms — e.g. a broken-price line AND a separate orphan-
+    // discount block in the same gap each get their own phantom.
+    let effectiveStart = baseSliceStart;
+    if (options.iosOcr) {
+      while (effectiveStart < band.anchorIdx) {
+        const orphanTrim = findOrphanDiscountTrimPoint(
+          productSlice,
+          effectiveStart,
+          band.anchorIdx,
+        );
+        if (orphanTrim === null || orphanTrim <= effectiveStart) break;
+        const phantomLines = productSlice.slice(effectiveStart, orphanTrim);
+        if (phantomLines.length === 0) break;
+        const phantomRegion = regionOf(phantomLines);
+        bands.push({
+          yTop: phantomRegion.yTop,
+          yBottom: phantomRegion.yBottom,
+        });
+        // The phantom anchor is a sentinel — its `reason: 'name'`
+        // makes it self-evidently NOT a price anchor, and the
+        // `phantom: true` flag tells the extractor to short-circuit
+        // before any price parsing runs.
+        const sentinelIdx = orphanTrim - 1;
+        internals.push({
+          bandIdx: bands.length - 1,
+          phantom: true,
+          anchor: {
+            line: productSlice[sentinelIdx],
+            sliceIdx: sentinelIdx,
+            reason: 'name',
+          },
+          preName: [],
+          postAnchor: [],
+          stop: {
+            sliceIdx: orphanTrim,
+            reason: 'stop-next-anchor',
+          },
+        });
+        effectiveStart = orphanTrim;
+      }
+    }
+
+    const bandLines = productSlice.slice(effectiveStart, band.lastIdx + 1);
     const region = regionOf(bandLines);
     bands.push({ yTop: region.yTop, yBottom: region.yBottom });
 
     const events = eventsPerBand[bi];
     const preName: BandLineEntry[] = [];
-    for (let k = sliceStart; k < band.anchorIdx; k++) {
+    for (let k = effectiveStart; k < band.anchorIdx; k++) {
       preName.push({ line: productSlice[k], sliceIdx: k, reason: 'name' });
     }
     const stopEv = events.find(
@@ -943,7 +1225,7 @@ function computeBandsContext(rawLines: MaximaLine[]): BandsContext {
           reason: 'stop-end-of-input' as const,
         };
     internals.push({
-      bandIdx: bi,
+      bandIdx: bands.length - 1,
       anchor: {
         line: productSlice[band.anchorIdx],
         sliceIdx: band.anchorIdx,
@@ -953,6 +1235,43 @@ function computeBandsContext(rawLines: MaximaLine[]): BandsContext {
       postAnchor,
       stop,
     });
+  }
+
+  // iOS-only: if no real anchors fired (every product on this
+  // receipt suffered a price-OCR dropout), scan the entire product
+  // slice for orphan patterns. Without this pass a receipt with
+  // only broken-price rows would render zero bands at all.
+  if (options.iosOcr && internalBands.length === 0) {
+    let cursor = 0;
+    while (cursor < productSlice.length) {
+      const orphanTrim = findOrphanDiscountTrimPoint(
+        productSlice,
+        cursor,
+        productSlice.length,
+      );
+      if (orphanTrim === null || orphanTrim <= cursor) break;
+      const phantomLines = productSlice.slice(cursor, orphanTrim);
+      if (phantomLines.length === 0) break;
+      const phantomRegion = regionOf(phantomLines);
+      bands.push({
+        yTop: phantomRegion.yTop,
+        yBottom: phantomRegion.yBottom,
+      });
+      const sentinelIdx = orphanTrim - 1;
+      internals.push({
+        bandIdx: bands.length - 1,
+        phantom: true,
+        anchor: {
+          line: productSlice[sentinelIdx],
+          sliceIdx: sentinelIdx,
+          reason: 'name',
+        },
+        preName: [],
+        postAnchor: [],
+        stop: { sliceIdx: orphanTrim, reason: 'stop-next-anchor' },
+      });
+      cursor = orphanTrim;
+    }
   }
 
   // Make adjacent bands share an exact divider, and extend the
@@ -977,8 +1296,11 @@ function computeBandsContext(rawLines: MaximaLine[]): BandsContext {
  * header/footer dividers so consumers can use `(yTop, yBottom)`
  * directly as a crop region.
  */
-export function findProductBands(lines: MaximaLine[]): ReceiptBandPlan {
-  const ctx = computeBandsContext(lines);
+export function findProductBands(
+  lines: MaximaLine[],
+  options: MaximaParseOptions = {},
+): ReceiptBandPlan {
+  const ctx = computeBandsContext(lines, options);
   return { bands: ctx.bands, internals: ctx.internals };
 }
 
@@ -1112,6 +1434,12 @@ const RECONCILE_TOLERANCE_EUR = 0.02;
  *   is informational — the product is still emitted.
  */
 export function extractMaximaProduct(internal: BandInternal): ExtractResult {
+  // Phantom bands cover orphan content where MLKit lost the price row;
+  // they exist only for the visual overlay. Nothing to extract.
+  if (internal.phantom) {
+    return { product: null, warnings: [] };
+  }
+
   const warnings: string[] = [];
 
   // TAISYMAS refund: net zero, drop.
@@ -1349,8 +1677,11 @@ export function traceMaximaExtract(rawLines: MaximaLine[]): string {
  * trace and reconcile self-check; the normalization happens once
  * at this boundary.
  */
-export function parseMaximaReceipt(lines: MaximaLine[]): MaximaParseResult {
-  const ctx = computeBandsContext(lines);
+export function parseMaximaReceipt(
+  lines: MaximaLine[],
+  options: MaximaParseOptions = {},
+): MaximaParseResult {
+  const ctx = computeBandsContext(lines, options);
   const header = parseHeader(ctx.processed.slice(0, ctx.headerEnd));
   const footer = parseFooter(ctx.processed.slice(ctx.footerStart));
   const products: MaximaProduct[] = [];
