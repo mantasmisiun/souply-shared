@@ -97,6 +97,20 @@ const WEIGHABLE_RE = new RegExp(
     `^\\s*(\\d+[.,]\\s?${D}{1,3})\\s*[xX]\\s*(${D}+[.,]\\s?${D}{1,2})\\s+(${D}+[.,]\\s?${D}{1,2})\\s*M\\s*[15]\\s*$`,
     'i'
 );
+
+// `2x2,15 4,30 M1` — inline integer-qty multi-buy (vnt). Captures:
+//   1 = quantity (integer, e.g. 2)
+//   2 = unit price (e.g. 2,15)
+//   3 = total (e.g. 4,30)
+// Sibling of WEIGHABLE_RE for the case where qty has no decimal —
+// kg-style weighables vs. unit-count multi-buys. Without this, the
+// integer-qty form gets classified as plain text, merges into the
+// next row's name, and the multi-buy product disappears from the
+// output (its band collapses into the next anchor's band).
+const WEIGHABLE_INT_RE = new RegExp(
+    `^\\s*(${D}+)\\s*[xX]\\s*(${D}+[.,]\\s?${D}{1,2})\\s+(${D}+[.,]\\s?${D}{1,2})\\s*M\\s*[15]\\s*$`,
+    'i'
+);
 // `*UŽstatas už pakuote PET` — bottle deposit. We don't surface
 // deposits as catalog products (same policy as Maxima/Rimi parsers).
 const DEPOSIT_RE = /u[žz]stat[ao]s?\s+u[žz]\s+pakuot/i;
@@ -280,7 +294,25 @@ export function isNorfaReceipt(lines: string[]): boolean {
 
 function findHeaderEnd(lines: NorfaLine[]): number {
     for (let i = 0; i < Math.min(lines.length, 20); i++) {
-        if (RECEIPT_NO_HEADER_RE.test(lines[i].text)) return i + 1;
+        if (RECEIPT_NO_HEADER_RE.test(lines[i].text)) {
+            // Header label found. On Android the label + value land
+            // on the same OCR line ("# Kvito numeris 67833 #"). On
+            // iOS MLKit splits them into two adjacent boxes:
+            //     # Kvito numeris      ← label only
+            //     326114               ← value only
+            // Without consuming the value too, it leaks into the
+            // first product's preName slice and shows up inside that
+            // product's displayed name. Look ahead one line and
+            // absorb a bare number if found.
+            let end = i + 1;
+            if (end < lines.length) {
+                const nextTrimmed = lines[end].text.trim();
+                if (/^#?\s*\d{3,}\s*#?$/.test(nextTrimmed)) {
+                    end++;
+                }
+            }
+            return end;
+        }
     }
     // Fallback: first standalone price line.
     for (let i = 0; i < lines.length; i++) {
@@ -632,8 +664,29 @@ interface NorfaProductBandInternal {
 
 const isPositivePriceLine = (line: NorfaLine): boolean => {
     const t = line.text.trim();
-    return PRICE_RE.test(t) || WEIGHABLE_RE.test(t);
+    return PRICE_RE.test(t) || WEIGHABLE_RE.test(t) || WEIGHABLE_INT_RE.test(t);
 };
+
+// Partial-buy lines (`qty x ppu`, no total/M-suffix). These are NOT
+// anchors — the total lives on the next OCR line — but they ARE
+// structurally distinct from name text and must be kept separate
+// during the same-row merge step. Without this check the merger
+// concatenates "2x0,69" with the next row's name fragment, and the
+// partial's qty/ppu information is lost to PARTIAL_DEC_LINE_RE
+// downstream because the leading partial no longer stands alone.
+const isPartialBuyLine = (line: NorfaLine): boolean => {
+    const t = line.text.trim();
+    return PARTIAL_DEC_LINE_RE.test(t) || PARTIAL_INT_LINE_RE.test(t);
+};
+
+// VAT-letter (`M1` / `M5`) and bare-price (`4,60`) detectors used by
+// the post-merge glue pass. iOS MLKit sometimes splits a single
+// "4,60 M1" anchor into two boxes; without re-gluing them, the row
+// has no canonical anchor and gets absorbed into the next product's
+// band. Both regexes are deliberately whole-line (`^…$`) to keep the
+// glue tight — anything more than the bare fragment skips.
+const NORFA_VAT_LETTER_RE = /^\s*M\s*[15]\s*$/i;
+const BARE_PRICE_FRAGMENT_RE = /^\s*\d+[.,]\s?\d{1,2}\s*$/;
 
 // Fused-anchor tail regexes — match the anchor portion at the END of
 // a line that starts with product-name text. MLKit on Norfa receipts
@@ -812,30 +865,111 @@ const mergeRowFragments = (rawLines: NorfaLine[]): NorfaLine[] => {
             out.push({ ...line });
             continue;
         }
-        const lineIsPrice = isPositivePriceLine(line);
-        const lastIsPrice = isPositivePriceLine(last);
-        if (lineIsPrice && !lastIsPrice) {
+        // Treat anchors AND partial-buy lines as "structural" — both
+        // must stay distinct from name text so downstream classifiers
+        // can read their qty/ppu / price fields. Without bucketing
+        // partials here, "2x0,69" (partial) merges with the next row's
+        // "Persiladas..." name and the qty/ppu info is lost.
+        const lineIsStructural = isPositivePriceLine(line) || isPartialBuyLine(line);
+        const lastIsStructural = isPositivePriceLine(last) || isPartialBuyLine(last);
+        if (lineIsStructural && !lastIsStructural) {
             out.push({ ...line });
             continue;
         }
-        if (!lineIsPrice && lastIsPrice) {
+        if (!lineIsStructural && lastIsStructural) {
             out.splice(out.length - 1, 0, { ...line });
             continue;
         }
-        if (lineIsPrice && lastIsPrice) {
+        if (lineIsStructural && lastIsStructural) {
             out.push({ ...line });
             continue;
         }
-        // Both plain text on the same row → merge.
-        last.text = `${last.text.trim()} ${line.text.trim()}`
-            .replace(/\s+/g, ' ')
-            .trim();
+
+        // Two same-row plain-text boxes can be either:
+        //   (a) column fragments to concatenate, or
+        //   (b) duplicate OCR readings of the same physical row.
+        // Disambiguate via x-overlap + text similarity. See the
+        // equivalent block in rimiParser.ts for the rationale and
+        // thresholds; same pattern, same tradeoffs.
+        const lastText = last.text.trim();
+        const lineText = line.text.trim();
+        const lastW = last.xRight - last.xLeft;
+        const lineW = line.xRight - line.xLeft;
+        const xOverlap = Math.max(
+            0,
+            Math.min(last.xRight, line.xRight) - Math.max(last.xLeft, line.xLeft),
+        );
+        const minW = Math.min(lastW, lineW);
+        const xOverlapRatio = minW > 0 ? xOverlap / minW : 0;
+        let positionMatches = 0;
+        const minLen = Math.min(lastText.length, lineText.length);
+        for (let k = 0; k < minLen; k++) {
+            if (lastText[k] === lineText[k]) positionMatches++;
+        }
+        const maxLen = Math.max(lastText.length, lineText.length);
+        const textSim = maxLen > 0 ? positionMatches / maxLen : 0;
+        if (xOverlapRatio > 0.5 && textSim > 0.7) {
+            // Duplicate — keep first-seen, expand bounds.
+            last.yTop = Math.min(last.yTop, line.yTop);
+            last.yBottom = Math.max(last.yBottom, line.yBottom);
+            last.xLeft = Math.min(last.xLeft, line.xLeft);
+            last.xRight = Math.max(last.xRight, line.xRight);
+            continue;
+        }
+
+        // Both plain text on the same row → merge by xLeft order so
+        // column boxes glue back into reading order.
+        const merged = last.xLeft <= line.xLeft
+            ? `${lastText} ${lineText}`
+            : `${lineText} ${lastText}`;
+        last.text = merged.replace(/\s+/g, ' ').trim();
         last.yTop = Math.min(last.yTop, line.yTop);
         last.yBottom = Math.max(last.yBottom, line.yBottom);
         last.xLeft = Math.min(last.xLeft, line.xLeft);
         last.xRight = Math.max(last.xRight, line.xRight);
     }
-    return out;
+
+    // Second pass: glue adjacent VAT-letter + bare-price pairs that
+    // ended up separated by the structural-splice logic. MLKit
+    // sometimes emits "X,YY M1" as two boxes ("X,YY" + "M1"); with
+    // a partial-buy line nearby, those boxes splice independently
+    // before their VAT companion, leaving no canonical anchor in
+    // the slice. This pass walks the output, recombining bare-price
+    // + VAT pairs at similar y so PRICE_RE matches them downstream.
+    const final: NorfaLine[] = [];
+    for (const item of out) {
+        if (final.length > 0) {
+            const last = final[final.length - 1];
+            const sameRow =
+                Math.abs(item.yTop - last.yTop) < ROW_MERGE_YTOP_THRESHOLD_PX;
+            if (sameRow) {
+                const lastTxt = last.text.trim();
+                const itemTxt = item.text.trim();
+                if (
+                    BARE_PRICE_FRAGMENT_RE.test(lastTxt) &&
+                    NORFA_VAT_LETTER_RE.test(itemTxt)
+                ) {
+                    last.text = `${lastTxt} ${itemTxt}`;
+                    last.yBottom = Math.max(last.yBottom, item.yBottom);
+                    last.xRight = Math.max(last.xRight, item.xRight);
+                    continue;
+                }
+                if (
+                    NORFA_VAT_LETTER_RE.test(lastTxt) &&
+                    BARE_PRICE_FRAGMENT_RE.test(itemTxt)
+                ) {
+                    last.text = `${itemTxt} ${lastTxt}`;
+                    last.yTop = Math.min(last.yTop, item.yTop);
+                    last.yBottom = Math.max(last.yBottom, item.yBottom);
+                    last.xLeft = Math.min(last.xLeft, item.xLeft);
+                    last.xRight = Math.max(last.xRight, item.xRight);
+                    continue;
+                }
+            }
+        }
+        final.push(item);
+    }
+    return final;
 };
 
 const findProductAnchorsV2 = (productSlice: NorfaLine[]): number[] => {
@@ -1231,11 +1365,19 @@ export function extractNorfaProduct(internal: NorfaBandInternal): NorfaExtractRe
     let pricePerUnit: number | null = null;
 
     const weighMatch = anchorText.match(WEIGHABLE_RE);
+    const weighIntMatch = weighMatch ? null : anchorText.match(WEIGHABLE_INT_RE);
     if (weighMatch) {
         quantity = parseNum(weighMatch[1]);
         pricePerUnit = parseNum(weighMatch[2]);
         price = parseNum(weighMatch[3]);
         unit = quantity % 1 !== 0 ? 'kg' : 'vnt';
+    } else if (weighIntMatch) {
+        // Integer-qty multi-buy (e.g. "2x2,15 4,30 M1"). qty is
+        // always integer here so unit is `vnt`, never `kg`.
+        quantity = parseNum(weighIntMatch[1]);
+        pricePerUnit = parseNum(weighIntMatch[2]);
+        price = parseNum(weighIntMatch[3]);
+        unit = 'vnt';
     } else {
         const priceMatch = anchorText.match(PRICE_RE);
         if (!priceMatch) {
@@ -1475,8 +1617,12 @@ export function extractNorfaProduct(internal: NorfaBandInternal): NorfaExtractRe
     }
 
     // postAnchor: discount tail (`Nuolaida 33%` + `-0,78 EUR`, in
-    // any order, possibly combined onto one line) and deposit lines
-    // that got folded in by the V2 wall logic.
+    // any order, possibly combined onto one line), deposit lines
+    // that got folded in by the V2 wall logic, AND partial-buy
+    // lines whose y-coords put them AFTER the anchor instead of
+    // before (happens when MLKit sorts the partial row's box a
+    // few pixels below the bare-price + VAT-letter pair that we
+    // glued into the canonical anchor).
     for (const entry of internal.postAnchor) {
         const text = entry.line.text.trim();
         if (!text) continue;
@@ -1486,6 +1632,26 @@ export function extractNorfaProduct(internal: NorfaBandInternal): NorfaExtractRe
                 promoPrice = Math.round((price - d) * 100) / 100;
             }
             continue;
+        }
+        if (pricePerUnit === null) {
+            if (PARTIAL_DEC_LINE_RE.test(text)) {
+                const m = text.match(PARTIAL_DEC_PARTS_RE);
+                if (m) {
+                    quantity = parseNum(m[1]);
+                    pricePerUnit = parseNum(m[2]);
+                    unit = quantity % 1 !== 0 ? 'kg' : 'vnt';
+                }
+                continue;
+            }
+            if (PARTIAL_INT_LINE_RE.test(text)) {
+                const m = text.match(PARTIAL_INT_PARTS_RE);
+                if (m) {
+                    quantity = parseNum(m[1]);
+                    pricePerUnit = parseNum(m[2]);
+                    unit = 'vnt';
+                }
+                continue;
+            }
         }
         // Deposit name + deposit price — both fold into the band
         // for visual completeness but neither contributes to the

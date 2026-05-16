@@ -319,6 +319,12 @@ function findHeaderEnd(lines: LidlLine[]): number {
 }
 
 function findFooterStart(lines: LidlLine[], afterIdx: number): number {
+    // Bare price (no VAT letter) — used by the look-back below to
+    // detect a footer marker's value that MLKit emitted as a separate
+    // box at near-same y. PRICE_RE accepts the same shape but with an
+    // optional VAT letter, which is too generous for the look-back —
+    // we want only the strict bare form here.
+    const BARE_PRICE_RE = /^\s*\d+[.,]\s?\d{1,2}\s*$/;
     for (let i = afterIdx; i < lines.length; i++) {
         // NFD-stripped copy for markers where OCR may have replaced
         // `ė` with `è`/`é`/`ê` — e.g. `Tarpinè suma` instead of the
@@ -327,17 +333,37 @@ function findFooterStart(lines: LidlLine[], afterIdx: number): number {
         // slice, generating phantom products for `Tarpinè suma`,
         // `Mokėti`, `NUolalda`, PVM tables, etc.
         const t = stripDiacritics(lines[i].text);
-        if (/^\s*tarpine\s+sum/.test(t)) return i;
-        if (/^\s*moketi\b/.test(t)) return i;
-        if (/^\s*mokejimas\s+kortele/.test(t)) return i;
-        if (/^\s*bekontak/.test(t)) return i;
+        let matched = false;
+        if (/^\s*tarpine\s+sum/.test(t)) matched = true;
+        else if (/^\s*moketi\b/.test(t)) matched = true;
+        else if (/^\s*mokejimas\s+kortele/.test(t)) matched = true;
+        else if (/^\s*bekontak/.test(t)) matched = true;
         // Dashed (`---`) or equal-sign (`===`) separator — Lidl
         // prints `===========` between the product list and the
         // PVM table. Catching it here keeps the visual band of
         // the LAST product from extending down into the
         // separator row when the V2 fold accepts everything to
         // the end of productSlice.
-        if (/^[=-]{5,}$/.test(t.trim())) return i;
+        else if (/^[=-]{5,}$/.test(t.trim())) matched = true;
+        if (!matched) continue;
+        // iOS MLKit emits the footer-marker value (e.g. "24,89" for
+        // "Tarpinė suma 24,89") as a separate OCR box at near-same y
+        // but a few px above. Without including it in the footer slice
+        // it sits in the product slice and PRICE_RE — which permits
+        // the VAT letter to be absent — anchors it as a phantom
+        // product with the previous line as the name. Look back from
+        // the matched marker; if the preceding line(s) are bare-price
+        // at near-same y, include them in the footer.
+        let start = i;
+        for (let j = i - 1; j >= afterIdx; j--) {
+            if (Math.abs(lines[j].yTop - lines[i].yTop) > 10) break;
+            if (BARE_PRICE_RE.test(lines[j].text)) {
+                start = j;
+                continue;
+            }
+            break;
+        }
+        return start;
     }
     return lines.length;
 }
@@ -749,6 +775,70 @@ const FUSED_PRICE_HEAD_BARCODE_RE = new RegExp(
     `^(${BC}{4,10})\\s+(\\d+[.,]\\s?${D}{1,2}\\s*[A-Z])\\s+`,
 );
 
+// Mid-line anchor with barcode at start. Handles the case where two
+// rows got merged together because of duplicate OCR readings, and
+// the first product's `X,YY A` anchor ended up sandwiched in the
+// middle of a long fused string rather than at head or tail. Pattern:
+//
+//   `<barcode> <name> X,YY A <trailing>`
+//
+// Examples seen in the wild on iOS Lidl receipts:
+//   - "0153420 Soft cake apels. skonio Cake dpe. .SKOT 0,83 A 3"
+//     (qty `3` got merged in as trailing noise)
+//   - "6717699 Jav.baton. su ban.ir šok. Jav.Datonl.SU Odn. I SoK. 0,29 A 2"
+//   - "0011941 ...Rūkyta paukštienos dešra 1,49 A ,49"
+//
+// The leading barcode is the strong context signal that this is a
+// structured product line, not free-form text that happens to
+// contain digits. Without it the pattern is too generous and over-
+// splits legitimate names that contain decimals (`Vyno 9,5 % 4,99 A`).
+//
+// Capture groups: 1 = barcode + name (everything before anchor),
+// 2 = the X,YY A anchor itself, 3 = trailing content after the
+// anchor (typically OCR noise, qty fragments, or the next row's
+// content if cluster contamination occurred).
+const FUSED_PRICE_MID_BARCODE_RE = new RegExp(
+    `^(${BC}{4,10}\\s+.+?\\S)\\s+(\\d+[.,]\\s?${D}{1,2}\\s*[A-Z])\\s+(\\S.*)$`,
+);
+
+// Split a barcode-prefixed line whose `X,YY A` anchor sits embedded
+// in the middle (rather than at head/tail). Used after the standard
+// splitter when two rows' contents got fused into one OCR line by
+// duplicate readings. Returns three parts:
+//   [0] barcode + name (before anchor)
+//   [1] anchor itself
+//   [2] trailing content (next row's name fragments, qty noise, etc.)
+// Returning null preserves the line unchanged when no mid-anchor is
+// detected, so this is safe to chain after splitFusedAnchorLineLidl.
+const splitMidAnchorLidl = (line: LidlLine): [LidlLine, LidlLine, LidlLine] | null => {
+    const trimmed = line.text.trim();
+    // Don't split clean anchors or anything already splittable by the
+    // head/tail logic — those are handled upstream.
+    if (PRICE_RE.test(trimmed)) return null;
+    if (PRICE_OCR_RE.test(trimmed)) return null;
+    if (PRICE_DEPOSIT_RE.test(trimmed)) return null;
+    if (FUSED_PRICE_TAIL_RE.test(trimmed)) return null;
+    if (FUSED_DEPOSIT_TAIL_RE.test(trimmed)) return null;
+    if (FUSED_PRICE_HEAD_RE.test(trimmed)) return null;
+    if (FUSED_DEPOSIT_HEAD_RE.test(trimmed)) return null;
+    const m = trimmed.match(FUSED_PRICE_MID_BARCODE_RE);
+    if (!m) return null;
+    const before = m[1].trim();
+    const anchor = m[2].trim();
+    const after = m[3].trim();
+    // Sanity: the "before" half must contain at least one letter, and
+    // "after" should be non-trivial (not just a single digit). Single-
+    // digit trailing fragments are usually OCR noise from the anchor's
+    // own row — keeping them as their own line is fine; they'll be
+    // ignored by name/anchor classifiers downstream.
+    if (!/[A-Za-zĄČĘĖĮŠŲŪŽąčęėįšųūž]/.test(before)) return null;
+    return [
+        { ...line, text: before },
+        { ...line, text: anchor },
+        { ...line, text: after },
+    ];
+};
+
 const splitFusedAnchorLineLidl = (line: LidlLine): [LidlLine, LidlLine] | null => {
     const trimmed = line.text.trim();
     // Already a clean anchor / deposit price — nothing to split.
@@ -941,7 +1031,226 @@ const mergeRowFragmentsLidlIosOrdered = (rawLines: LidlLine[]): LidlLine[] => {
             out.push({ ...cluster[0] });
             continue;
         }
-        const ordered = cluster.slice().sort((a, b) => a.xLeft - b.xLeft);
+        // In-cluster dedup. MLKit on iOS occasionally emits two boxes
+        // for the SAME physical column with slightly different
+        // character recognition. Three patterns observed:
+        //
+        //   (1) Whitespace/case noise: "Bande]es Su šokoladu" vs
+        //       "Bandelės su šokoladu" — same word, OCR mistakes.
+        //   (2) Heavy corruption: "UOTTy4| KuKy Ld paUKSTIenos" vs
+        //       "Rūkyta paukštienos dešra" — barely recognisable
+        //       text similarity, but same physical row.
+        //   (3) Whitespace-only: "Baltym. batonėl..." vs
+        //       "Baltym.batonėl..." — pure space difference.
+        //
+        // The dedup uses TWO independent triggers so each pattern
+        // catches:
+        //   - High text similarity (case-insensitive, whitespace-
+        //     stripped position-aligned compare). Handles (1) and (3).
+        //   - Very high x-overlap (>0.7) regardless of text sim,
+        //     since duplicate column readings always sit in the same
+        //     x-range. Handles (2) — heavy OCR mangling can't fool
+        //     the spatial signal.
+        //
+        // When dedup fires, KEEP the cleaner reading per a quality
+        // score (fraction of recognisable letters + spaces). Pure
+        // alphanumeric/space content scores higher than text full of
+        // `|`, `]`, digit/letter substitutions.
+        const normForSim = (s: string): string =>
+            s.replace(/\s+/g, '').toLowerCase();
+        const qualityScore = (s: string): number => {
+            if (s.length === 0) return 0;
+            let score = 0;
+            let letters = 0;
+            let digits = 0;
+            for (const ch of s) {
+                // Lithuanian diacritics get a bonus — they're unique
+                // to the language and a strong signal that this is
+                // the "clean" OCR reading rather than the corrupted
+                // twin (which usually loses diacritics, e.g.
+                // "ŠVž. sūrio užtepėlė" vs "SVZ.SurTo UZtepele").
+                if (/[ĄČĘĖĮŠŲŪŽąčęėįšųūž]/.test(ch)) { score += 1.5; letters++; }
+                else if (/[A-Za-z]/.test(ch)) { score += 1; letters++; }
+                else if (/\d/.test(ch)) { score += 1; digits++; }
+                else if (/[\s.,'\-%]/.test(ch)) score += 0.5;
+                // Special chars (`|`, `]`, etc.) contribute 0 —
+                // penalises OCR-mangled twins like "Bande]es" or
+                // "UOTTy4|" that interleave noise punctuation with
+                // legitimate text.
+            }
+            // ABSOLUTE score — longer cleaner reading wins. But
+            // penalize letter intrusions inside a mostly-numeric
+            // string: barcodes are digit-only, and a stray letter
+            // (e.g. "b7004 72" instead of "6700472", "001g160"
+            // instead of "0019160") is OCR garbage that shouldn't
+            // beat the clean numeric form just because it added a
+            // character of length.
+            if (digits > 4 && digits > letters * 3) {
+                score -= letters * 2;
+            }
+            return score;
+        };
+        // Two structurally-distinct dedup cases in the wild:
+        //
+        // (A) SAME-COLUMN DUPLICATE: two boxes cover the same physical
+        //     column (similar xLeft AND xRight, similar widths). MLKit
+        //     emitted two readings of the same word. Example:
+        //     "Bandelės su šokoladu" + "Bande]es Su šokoladu" both at
+        //     xLeft~60, xRight~700, both wide. Keep the cleaner.
+        //
+        // (B) MIDDLE-CONTAINED CORRUPTED FRAGMENT: a small box sits
+        //     inside a larger box's x-range but NOT at its left edge.
+        //     MLKit double-detected part of the row, producing a
+        //     short corrupted fragment that "shadows" the middle of
+        //     the clean wide reading. Example: "Cake dpe." (xLeft=300,
+        //     short) inside "Soft cake apels. skonio" (xLeft=60, wide).
+        //     Drop the shorter fragment.
+        //
+        // CRITICALLY: barcodes (`"0153420"`, narrow, at xLeft~50) sit
+        // to the LEFT of names. Their x-range is contained in the
+        // name's wide range by coincidence, but they start at the
+        // same xLeft as the row's leftmost edge. Case (B) must require
+        // the small box to start STRICTLY INSIDE the larger box, not
+        // at its left edge — otherwise barcodes get incorrectly
+        // dropped.
+        const deduped: LidlLine[] = [];
+        for (const box of cluster) {
+            const boxText = box.text.trim();
+            const boxNorm = normForSim(boxText);
+            const boxW = box.xRight - box.xLeft;
+            let dupAction: { kind: 'drop' | 'replace'; idx: number } | null = null;
+            for (let di = 0; di < deduped.length; di++) {
+                const seen = deduped[di];
+                const seenText = seen.text.trim();
+                const seenNorm = normForSim(seenText);
+                const seenW = seen.xRight - seen.xLeft;
+
+                // Case (A): same-column. Both xLeft and xRight close,
+                // similar widths (>50% length ratio).
+                const xLeftDist = Math.abs(box.xLeft - seen.xLeft);
+                const xRightDist = Math.abs(box.xRight - seen.xRight);
+                const widthRatio = Math.min(boxW, seenW) /
+                    Math.max(boxW, seenW || 1);
+                const sameColumn =
+                    xLeftDist < 100 && xRightDist < 100 && widthRatio > 0.5;
+                if (sameColumn) {
+                    // Pick the cleaner reading by quality score.
+                    if (qualityScore(boxText) > qualityScore(seenText)) {
+                        dupAction = { kind: 'replace', idx: di };
+                    } else {
+                        dupAction = { kind: 'drop', idx: di };
+                    }
+                    break;
+                }
+
+                // Case (B): box is contained in seen but starts inside
+                // (not at the left edge). Smaller corrupted fragment.
+                const xLeftOffset = box.xLeft - seen.xLeft;
+                const xRightOverhang = box.xRight - seen.xRight;
+                const boxIsMidContained =
+                    xLeftOffset > 50 &&
+                    xRightOverhang < 20 &&
+                    boxW < seenW * 0.7;
+                if (boxIsMidContained) {
+                    dupAction = { kind: 'drop', idx: di };
+                    break;
+                }
+                // Mirror: seen contained inside box.
+                const seenLeftOffset = seen.xLeft - box.xLeft;
+                const seenRightOverhang = seen.xRight - box.xRight;
+                const seenIsMidContained =
+                    seenLeftOffset > 50 &&
+                    seenRightOverhang < 20 &&
+                    seenW < boxW * 0.7;
+                if (seenIsMidContained) {
+                    dupAction = { kind: 'replace', idx: di };
+                    break;
+                }
+
+                // Substring containment: when one normalized text is
+                // contained inside the other (and the smaller is
+                // non-trivially long), the smaller is a sub-reading
+                // of the larger. Common on iOS Lidl with qty rows:
+                // MLKit emits "1,59 x" (left half) AND "2,000 €/vnt."
+                // (right half) AND "1,59 x 2,000 €/vnt." (full)
+                // as three boxes for one physical row. The full
+                // reading subsumes the two halves. Drop the smaller
+                // reading(s); keep the largest.
+                if (seenNorm.length > 4 && boxNorm.length > 4) {
+                    if (boxNorm !== seenNorm) {
+                        if (seenNorm.includes(boxNorm)) {
+                            dupAction = { kind: 'drop', idx: di };
+                            break;
+                        }
+                        if (boxNorm.includes(seenNorm)) {
+                            dupAction = { kind: 'replace', idx: di };
+                            break;
+                        }
+                    }
+                }
+
+                // Whitespace-normalized similarity fallback. Two
+                // separate thresholds:
+                //   - 0.7 when boxes are at unrelated x-positions
+                //     (e.g. one tiny matching fragment elsewhere)
+                //   - 0.5 when both boxes start at similar xLeft
+                //     (same left-column duplicate where MLKit
+                //     character-substituted heavily — "Virtas
+                //     kiaulienos kumpis riek." vs "VIrtdS Kldullenos
+                //     KUmpLS" scores ~63% position-aligned because
+                //     several letters got swapped to similar shapes;
+                //     anchored to the same column, this is still a
+                //     duplicate, not a different product).
+                const minLen = Math.min(seenNorm.length, boxNorm.length);
+                const maxLen = Math.max(seenNorm.length, boxNorm.length);
+                if (maxLen > 0) {
+                    let matches = 0;
+                    for (let k = 0; k < minLen; k++) {
+                        if (seenNorm[k] === boxNorm[k]) matches++;
+                    }
+                    const sim = matches / maxLen;
+                    const simThreshold = xLeftDist < 100 ? 0.5 : 0.7;
+                    if (sim > simThreshold) {
+                        if (qualityScore(boxText) > qualityScore(seenText)) {
+                            dupAction = { kind: 'replace', idx: di };
+                        } else {
+                            dupAction = { kind: 'drop', idx: di };
+                        }
+                        break;
+                    }
+                }
+            }
+            if (dupAction?.kind === 'replace') {
+                deduped[dupAction.idx] = { ...box };
+            } else if (dupAction?.kind === 'drop') {
+                // Don't add box.
+            } else {
+                deduped.push({ ...box });
+            }
+        }
+
+        // Post-pass: drop any entry whose normalized text is fully
+        // contained in another entry's normalized text. Catches the
+        // case where smaller fragments were added EARLIER, before the
+        // larger superset arrived in iteration. The in-loop substring
+        // check only triggers when comparing a NEW box to existing
+        // entries — it doesn't retroactively remove the now-subsumed
+        // smaller entries. Iterate in reverse so splice indices stay
+        // valid.
+        for (let i = deduped.length - 1; i >= 0; i--) {
+            const iNorm = normForSim(deduped[i].text);
+            if (iNorm.length <= 4) continue;
+            for (let j = 0; j < deduped.length; j++) {
+                if (i === j) continue;
+                const jNorm = normForSim(deduped[j].text);
+                if (jNorm.length > iNorm.length && jNorm.includes(iNorm)) {
+                    deduped.splice(i, 1);
+                    break;
+                }
+            }
+        }
+
+        const ordered = deduped.slice().sort((a, b) => a.xLeft - b.xLeft);
         out.push({
             text: ordered
                 .map((l) => l.text.trim())
@@ -1133,8 +1442,20 @@ const computeBandsContextLidlV2 = (
     const productSlice: LidlLine[] = [];
     for (const line of mergedProductSlice) {
         const split = splitFusedAnchorLineLidl(line);
-        if (split) productSlice.push(split[0], split[1]);
-        else productSlice.push(line);
+        if (split) {
+            productSlice.push(split[0], split[1]);
+            continue;
+        }
+        // No head/tail fused-anchor pattern. Try the mid-line splitter
+        // for the case where duplicate row readings concatenated two
+        // products into one cluster line with the first product's
+        // anchor sandwiched in the middle.
+        const midSplit = splitMidAnchorLidl(line);
+        if (midSplit) {
+            productSlice.push(midSplit[0], midSplit[1], midSplit[2]);
+            continue;
+        }
+        productSlice.push(line);
     }
     const footerSlice = rawLines.slice(footerStart);
 

@@ -802,6 +802,18 @@ function extendBand(
         last = j;
         events.push({ sliceIdx: j, reason: 'discount-amount' });
         j++;
+      } else if (j < lines.length && STANDALONE_PRICE_RE.test(lines[j].text.trim())) {
+        // iOS MLKit occasionally drops the leading `-` off a savings
+        // amount, so a Maxima `-4,00 A` arrives as `4,00 A`. The only
+        // semantically valid line that lives immediately under a
+        // `Sutaupėte:` label on a Maxima receipt is the discount
+        // amount, so accept a positive `STANDALONE_PRICE_RE` here as
+        // the discount amount. Android receipts always carry the
+        // minus and hit the NEG_AMOUNT_RE branch above, so this
+        // doesn't regress them.
+        last = j;
+        events.push({ sliceIdx: j, reason: 'discount-amount' });
+        j++;
       }
       continue;
     }
@@ -1435,9 +1447,12 @@ const RECONCILE_TOLERANCE_EUR = 0.02;
  */
 export function extractMaximaProduct(internal: BandInternal): ExtractResult {
   // Phantom bands cover orphan content where MLKit lost the price row;
-  // they exist only for the visual overlay. Nothing to extract.
+  // they exist only for the visual overlay. No product to extract,
+  // but surface a specific `skip:` warning so the receipt-detail UI
+  // shows "Neatpažinta kaina" instead of the generic "praleista"
+  // (which reads like an admin choice rather than an OCR limitation).
   if (internal.phantom) {
-    return { product: null, warnings: [] };
+    return { product: null, warnings: ['skip:ocr-price-dropped'] };
   }
 
   const warnings: string[] = [];
@@ -1546,10 +1561,16 @@ export function extractMaximaProduct(internal: BandInternal): ExtractResult {
 
   // promoPrice from the first discount/neg event we see. The
   // signed amount is the savings; promoPrice = price - |amount|.
+  // iOS MLKit sometimes drops the leading `-` off the savings row
+  // (`"4,00 A"` instead of `"-4,00 A"`). `extendBand` already absorbs
+  // these via STANDALONE_PRICE_RE and tags them `discount-amount`,
+  // so here we accept either signed or unsigned magnitude — the
+  // sign is implied by the event type.
   let promoPrice: number | null = null;
   for (const e of internal.postAnchor) {
     if (e.reason === 'discount-amount' || e.reason === 'bare-negative') {
-      const m = e.line.text.trim().match(NEG_AMOUNT_RE);
+      const txt = e.line.text.trim();
+      const m = txt.match(NEG_AMOUNT_RE) ?? txt.match(STANDALONE_PRICE_RE);
       if (m) {
         const amount = parseNum(m[1]);
         promoPrice = Math.round((price - amount) * 100) / 100;
@@ -1569,15 +1590,45 @@ export function extractMaximaProduct(internal: BandInternal): ExtractResult {
   // Reconcile self-check on bands that have an extracted unit-qty.
   // Receipt's own arithmetic: `ppu × qty` should match the printed
   // line price. Mismatch beyond €0.02 means OCR scrambled one of
-  // the three numbers — log it but still emit the product.
+  // the three numbers. Self-heal preferred over silent mismatch:
+  //
+  //   - `price` is anchored on `X,YY A/B` (strict regex, VAT letter)
+  //   - `quantity` is suffixed with `vnt`/`kg` (constrained by unit)
+  //   - `pricePerUnit` floats free in the middle column — the most
+  //     likely OCR victim.
+  //
+  // When the math fails we re-derive ppu from `price / quantity`.
+  // Two guards keep this from false-healing when the wrong number
+  // was elsewhere:
+  //   (1) derived × qty must itself reconcile (handles fp drift)
+  //   (2) |derived − OCR-ppu| ≤ €0.50, suggesting a digit-level
+  //       OCR error rather than a different number entirely. Larger
+  //       deltas imply price or quantity is wrong — leave alone and
+  //       warn so the dev can spot it.
   if (pricePerUnit !== null) {
     const expected = pricePerUnit * quantity;
     const delta = Math.abs(expected - price);
     if (delta > RECONCILE_TOLERANCE_EUR) {
-      warnings.push(
-        `reconcile MISMATCH: ppu=${pricePerUnit.toFixed(2)} × qty=${quantity} = ` +
-          `${expected.toFixed(2)} but price=${price.toFixed(2)} (Δ=${delta.toFixed(2)})`,
-      );
+      const HEAL_MAX_PPU_DELTA = 0.5;
+      const derived = quantity !== 0
+        ? Math.round((price / quantity) * 100) / 100
+        : null;
+      if (
+        derived !== null &&
+        Math.abs(derived * quantity - price) <= RECONCILE_TOLERANCE_EUR &&
+        Math.abs(derived - pricePerUnit) <= HEAL_MAX_PPU_DELTA
+      ) {
+        warnings.push(
+          `reconcile HEALED: ppu ${pricePerUnit.toFixed(2)} → ${derived.toFixed(2)} ` +
+            `(price=${price.toFixed(2)} ÷ qty=${quantity})`,
+        );
+        pricePerUnit = derived;
+      } else {
+        warnings.push(
+          `reconcile MISMATCH: ppu=${pricePerUnit.toFixed(2)} × qty=${quantity} = ` +
+            `${expected.toFixed(2)} but price=${price.toFixed(2)} (Δ=${delta.toFixed(2)})`,
+        );
+      }
     }
   }
 

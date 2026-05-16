@@ -472,8 +472,68 @@ const mergeRowFragments = (rawLines: RimiLine[]): RimiLine[] => {
             continue;
         }
 
-        // Both plain text on the same row → consolidate.
-        last.text = `${lastText} ${lineText}`.replace(/\s+/g, ' ').trim();
+        // Two same-row plain-text boxes can be either:
+        //   (a) column fragments to concatenate (left column + right
+        //       column of the same physical row), OR
+        //   (b) duplicate OCR readings of the same physical row that
+        //       MLKit emitted twice with slightly different character
+        //       recognition (iOS quirk on faded thermal-print rows).
+        //
+        // Distinguishing them needs both x-overlap and text similarity:
+        //   - column fragments: separate x-ranges (gap between them),
+        //     dissimilar text content
+        //   - duplicates:        overlapping x-ranges (same column),
+        //     near-identical text differing only by digit-confusion
+        //     substitutions
+        //
+        // When both signals agree it's a duplicate, drop the new
+        // reading and expand the existing bbox; otherwise fall
+        // through to the column-fragment concatenation below.
+        const lastW = last.xRight - last.xLeft;
+        const lineW = line.xRight - line.xLeft;
+        const xOverlap = Math.max(
+            0,
+            Math.min(last.xRight, line.xRight) - Math.max(last.xLeft, line.xLeft),
+        );
+        const minW = Math.min(lastW, lineW);
+        const xOverlapRatio = minW > 0 ? xOverlap / minW : 0;
+
+        // Position-aligned char-overlap as a cheap similarity proxy.
+        // OCR duplicate variants typically differ by 1-2 character
+        // substitutions at the same position (e.g. "UŽspaudžiami" vs
+        // "UŽspaudžiani"), which scores ~95% here. Two genuinely
+        // different texts score below ~50% even when lengths align.
+        let positionMatches = 0;
+        const minLen = Math.min(lastText.length, lineText.length);
+        for (let k = 0; k < minLen; k++) {
+            if (lastText[k] === lineText[k]) positionMatches++;
+        }
+        const maxLen = Math.max(lastText.length, lineText.length);
+        const textSim = maxLen > 0 ? positionMatches / maxLen : 0;
+
+        if (xOverlapRatio > 0.5 && textSim > 0.7) {
+            // Duplicate — keep the first-seen reading, expand bounds.
+            last.yTop = Math.min(last.yTop, line.yTop);
+            last.yBottom = Math.max(last.yBottom, line.yBottom);
+            last.xLeft = Math.min(last.xLeft, line.xLeft);
+            last.xRight = Math.max(last.xRight, line.xRight);
+            continue;
+        }
+
+        // Column fragments → consolidate. Order the concatenation by
+        // xLeft (visual reading order) so boxes glue back into row
+        // order, not whatever order MLKit emitted. iOS MLKit on
+        // multi-unit rows often emits the right column ("x 4,95 EUR")
+        // before the left ("2 vnt.") when both share a yTop; a
+        // yTop-sorted concat would yield "x 4,95 EUR 2 vnt." which
+        // breaks MULTI_RE downstream and leaks the price column into
+        // the displayed name. xLeft order recovers "2 vnt. x 4,95
+        // EUR" → MULTI_RE matches. Android is unaffected: one box
+        // per row, this branch never fires.
+        const merged = last.xLeft <= line.xLeft
+            ? `${lastText} ${lineText}`
+            : `${lineText} ${lastText}`;
+        last.text = merged.replace(/\s+/g, ' ').trim();
         last.yTop = Math.min(last.yTop, line.yTop);
         last.yBottom = Math.max(last.yBottom, line.yBottom);
         last.xLeft = Math.min(last.xLeft, line.xLeft);
@@ -497,8 +557,19 @@ const mergeRowFragments = (rawLines: RimiLine[]): RimiLine[] => {
 // line ("Galut. kaina" → "Ga1ut. kaina") still doesn't match.
 const ocrDigitClass = (s: string): string =>
     s.replace(/[Oo]/g, '0').replace(/[lI]/g, '1');
+// Collapse runs of decimal separators ("8,,99" → "8,99", "8..99" → "8.99",
+// "8,.99" → "8,99"). MLKit on iOS occasionally emits an extra comma or
+// period adjacent to a real one when the thermal-print dot bleeds into
+// the next pixel column — the second separator looks like a glyph but
+// belongs to the same decimal. Display text keeps the raw form (we don't
+// mutate name characters); this only affects pre-regex normalization
+// for WEIGHT_RE / MULTI_RE matching, which is what blocks rows like
+// `0,230 kg X 8,,99 EUR/ kg` from being recognised as weight lines and
+// leaks them into the displayed name.
+const collapseRepeatedSep = (s: string): string =>
+    s.replace(/([.,])[.,]+/g, '$1');
 const normalizeForNumberRegex = (s: string): string =>
-    ocrDigitClass(stripDiacritics(s));
+    ocrDigitClass(stripDiacritics(collapseRepeatedSep(s)));
 
 const isWeightOrMultiLine = (line: RimiLine): boolean => {
     const t = normalizeForNumberRegex(line.text);
@@ -1080,6 +1151,23 @@ function findProductAnchors(productSlice: RimiLine[]): number[] {
         if (isWeightOrMultiLine(prev)) continue;
         if (isDepositLine(prev)) continue;
         if (!/\p{L}/u.test(prev.text)) continue;
+        // iOS MLKit sometimes drops the trailing unit letter off an
+        // amount column ("1,51 l" → "1,51"), leaving a bare X,YY line
+        // between the row's two name fragments. With a name-like prev,
+        // the relaxed branch above would accept it as a price anchor —
+        // stealing the row's real anchor from the strict `X,YY A` line
+        // that follows. Defer to the strict anchor: if one appears
+        // within the next two lines with no intervening structural
+        // line (discount/weight/multi/deposit), drop this candidate.
+        let foundStrictAhead = false;
+        for (let k = i + 1; k <= i + 2 && k < productSlice.length; k++) {
+            const ahead = productSlice[k];
+            if (isPositivePriceLine(ahead)) { foundStrictAhead = true; break; }
+            if (isDiscountLine(ahead)) break;
+            if (isWeightOrMultiLine(ahead)) break;
+            if (isDepositLine(ahead)) break;
+        }
+        if (foundStrictAhead) continue;
         anchors.push(i);
     }
     return anchors;
@@ -1763,6 +1851,44 @@ export function extractRimiProduct(internal: RimiBandInternal): RimiExtractResul
     }
 
     const promoPrice = finalPrice;
+
+    // ppu × qty reconcile + self-heal. Receipts print the price-per-
+    // unit in the middle column (`2 vnt. X 4,99 EUR` or `0,690 kg X
+    // 1,29 EUR/kg`) where MLKit has no structural anchor to validate
+    // against — single-digit OCR errors land here often. The `price`
+    // anchor (`X,YY A`, strict regex with VAT letter) and the
+    // `quantity` (constrained by `vnt`/`kg` suffix) are both
+    // higher-confidence, so when the math fails we re-derive ppu
+    // from `price / quantity`. See the corresponding block in
+    // maximaParser.ts for the rationale and the bounded-delta guard
+    // that keeps this from false-healing when the wrong number was
+    // elsewhere.
+    if (pricePerUnit !== null) {
+        const expected = pricePerUnit * quantity;
+        const delta = Math.abs(expected - price);
+        if (delta > RECONCILE_TOLERANCE_EUR) {
+            const HEAL_MAX_PPU_DELTA = 0.5;
+            const derived = quantity !== 0
+                ? Math.round((price / quantity) * 100) / 100
+                : null;
+            if (
+                derived !== null &&
+                Math.abs(derived * quantity - price) <= RECONCILE_TOLERANCE_EUR &&
+                Math.abs(derived - pricePerUnit) <= HEAL_MAX_PPU_DELTA
+            ) {
+                warnings.push(
+                    `reconcile HEALED: ppu ${pricePerUnit.toFixed(2)} → ${derived.toFixed(2)} ` +
+                        `(price=${price.toFixed(2)} ÷ qty=${quantity})`,
+                );
+                pricePerUnit = derived;
+            } else {
+                warnings.push(
+                    `reconcile MISMATCH: ppu=${pricePerUnit.toFixed(2)} × qty=${quantity} = ` +
+                        `${expected.toFixed(2)} but price=${price.toFixed(2)} (Δ=${delta.toFixed(2)})`,
+                );
+            }
+        }
+    }
 
     const allLines = [
         ...internal.preName.map((e) => e.line),
