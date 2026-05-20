@@ -292,7 +292,15 @@ const BARE_PRICE_RE = /^\s*[\dOoIl]+\s*[.,]\s*[\dOoIl]{2}\s*$/;
 // — MLKit confuses `š` (s+caron) with `ž` (z+caron) on some
 // prints. Without `ž`/`z` in the class, "maiželis" / "maizelis"
 // OCR variants slip through as products.
-export const NON_CATALOG_PATTERN = /\b(?:vienkartinis|didelis|pirkini[uų])?\s*(?:plastikinis|popierinis)?\s*mai[sšžz](?:elis|as)\b/i;
+//
+// First-letter alternation `(?:m|rn|nn|n)` covers iOS MLKit's
+// lowercase-`m` confusions: most often `n` (loses one of m's three
+// vertical strokes — observed on iPhone reading "naiželis"), and
+// occasionally `rn` / `nn`. The modifier `(?:plastikinis|popierinis)`
+// immediately before kills false-positive risk — there's no
+// Lithuanian grocery word starting with `nai[sšžz]elis` that would
+// follow "plastikinis".
+export const NON_CATALOG_PATTERN = /\b(?:vienkartinis|didelis|pirkini[uų])?\s*(?:plastikinis|popierinis)?\s*(?:m|rn|nn|n)ai[sšžz](?:elis|as)\b/i;
 
 // ───────── helpers ─────────
 
