@@ -92,6 +92,14 @@ export interface RimiProduct {
     pricePerUnit: number | null;
     rawLines: string[];
     region: Region;
+    /** Pack size extracted from the product name (e.g. `32` for "32 rit.",
+     *  `990` for "990ml"). Separate from `quantity` (= how many packs the
+     *  user bought) and `unit` (= the receipt-level pricing unit, vnt/kg).
+     *  Used by the matcher to discriminate same-name products at different
+     *  pack sizes (e.g. ZEWA EVERYDAY 32 rit. vs 12 rit. — without this,
+     *  name-similarity alone returns the wrong pack at confidence 1.0). */
+    parsedAmount?: number | null;
+    parsedUnit?: string | null;
 }
 
 export interface RimiHeader {
@@ -156,8 +164,27 @@ const DISCOUNT_RE =
 const NUOL_FRAGMENT_RE = /Nuo[li]\s*\.?\s*-\s*[\dOoIl]+[.,]\s?[\dOoIl]{1,2}/i;
 const GALUT_FRAGMENT_RE = /Gal[uūü]t\s*[.,]?\s*k?aina\s*[\dOoIl]+[.,]\s?[\dOoIl]{1,2}/i;
 
-// Weighable: `0,340 kg X 7,59 EUR/kg`.
-const WEIGHT_RE = /(\d+[.,]\s?\d{1,3})\s*kg\s*[xX×]\s*(\d+[.,]\s?\d{1,2})\s*(?:EUR|€)/i;
+// Weighable: `0,340 kg X 7,59 EUR/kg`. `E?UR` tolerates an iOS-MLKit
+// pattern where the leading `E` of `EUR` is dropped — observed on
+// receipt 55 as "0,978 kg X 1,69UR/K_3. 1", which otherwise fails the
+// weight-line classifier and the entire row drops to unit=vnt qty=1.
+// "UR" preceded by `\d+[.,]\d{1,2}\s*` has no plausible false-positive
+// shape in product names.
+//
+// `kg[^xX×]*[xX×]` (instead of `kg\s*[xX×]`) tolerates a stray
+// non-X character between `kg` and `X` — observed on receipt 56 band 7
+// as "0,494 kg? X 7,99 EUR/kg" where MLKit inserted a "?" after kg.
+// Pre-fix that row was misclassified as preName and glued into the
+// product name with unit/quantity/ppu all lost.
+const WEIGHT_RE = /(\d+[.,]\s?\d{1,3})\s*kg[^xX×]*[xX×]\s*(\d+[.,]\s?\d{1,2})\s*(?:E?UR|€)/i;
+
+// Fallback for weighable lines where MLKit dropped the `kg` between
+// the quantity and the X — observed on receipt 56 band 10 salmon as
+// "0,524 .24 x 23,99 EUR/kg". The `EUR/kg` suffix is the unique
+// signature that disambiguates "weighable" from "multi-buy" when the
+// `kg` token between qty and X is missing; multi-buy lines never carry
+// a `/kg` rate suffix. Tried only after WEIGHT_RE fails.
+const WEIGHT_RATE_ONLY_RE = /(\d+[.,]\s?\d{1,3})\s*[^xX×]*[xX×]\s*(\d+[.,]\s?\d{1,2})\s*(?:E?UR|€)\s*\/\s*kg/i;
 
 // Multi-buy: `2 vnt X 1,99 EUR`.
 const MULTI_RE = /(\d+)\s*vnt\s*\.?\s*[xX×]\s*(\d+[.,]\s?\d{1,2})\s*(?:EUR)?/i;
@@ -300,7 +327,14 @@ const BARE_PRICE_RE = /^\s*[\dOoIl]+\s*[.,]\s*[\dOoIl]{2}\s*$/;
 // immediately before kills false-positive risk — there's no
 // Lithuanian grocery word starting with `nai[sšžz]elis` that would
 // follow "plastikinis".
-export const NON_CATALOG_PATTERN = /\b(?:vienkartinis|didelis|pirkini[uų])?\s*(?:plastikinis|popierinis)?\s*(?:m|rn|nn|n)ai[sšžz](?:elis|as)\b/i;
+//
+// Trailing `[A-Z]?` tolerates a single uppercase tax-code letter that
+// occasionally glues onto the product name when the band parser
+// merges the price line (`0,40 A`) into the name line — observed on
+// Android batch test as "Rimi maišasA". Without it the \b boundary
+// fails between `as` and `A` (both word chars) and the skip leaks
+// through.
+export const NON_CATALOG_PATTERN = /\b(?:vienkartinis|didelis|pirkini[uų])?\s*(?:plastikinis|popierinis)?\s*(?:m|rn|nn|n)ai[sšžz](?:elis|as)[A-Z]?\b/i;
 
 // ───────── helpers ─────────
 
@@ -319,7 +353,7 @@ function parseNumLoose(str: string): number {
             .replace(/,/g, '.')
             .replace(/\s/g, '')
             .replace(/[Oo]/g, '0')
-            .replace(/[IlL]/g, '1'),
+            .replace(/[IilL]/g, '1'),
     );
 }
 
@@ -367,7 +401,7 @@ const splitFusedAnchorLine = (line: RimiLine): [RimiLine, RimiLine] | null => {
     const [, priceText, middle, vat] = match;
     const middleTrim = middle.trim();
     const middleNormalized = normalizeForNumberRegex(middleTrim);
-    if (!WEIGHT_RE.test(middleNormalized) && !MULTI_RE.test(middleNormalized)) return null;
+    if (!WEIGHT_RE.test(middleNormalized) && !WEIGHT_RATE_ONLY_RE.test(middleNormalized) && !MULTI_RE.test(middleNormalized)) return null;
     return [
         { ...line, text: middleTrim },
         { ...line, text: `${priceText} ${vat}` },
@@ -436,7 +470,20 @@ const mergeRowFragments = (rawLines: RimiLine[]): RimiLine[] => {
             (line.yTop + line.yBottom) / 2 -
                 (last.yTop + last.yBottom) / 2,
         );
-        if (minH <= 0 || centerDist >= minH * ROW_MERGE_CENTER_RATIO) {
+        // Vertical-overlap override: iOS MLKit occasionally gives a
+        // text box an inflated bounding box (e.g. 81 px for a 25 px
+        // text line), shifting its centerY below the sibling and
+        // failing the centerDist check. When ≥ 60 % of the shorter
+        // box's height overlaps the other box, they're on the same
+        // physical row regardless of the centerDist result.
+        const vertOverlap = Math.max(
+            0,
+            Math.min(line.yBottom, last.yBottom) - Math.max(line.yTop, last.yTop),
+        );
+        const isSameRow =
+            (minH > 0 && centerDist < minH * ROW_MERGE_CENTER_RATIO) ||
+            (minH > 0 && vertOverlap / minH >= 0.6);
+        if (!isSameRow) {
             out.push({ ...line });
             continue;
         }
@@ -581,7 +628,7 @@ const normalizeForNumberRegex = (s: string): string =>
 
 const isWeightOrMultiLine = (line: RimiLine): boolean => {
     const t = normalizeForNumberRegex(line.text);
-    return WEIGHT_RE.test(t) || MULTI_RE.test(t);
+    return WEIGHT_RE.test(t) || WEIGHT_RATE_ONLY_RE.test(t) || MULTI_RE.test(t);
 };
 
 const isDiscountLine = (line: RimiLine): boolean => {
@@ -828,6 +875,308 @@ export function cleanProductName(name: string): string {
     cleaned = cleaned.replace(/\s+\d+(kg|g|ml|l)\s*$/i, '').trim();
     cleaned = cleaned.replace(/,\s*$/, '').trim();
     return cleaned;
+}
+
+/**
+ * Match the per-unit / per-weight rate line that Rimi prints in the
+ * middle column ("0,978 kg X 1,69 EUR/kg" or "2 vnt. X 4,99 EUR"). The
+ * band classifier usually tags these as `weight/multi`, but on some
+ * iOS receipts they slip into `preName` and get glued into the product
+ * name. Strip the entire fragment so neither name-similarity nor
+ * `extractPackSize` picks up tokens from it.
+ *
+ * Signature shape: `[number][unit] [maybe-junk] X [number][maybe-junk]
+ * [optional EUR][optional /kg suffix] [optional trailing stray digit]`.
+ * The `X` between number-unit pairs is the unique discriminator —
+ * pack-size tokens never have an `X` next to them.
+ */
+const WEIGHT_LINE_FRAGMENT_RE =
+    /[\dOoIlL][\dOoIlL.,]*\s*(?:kg|g|ml|l|vnt\.?)\s*[^\w\s]*\s*[xX×]\s*[\dOoIlL.,]+\s*[^\s,]*(?:\s+[\dOoIlL.,]+)?/gi;
+
+// Companion to WEIGHT_LINE_FRAGMENT_RE for weighable lines where MLKit dropped
+// the unit (`kg`) between the weight and the `X` but kept the `/kg` rate suffix
+// at the end — observed as "0,986 .27 X 1,39 EUR/kg" (banana by-weight line
+// where the intermediate slice was classified as preName and absorbed into the
+// product name). The `EUR/kg` suffix uniquely discriminates weighable from
+// multi-buy: multi-buy lines never carry a `/kg` rate suffix, so no false positives
+// from numeric tokens in product names. `[^xX×]{0,20}` absorbs stray OCR
+// fragments (e.g. the `.27` price fragment) between the weight qty and the `X`.
+const WEIGHT_LINE_RATE_FRAGMENT_RE =
+    /\d[\dOoIlL.,]*[^xX×]{0,20}[xX×]\s*[\dOoIlL.,]+\s*(?:E?UR|€)?\s*\/\s*kg\b/gi;
+
+/**
+ * Detect and extract a pack-size token from the product name.
+ *
+ * Receipts print pack size inside the product name (e.g.
+ * "Tualetinis popierius ZEWA EVERYDAY, 32 rit." or "Ind. gelis SOMAT
+ * 990ml 55sk"). Without structured extraction:
+ *   - `cleanProductName` strips trailing size tokens, so the name
+ *     loses any discriminating signal
+ *   - the matcher then can't tell a 32-roll pack from a 12-roll pack
+ *     and returns confidence 1.0 against the wrong variant
+ *
+ * The digit class accepts OCR-confusing letters: `O`/`o` for 0,
+ * `I`/`l`/`L`/`i` for 1. Receipts in the wild produce "lkg" for
+ * "1 kg", "25Oml" for "250 ml", "i kg" for "1 kg". The substitution
+ * happens at parse time (`parseNumLoose`) so the numeric value is
+ * recovered correctly. We REQUIRE at least one actual digit in the
+ * captured run to keep `\bg\b` and `\bl\b` from matching bare letters.
+ *
+ * Returns the first match in priority order (volume > weight > rolls
+ * > tablets > sheets > packs > units > ply). Volume / weight are
+ * most discriminating across pack variants; ply tends to be shared
+ * across pack sizes so ranks last.
+ *
+ * The `l` (litre) pattern requires a decimal/comma in the numeric run
+ * so "All in One" doesn't yield "1l" by reading the bare `l` as a
+ * volume — false-positive risk is highest for that single-letter unit.
+ *
+ * `strippedName` removes the matched token + adjacent whitespace +
+ * trailing-comma noise so downstream name-similarity scoring doesn't
+ * count the numeric token twice. It also pre-strips any weight-line
+ * fragment (see `WEIGHT_LINE_FRAGMENT_RE`).
+ *
+ * Returns `{ amount: null, unit: null, strippedName: name }` when no
+ * token matches.
+ */
+export function extractPackSize(
+    name: string,
+): { amount: number | null; unit: string | null; strippedName: string } {
+    // OCR digit class: real digits plus the letters MLKit confuses with
+    // 0 (O/o) and 1 (I/l/L/i). `parseNumLoose` substitutes them at parse
+    // time. We use `\b` anchors on each pattern instead of HAS_DIGIT_RE
+    // so pure-substitute runs like "lkg" (= 1kg) and "i kg" (= 1 kg)
+    // are accepted. Mid-word matches stay blocked by `\b`.
+    const D = '[\\dOoIlLi]';
+    // Per-unit weight-line garbage occasionally classified as preName
+    // on iOS gets stripped first so its tokens don't poison the size
+    // extractor or name-similarity scoring.
+    let preStripped = name.replace(WEIGHT_LINE_FRAGMENT_RE, ' ');
+    // Companion: rate-only weight-line (EUR/kg suffix, no unit before X).
+    preStripped = preStripped.replace(WEIGHT_LINE_RATE_FRAGMENT_RE, ' ');
+    // OCR underscore normalisation: MLKit substitutes `_` for a space or
+    // thin separator in printed text (observed as "240_g" for "240 g").
+    // Lithuanian grocery names never use underscores, so this is always
+    // noise. Replace before unit patterns so `\s*g\b` can match.
+    preStripped = preStripped.replace(/_/g, ' ');
+
+    // Milk-volume OCR fix: receipt prints "rieb., 2 l" (riebumas = fat
+    // content, followed by litre volume) but iOS MLKit fuses the
+    // space-separated "2 l" into "21" because lowercase `l` reads as
+    // digit 1. The trailing "1" is unambiguously the litre mark in a
+    // dairy context — milk isn't sold in non-litre integer amounts like
+    // "21 of something". Restricted to dairy keywords + trailing-end
+    // position so non-milk products with "rieb., 21 mėn" (matured-cheese
+    // age) etc. don't false-trigger.
+    const DAIRY_RE = /\b(?:pien|kefyr|r[uū]gpien|grietin|jogurt)/i;
+    const MILK_LITRE_OCR_RE = /(rieb\.[^,]*,\s*)([1-9])1\b\s*(?![A-Za-zĄČĘĖĮŠŲŪŽąčęėįšųūž])/i;
+    // Some milk receipts don't print the "rieb." abbreviation — the fat
+    // percentage is followed directly by the volume:
+    //   "ROKIŠKIO NAMINIS pienas 2,5%, 1 l" → OCR'd "...2,5%, 1 1"
+    // Same trailing-end damage but no rieb. anchor. The %-followed-by-
+    // digit-pair shape at end is unambiguous for dairy products.
+    const MILK_LITRE_NO_RIEB_RE = /%\s*,?\s+([1-9])\s+1\b\s*(?![A-Za-zĄČĘĖĮŠŲŪŽąčęėįšųūž])/i;
+    if (DAIRY_RE.test(preStripped)) {
+        const milkMatch = preStripped.match(MILK_LITRE_OCR_RE);
+        if (milkMatch) {
+            const num = parseInt(milkMatch[2], 10);
+            if (Number.isFinite(num) && num >= 1 && num <= 9) {
+                const strippedName = preStripped
+                    .replace(MILK_LITRE_OCR_RE, '$1')
+                    .replace(/[,;]\s*$/g, '')
+                    .replace(/\s{2,}/g, ' ')
+                    .trim();
+                return { amount: num, unit: 'l', strippedName };
+            }
+        }
+        const noRiebMatch = preStripped.match(MILK_LITRE_NO_RIEB_RE);
+        if (noRiebMatch) {
+            const num = parseInt(noRiebMatch[1], 10);
+            if (Number.isFinite(num) && num >= 1 && num <= 9) {
+                const strippedName = preStripped
+                    .replace(MILK_LITRE_NO_RIEB_RE, '')
+                    .replace(/[,;]\s*$/g, '')
+                    .replace(/\s{2,}/g, ' ')
+                    .trim();
+                return { amount: num, unit: 'l', strippedName };
+            }
+        }
+    }
+
+    // Sub-litre beverage OCR fix: receipt prints "0,5 l" / "0,33 l" /
+    // "0,7 l" (standard bottle sizes for cocktails / beer / wine / soft
+    // drinks) but iOS MLKit (a) splits the decimal comma with a space
+    // and (b) fuses the trailing " l" into "1" because lowercase l
+    // reads as digit 1. Final text: "0, 51" / "0, 331" / "0, 71" at
+    // the trailing end of the name.
+    //
+    // Three guards keep this from false-matching percentage tokens
+    // ("21,5%", "0,5%", etc.):
+    //   1. BEVERAGE_RE — name must contain a beverage keyword
+    //   2. Pattern starts with literal `0` followed by comma — anchors
+    //      this to the sub-litre bottle convention. Whole-litre forms
+    //      ("1 l", "2 l") are handled by the whole-number-l pattern.
+    //   3. Trailing-end position (`\s*$`) — anchors to the volume slot
+    //      at end of name, not random `0,X` digit pairs mid-name.
+    const BEVERAGE_RE = /\b(?:kokteil|alus\b|vynas|alkohol|degtin|liker|šampan|sidr|spirit|al\.|rom)/i;
+    const SUBLITRE_OCR_RE = /\b0\s*,\s*(\d{1,2})\s*[1l]\b\s*$/i;
+    if (BEVERAGE_RE.test(preStripped)) {
+        const subLitreMatch = preStripped.match(SUBLITRE_OCR_RE);
+        if (subLitreMatch) {
+            const decimalDigits = subLitreMatch[1];
+            const num = parseFloat(`0.${decimalDigits}`);
+            if (Number.isFinite(num) && num > 0 && num < 1) {
+                const strippedName = preStripped
+                    .replace(SUBLITRE_OCR_RE, '')
+                    .replace(/[,;]\s*$/g, '')
+                    .replace(/\s{2,}/g, ' ')
+                    .trim();
+                return { amount: num, unit: 'l', strippedName };
+            }
+        }
+    }
+
+    // Whole-litre OCR fix for plant-based drinks and other beverages:
+    // receipt prints "X l" (e.g. "1 l") but iOS MLKit either (a) fuses
+    // digit + l into "X1" / "Xl" or (b) reads two digits ("11") because
+    // `l` → `1`. The existing `\b(D+)\s+l\b` pattern only handles the
+    // space-preserved case. Guard is broader than BEVERAGE_RE to also
+    // cover "gerimas" (plant-based drink), "sultys"/"sulčių" (juice),
+    // "vanduo"/"vand." (water).
+    // Broader than BEVERAGE_RE: also covers juices, water, and oils
+    // ("aliej") which can appear as "1,5 l" bottles. `ger\.` catches the
+    // abbreviated "ger." form of "gėrimas" that Rimi prints on multi-word
+    // product names where space is tight (e.g. "sojos ger. ALPRO PLANT …").
+    const DRINK_RE = /\b(?:gerim|ger\.|sul[čc][iy]|sult[iy]|vand|alus\b|vyn|degtin|liker|šampan|sidr|kokteil|spirit|al\.|alkohol|aliej|rom)/i;
+    // Matches trailing ", X1" / " X1" / " Xl" / " X l" (whole litres) OR
+    // ", X,Y1" / " X,Y1" (decimal litres where `l` was OCR'd as `1`).
+    // Example: "NATURA, 1,51" = "NATURA, 1,5 l" → amount=1.5, unit='l'.
+    // The `(?:[.,]\d{1,2})?` capture of the decimal part relies on regex
+    // backtracking: the engine first tries to take 2 decimal digits into
+    // the capture (leaving nothing for `[1l]`), fails, backtracks, takes
+    // 1 decimal digit, leaving the last `1` for `[1l]`. ✓
+    const DRINK_TRAILING_LITRE_RE = /(?:,\s*|\s+)([1-9](?:[.,]\d{1,2})?)\s*[1l]\b\s*(?![A-Za-zĄČĘĖĮŠŲŪŽąčęėįšųūž\d])/i;
+    if (DRINK_RE.test(preStripped)) {
+        const drinkMatch = preStripped.match(DRINK_TRAILING_LITRE_RE);
+        if (drinkMatch) {
+            const rawNum = drinkMatch[1].replace(',', '.').replace(/\s/g, '');
+            const num = parseFloat(rawNum);
+            if (Number.isFinite(num) && num >= 0.25 && num <= 9) {
+                const strippedName = preStripped
+                    .replace(DRINK_TRAILING_LITRE_RE, '')
+                    .replace(/[,;]\s*$/g, '')
+                    .replace(/\s{2,}/g, ' ')
+                    .trim();
+                return { amount: num, unit: 'l', strippedName };
+            }
+        }
+    }
+
+    // Dual-unit tokens like "75ml/75g" — Lithuanian solid/semi-solid
+    // foods (ice cream, yogurt, pudding) print both the volume and the
+    // legal net mass. EU labeling requires mass as the authoritative
+    // figure, so catalogs store the gram value. When we see the
+    // `X<vol>/Y<mass>` shape, pick the weight side regardless of
+    // ordering. Strips the entire dual-unit fragment from the name so
+    // the dangling "/" + orphan half don't leak through.
+    const DUAL_RE = new RegExp(
+        `(${D}+(?:[.,]${D}+)?)\\s*(ml|l|g|kg|1)\\s*\\/\\s*(${D}+(?:[.,]${D}+)?)\\s*(g|kg|ml|l|1)\\b`,
+        'i',
+    );
+    const dualMatch = preStripped.match(DUAL_RE);
+    if (dualMatch) {
+        const num1 = dualMatch[1];
+        // The `1` alternative in the unit slot is OCR-substitute for
+        // lowercase `l` (the litre mark). Observed on iOS as
+        // "1 l / 500 g" → "1 1 /500 g". Translate before downstream
+        // logic so the weight-preference picker treats it as `l`.
+        const translateOcrUnit = (u: string) => (u === '1' ? 'l' : u);
+        const unit1 = translateOcrUnit(dualMatch[2].toLowerCase());
+        const num2 = dualMatch[3];
+        const unit2 = translateOcrUnit(dualMatch[4].toLowerCase());
+        const isWeight = (u: string) => u === 'g' || u === 'kg';
+        const pickNum = isWeight(unit1) ? num1 : isWeight(unit2) ? num2 : num1;
+        const pickUnit = isWeight(unit1) ? unit1 : isWeight(unit2) ? unit2 : unit1;
+        const normalised = pickNum
+            .replace(/,/g, '.')
+            .replace(/[Oo]/g, '0')
+            .replace(/[IlLi]/g, '1');
+        const num = parseFloat(normalised);
+        if (Number.isFinite(num) && num > 0) {
+            const strippedName = preStripped
+                .replace(DUAL_RE, ' ')
+                .replace(/\s+,\s*/g, ', ')
+                .replace(/,\s*$/g, '')
+                .replace(/\s{2,}/g, ' ')
+                .trim();
+            return { amount: num, unit: pickUnit, strippedName };
+        }
+    }
+
+    // Volume `l` patterns. Two variants because of the false-positive
+    // risk with single-letter `l`:
+    //   1. Decimal-l (`1.5l`, `0,5l`, `1,5 l`): require a decimal so
+    //      "All in One" never reads as "1l in One".
+    //   2. Whole-number-l (`2 l`, `1 l`): require ≥1 whitespace
+    //      between the digit and `l`. Catches the common milk shape
+    //      ("ROKIŠKIO pienas, 2 l") without re-introducing the "All"
+    //      / "Atl" false positives — those have no whitespace before
+    //      the `l`. Tried after the decimal variant so the decimal
+    //      version takes precedence when both could match.
+    const patterns: Array<{ re: RegExp; unit: string }> = [
+        { re: new RegExp(`\\b(${D}+(?:[.,]${D}+)?)\\s*ml\\b`, 'i'),  unit: 'ml' },
+        { re: new RegExp(`\\b(${D}+[.,]${D}+)\\s*l\\b`, 'i'),         unit: 'l'  },
+        { re: new RegExp(`\\b(${D}+)\\s+l\\b`, 'i'),                  unit: 'l'  },
+        { re: new RegExp(`\\b(${D}+(?:[.,]${D}+)?)\\s*kg\\b`, 'i'),   unit: 'kg' },
+        { re: new RegExp(`\\b(${D}+(?:[.,]${D}+)?)\\s*g\\b`, 'i'),    unit: 'g'  },
+        { re: new RegExp(`\\b(${D}+)\\s*rit\\b\\.?`, 'i'),            unit: 'rit' },
+        { re: new RegExp(`\\b(${D}+)\\s*sk\\b`, 'i'),                  unit: 'sk' },
+        { re: new RegExp(`\\b(${D}+)\\s*lap\\b\\.?`, 'i'),             unit: 'lap' },
+        { re: new RegExp(`\\b(${D}+)\\s*pak\\b\\.?`, 'i'),             unit: 'pak' },
+        { re: new RegExp(`\\b(${D}+)\\s*vnt\\b\\.?`, 'i'),             unit: 'vnt' },
+        { re: new RegExp(`\\b(${D}+)\\s*sl\\b\\.?`, 'i'),              unit: 'sl' },
+    ];
+    for (const { re, unit } of patterns) {
+        const m = preStripped.match(re);
+        if (!m) continue;
+        // Wider OCR fold than parseNumLoose (which only handles I/l/L,
+        // missing lowercase `i`). `i kg` on Rimi receipts reads `i`
+        // where the printed digit was 1.
+        const normalisedDigits = m[1]
+            .replace(/,/g, '.')
+            .replace(/[Oo]/g, '0')
+            .replace(/[IlLi]/g, '1');
+        const num = parseFloat(normalisedDigits);
+        if (!Number.isFinite(num) || num <= 0) continue;
+        // Strip the matched token + collapse adjacent whitespace and
+        // dangling commas so the cleaned name doesn't double-count the
+        // numeric token in name-similarity scoring.
+        const strippedName = preStripped
+            .replace(re, ' ')
+            .replace(/\s+,\s*/g, ', ')
+            .replace(/,\s*$/g, '')
+            .replace(/\s{2,}/g, ' ')
+            .trim();
+        return { amount: num, unit, strippedName };
+    }
+    // Last-resort: "N %" at the end of name where N is a 3-4 digit
+    // integer ≥ 100 — impossible as a genuine percentage (no food has
+    // ≥ 100 % fat/cocoa/etc.), so treat as OCR'd gram weight (g → %).
+    // Decimal-separator percentages like "3,5 %" are unaffected because
+    // \d{3,4} requires 3-4 CONSECUTIVE digits.
+    const pctGramMatch = preStripped.match(/\b(\d{3,4})\s*%\s*$/);
+    if (pctGramMatch) {
+        const num = parseInt(pctGramMatch[1], 10);
+        if (num >= 100 && num <= 9999) {
+            const strippedName = preStripped
+                .replace(/\b\d{3,4}\s*%\s*$/, '')
+                .replace(/[,;]\s*$/g, '')
+                .replace(/\s{2,}/g, ' ')
+                .trim();
+            return { amount: num, unit: 'g', strippedName };
+        }
+    }
+    return { amount: null, unit: null, strippedName: preStripped.replace(/\s{2,}/g, ' ').trim() };
 }
 
 export function parseFooter(lines: RimiLine[]): RimiFooter {
@@ -1735,7 +2084,8 @@ export function extractRimiProduct(internal: RimiBandInternal): RimiExtractResul
         ...internal.preName.map((e) => ({ entry: e, isPreName: true })),
         ...internal.postAnchor.map((e) => ({ entry: e, isPreName: false })),
     ];
-    for (const { entry, isPreName } of allEntries) {
+    for (let ei = 0; ei < allEntries.length; ei++) {
+        const { entry, isPreName } = allEntries[ei];
         const text = entry.line.text.trim();
         if (!text) continue;
 
@@ -1774,6 +2124,51 @@ export function extractRimiProduct(internal: RimiBandInternal): RimiExtractResul
             unit = 'kg';
             continue;
         }
+        // Fallback for OCR'd weight-lines where `kg` between qty and X
+        // is missing but the `EUR/kg` rate suffix is intact (e.g.
+        // "0,524 .24 x 23,99 EUR/kg" — the salmon row on receipt 56
+        // band 10). The `/kg` suffix can't co-occur with multi-buy
+        // lines, so this branch is safe to try after WEIGHT_RE.
+        const rateOnlyMatch = stripped.match(WEIGHT_RATE_ONLY_RE);
+        if (rateOnlyMatch && pricePerUnit === null) {
+            quantity = parseNumLoose(rateOnlyMatch[1]);
+            pricePerUnit = parseNumLoose(rateOnlyMatch[2]);
+            unit = 'kg';
+            continue;
+        }
+        // Split weight-line lookahead: when the anchor's sort-order
+        // separates two weight-line halves so mergeRowFragments can't
+        // join them (e.g. "0,986 .27" + "X 1,39 EUR/kg" — the anchor
+        // "1,37 A" sorted between them by yTop and prevented the merge),
+        // try combining this preName entry with the immediately following
+        // preName entry. If the joined text matches WEIGHT_RE or
+        // WEIGHT_RATE_ONLY_RE, consume both and skip the next entry.
+        //
+        // Guard: only attempt when the CURRENT entry is a numeric fragment
+        // (digits, OCR-substitute letters O/o/I/l/L/i, and punctuation).
+        // A product-name line like "Bananai Cavendish, 20+cm lkg" has
+        // real alphabetic content and must NOT be consumed as the first
+        // half of a weight-line — that would leave nameFragments empty
+        // and trigger skip:no-name for the band.
+        const isNumericFragment = /^[\dOoIlLi\s.,+:/-]*$/.test(text.trim());
+        if (isPreName && pricePerUnit === null && isNumericFragment) {
+            const nextItem = allEntries[ei + 1];
+            if (nextItem?.isPreName) {
+                const combined = normalizeForNumberRegex(
+                    `${text} ${nextItem.entry.line.text.trim()}`,
+                );
+                const wm2 = combined.match(WEIGHT_RE);
+                const ro2 = combined.match(WEIGHT_RATE_ONLY_RE);
+                const m2 = wm2 ?? ro2;
+                if (m2) {
+                    quantity = parseNumLoose(m2[1]);
+                    pricePerUnit = parseNumLoose(m2[2]);
+                    unit = 'kg';
+                    ei++; // consume the next entry too
+                    continue;
+                }
+            }
+        }
         const multiMatch = stripped.match(MULTI_RE);
         if (multiMatch && pricePerUnit === null) {
             quantity = parseInt(multiMatch[1], 10);
@@ -1805,8 +2200,42 @@ export function extractRimiProduct(internal: RimiBandInternal): RimiExtractResul
         // left-column wraps land in preName via the splice, so this no
         // longer drops anything that should have been in the name.
         if (!isPreName) continue;
-        if (/[a-zA-ZąčęėįšųūžĄČĘĖĮŠŲŪŽ]/.test(text)) {
-            nameFragments.push(text);
+        // Include slices that carry product text (letters) OR pure-digit
+        // size hints (e.g. "%, 1 1" — the OCR-mangled volume slot on
+        // milk receipts where the size hint is on its own slice with no
+        // letters; was previously dropped entirely, leaving the volume
+        // unrecoverable by extractPackSize). The slice classifier
+        // already excludes price/discount/weight/multi rows, so what
+        // reaches here is either product text or trailing size info.
+        let nameText = text;
+        // Strip a trailing "…kaina X,XX" suffix that leaked into a preName
+        // slice when OCR fused the product-name continuation with a
+        // Galut.kaina fragment (e.g. "mėlynėnis alut. kaina 0,39" where
+        // the leading 'G' of "Galut." was lost). Capture the finalPrice
+        // if not yet set.
+        const kainaInName = nameText.match(
+            /\s+(?:\S{1,8}\s+)?kaina\s+([\dOoIl]+[.,]\s?[\dOoIl]{1,2})\s*$/i,
+        );
+        if (kainaInName) {
+            if (finalPrice === null) {
+                finalPrice = parseNumLoose(kainaInName[1]);
+            }
+            nameText = nameText.slice(0, nameText.length - kainaInName[0].length).trim();
+        }
+        // Strip a trailing "…WORD.? -N,NN" savings fragment that leaked
+        // when OCR mangled "Nuol. -N,NN" beyond classifier recognition
+        // (e.g. "RIP. -1,92" read where the receipt printed "Nuol. -1,92").
+        const savingsInName = nameText.match(
+            /(?:^|\s+)\S{1,8}\.?\s*-\s*([\dOoIl]+[.,]\s?[\dOoIl]{1,2})\s*$/i,
+        );
+        if (savingsInName) {
+            if (savings === null) {
+                savings = parseNumLoose(savingsInName[1]);
+            }
+            nameText = nameText.slice(0, nameText.length - savingsInName[0].length).trim();
+        }
+        if (/[a-zA-Z\dąčęėįšųūžĄČĘĖĮŠŲŪŽ]/.test(nameText)) {
+            nameFragments.push(nameText);
         }
     }
 
@@ -1827,7 +2256,63 @@ export function extractRimiProduct(internal: RimiBandInternal): RimiExtractResul
         };
     }
 
-    const name = cleanProductName(rawName);
+    // Extract pack size BEFORE cleanProductName (which strips trailing
+    // size tokens, losing the signal we need for size-aware matching).
+    // The result drives parsedAmount + parsedUnit, which the client
+    // forwards to /api/store-products/match so the matcher can prefer
+    // SPs of the right pack size when multiple same-named variants exist.
+    let { amount: parsedAmount, unit: parsedUnit, strippedName: nameAfterPackExtract } =
+        extractPackSize(rawName);
+
+    // Inference layer: when extractPackSize returned null we still have
+    // two high-confidence guesses we can make from receipt-line context.
+    //
+    // (G) Weighable line — `unit === 'kg'` means the receipt printed a
+    // per-kg rate and a weighed quantity. The catalog's weighable
+    // candidate is stored as `amount: 1, unit: 'kg'`. Defaulting to
+    // 1/kg here lets the matcher prefer the weighable variant over
+    // similarly-named fixed-pack siblings. Observed on receipt 55's
+    // "Česnakai, kg" — the name has no `\d` before `kg` so the regex
+    // can't catch it, but the line's unit is enough signal.
+    if (parsedAmount === null && unit === 'kg') {
+        parsedAmount = 1;
+        parsedUnit = 'kg';
+        // Strip the trailing "kg" suffix that the receipt prints as the
+        // per-kg reference (e.g. "Česnakai, kg" → "Česnakai"). It's now
+        // captured in parsedUnit so leaving it in the name would
+        // double-count and clutter the displayed product name.
+        // cleanProductName below only strips digit-prefixed unit tokens;
+        // bare "kg" / ", kg" needs this step.
+        nameAfterPackExtract = nameAfterPackExtract
+            .replace(/[,;]?\s*kg\s*$/i, '')
+            .trim();
+    }
+
+    // (F) Non-weighable line with a bare trailing number — most often
+    // the case where the unit suffix (typically `g`) got dropped in OCR.
+    // Observed on receipts 55/56 as "MALSENA, 300" and "BARILLA FUSILLI,
+    // 400". Range-guarded (50-5000) so single-digit codes / year-like
+    // 4-digit values can't pollute the matcher. Only fires for
+    // non-weighable lines because weighables wouldn't print a bare-pack
+    // number after the kg suffix.
+    if (parsedAmount === null && unit === 'vnt') {
+        // Negative lookbehind: the comma must NOT be preceded by a digit
+        // (decimal separator like the `,5` in "1,51" must not trigger this).
+        // Without the guard, "NATURA, 1,51" matches `,51` → amount=51 g.
+        const tail = nameAfterPackExtract.match(/(?<!\d),\s*(\d{2,4})\s*$/);
+        if (tail) {
+            const num = parseInt(tail[1], 10);
+            if (Number.isFinite(num) && num >= 30 && num <= 5000) {
+                parsedAmount = num;
+                parsedUnit = 'g';
+                nameAfterPackExtract = nameAfterPackExtract
+                    .replace(/(?<!\d),\s*\d{2,4}\s*$/, '')
+                    .trim();
+            }
+        }
+    }
+
+    const name = cleanProductName(nameAfterPackExtract);
 
     // Rimi prints both the savings and the final price explicitly.
     // Use BOTH to drive: (a) reconcile (when both came from OCR,
@@ -1916,6 +2401,8 @@ export function extractRimiProduct(internal: RimiBandInternal): RimiExtractResul
             pricePerUnit,
             rawLines,
             region,
+            parsedAmount,
+            parsedUnit,
         },
         warnings,
     };
@@ -1956,8 +2443,11 @@ export function traceRimiExtract(rawLines: RimiLine[]): string {
             const savings = product.price - product.promoPrice;
             reconcile = `reconcile:${product.price.toFixed(2)}−${savings.toFixed(2)}=${product.promoPrice.toFixed(2)} ✓`;
         }
+        const packSize = product.parsedAmount != null && product.parsedUnit
+            ? `[${product.parsedAmount} ${product.parsedUnit}]`
+            : '[?]';
         out.push(
-            `band ${bandNum}: ${status}  name="${TRUNC(product.name, 60)}"  ` +
+            `band ${bandNum}: ${status}  name="${TRUNC(product.name, 60)}" ${packSize}  ` +
                 `price=${product.price.toFixed(2)}  promo=${promo}  ` +
                 `qty=${product.quantity}  unit=${product.unit}  ppu=${ppu}  ${reconcile}`,
         );
