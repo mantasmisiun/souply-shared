@@ -48,6 +48,8 @@ export interface NorfaProduct {
     pricePerUnit: number | null;
     rawLines: string[];
     region: Region;
+    parsedAmount?: number | null;
+    parsedUnit?: string | null;
 }
 
 /** Per-line bbox tracking — see rimiParser for the rationale. */

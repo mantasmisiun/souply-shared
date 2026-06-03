@@ -236,6 +236,11 @@ const DEPOSIT_RE = /(?:u[žz]stat[ao]|[i1l]\W?stat[o0]|[i1l]\W?statas?)/i;
 //   maišyti      — verb "to mix"
 //   maišinim*    — mixing-related noun
 const NON_CATALOG_RE = /\bmai[sš](?:el|as|ai)\w*/i;
+// TAISYMAS correction section — Lidl prints a `---- TAISYMAS ----`
+// block with a negative refund price when a cashier voids/corrects
+// a line. Its separator dashes must not trigger findFooterStart, and
+// the whole block must be excluded from the product slice.
+const TAISYMAS_RE = /\bTAISYMAS\b/i;
 // Discount-header line. Tolerates `Nuolalda` (i↔l swap on low-
 // contrast OCR) alongside canonical `Nuolaida`, and the standalone
 // `LIDL PLUS kupono` form (where the line has the loyalty prefix
@@ -344,7 +349,13 @@ function findFooterStart(lines: LidlLine[], afterIdx: number): number {
         // the LAST product from extending down into the
         // separator row when the V2 fold accepts everything to
         // the end of productSlice.
-        else if (/^[=-]{5,}$/.test(t.trim())) matched = true;
+        // Skip separators that belong to a TAISYMAS correction block
+        // (e.g. `---- TAISYMAS ----` or the dashes surrounding it).
+        else if (/^[=-]{5,}$/.test(t.trim())) {
+            const prev = i > 0 ? lines[i - 1].text : '';
+            const next = i + 1 < lines.length ? lines[i + 1].text : '';
+            if (!TAISYMAS_RE.test(prev) && !TAISYMAS_RE.test(next)) matched = true;
+        }
         if (!matched) continue;
         // iOS MLKit emits the footer-marker value (e.g. "24,89" for
         // "Tarpinė suma 24,89") as a separate OCR box at near-same y
@@ -689,6 +700,8 @@ const classifyLineReasonV2 = (line: LidlLine): LidlLineReason => {
     if (BARCODE_ONLY_RE.test(t)) return 'barcode';
     if (DISCOUNT_HEADER_RE.test(t)) return 'discount-header';
     if (DISCOUNT_RE.test(t)) return 'discount-eur';
+    // TAISYMAS correction-section markers are structural noise, not products.
+    if (TAISYMAS_RE.test(t)) return 'other';
     return /[A-Za-zĄČĘĖĮŠŲŪŽąčęėįšųūž]{3,}/.test(t) ? 'name' : 'other';
 };
 
@@ -1457,6 +1470,41 @@ const computeBandsContextLidlV2 = (
         }
         productSlice.push(line);
     }
+
+    // Strip TAISYMAS correction blocks. A block starts at a TAISYMAS
+    // marker (the `---- TAISYMAS ----` line or a surrounding dash line)
+    // and ends at the next separator or at the next product anchor,
+    // whichever comes first. We find TAISYMAS marker lines by index and
+    // remove everything from the nearest preceding separator (or the
+    // marker itself) through the next separator (inclusive).
+    {
+        let i = 0;
+        while (i < productSlice.length) {
+            if (TAISYMAS_RE.test(productSlice[i].text)) {
+                // Walk back to include a leading dash-separator on the same block.
+                let blockStart = i;
+                if (blockStart > 0 && /^[=-]{5,}$/.test(productSlice[blockStart - 1].text.trim())) {
+                    blockStart--;
+                }
+                // Walk forward past the correction lines to include the
+                // trailing dash-separator and the refund price line.
+                let blockEnd = i + 1;
+                while (blockEnd < productSlice.length) {
+                    const txt = productSlice[blockEnd].text.trim();
+                    // Stop after a closing separator line.
+                    if (/^[=-]{5,}$/.test(txt)) { blockEnd++; break; }
+                    // Stop at the next product anchor (positive price with VAT letter).
+                    if (/^\d+[.,]\s?\d{1,2}\s*[A-Z]$/.test(txt)) break;
+                    blockEnd++;
+                }
+                productSlice.splice(blockStart, blockEnd - blockStart);
+                i = blockStart;
+            } else {
+                i++;
+            }
+        }
+    }
+
     const footerSlice = rawLines.slice(footerStart);
 
     const bands: LidlReceiptBand[] = [];

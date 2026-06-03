@@ -64,6 +64,8 @@ export interface MaximaProduct {
   pricePerUnit: number | null;
   rawLines: string[];
   region: Region;
+  parsedAmount?: number | null;
+  parsedUnit?: string | null;
 }
 
 /** Per-field source-line bboxes. Mobile renders one band per entry;
