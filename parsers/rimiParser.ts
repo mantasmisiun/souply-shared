@@ -284,13 +284,22 @@ const ADDRESS_FALLBACK_RE =
 // `1` for `i`/`l` and `0` for `o` inside Lithuanian street names
 // (`Gegužių` → `Geguž1ų`, `Tilžės` → `T1lžės`). The matcher's
 // Levenshtein on the normalised form absorbs single-char diffs.
+//
+// MLKit also sometimes splits a single street word across a space
+// (`Zarasų` → `Zar asų`), which would otherwise truncate the street
+// name to the first fragment and break the suffix anchor. The
+// `(?:\s+[a-z…]+){0,2}` tail re-attaches up to two lowercase
+// continuation fragments before the suffix; the matcher then strips
+// whitespace, so `Zar asų g.` normalises to the same key as `Zarasų g.`.
 const STREET_PREFIX_RE =
-    /([A-ZĄČĘĖĮŠŲŪŽ][a-ząčęėįšųūž\d]+)\s*[,]?\s*\b(g|pr|al|pl|a)\b\.?/;
+    /([A-ZĄČĘĖĮŠŲŪŽ][a-ząčęėįšųūž\d]+(?:\s+[a-ząčęėįšųūž\d]+){0,2})\s*[,]?\s*\b(g|pr|al|pl|a)\b\.?/;
 
 // CITY_TAIL_RE picks out the "30, Šiauliai" component independent
-// of which OCR line it lands on.
+// of which OCR line it lands on. The house number admits a single
+// trailing letter (`5A`, `12B`) — common in Lithuanian addresses and
+// otherwise dropped, which left the street-only fallback to match on.
 const CITY_TAIL_RE =
-    /\b(\d+(?:[-/]\d+)?)\s*,\s*([A-ZĄČĘĖĮŠŲŪŽ][a-ząčęėįšųūž]+)/;
+    /\b(\d+[A-Za-z]?(?:[-/]\d+)?)\s*,\s*([A-ZĄČĘĖĮŠŲŪŽ][a-ząčęėįšųūž]+)/;
 
 // Store-name heuristic. Rimi prints "UAB RIMI LIETUVA, T709" or
 // "RIMI LIETUVA UAB, T709" — UAB + RIMI on the same line.
