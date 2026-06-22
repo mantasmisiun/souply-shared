@@ -46,6 +46,14 @@ export interface Region {
     yBottom: number;
     xLeft: number;
     xRight: number;
+    // Optional skew: top/bottom Y at the band's LEFT vs RIGHT edge, so the photo
+    // overlay can draw a parallelogram that follows a tilted receipt. Absent →
+    // render as the axis-aligned rectangle. Currently produced only by the IKI
+    // photographed (thermal) parser.
+    yLeftTop?: number;
+    yRightTop?: number;
+    yLeftBottom?: number;
+    yRightBottom?: number;
 }
 
 /**
@@ -66,7 +74,8 @@ export type RegionKind =
     | 'date'
     | 'time'
     | 'dateTime'
-    | 'receiptNo';
+    | 'receiptNo'
+    | 'skipped';
 
 /** A `Region` with the logical field it covers. Used in
  *  `header.lineRegions` / `footer.lineRegions` post-Phase-6. */

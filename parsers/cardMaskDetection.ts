@@ -31,6 +31,15 @@ export interface MaskLineInput {
     yBottom: number;
     xLeft: number;
     xRight: number;
+    // Optional per-corner Y (skew) from MLKit cornerPoints, so the redaction box
+    // can follow a tilted receipt. Absent → treated as the axis-aligned rect.
+    yLeftTop?: number;
+    yRightTop?: number;
+    yLeftBottom?: number;
+    yRightBottom?: number;
+    // Per-word boxes (MLKit elements). When present, the redaction box is anchored
+    // to the actual masked WORDS (real x + per-word Y) instead of a char→x guess.
+    words?: { text: string; xLeft: number; xRight: number; yTop: number; yBottom: number }[];
 }
 
 export type MaskBandKind = 'bank' | 'loyalty' | 'cashier';
@@ -55,6 +64,12 @@ export interface MaskBand {
     /** Pre-REDACTED text: the visible label with the number replaced by a
      *  placeholder. Safe to log / store — the digits are gone. */
     text: string;
+    /** Per-corner Y (skew), padded — so the box can be drawn/burned as a
+     *  parallelogram that follows the receipt tilt. Absent → axis-aligned. */
+    yLeftTop?: number;
+    yRightTop?: number;
+    yLeftBottom?: number;
+    yRightBottom?: number;
 }
 
 // ── text folding ────────────────────────────────────────────────────
@@ -84,6 +99,11 @@ const LOYALTY_CTX = /lojalum|mano\s+rimi|lidl\s*plus|mano\s+iki|\bikiuk|aciu\w*\
 // Cashier line: `Kasininkas` / `Kasininkė` + the name/id after it (PII).
 // Captures the label + separators so the VALUE start is the match end.
 const CASHIER_LABEL = /kasinink\w*\s*(nr\.?|nr)?\s*[:.\-–]?\s*/;
+// Loyalty card number printed in FULL (not PCI star-masked) — e.g. IKI's
+// "IKI KORTELĖS NR. 99110000000005068582". The label is a loyalty-card "NR".
+const LOYALTY_NUMBER_LABEL = /kortel\w*\s*nr/;
+// A long bare digit run (the full loyalty number; spaces allowed between groups).
+const LONG_DIGIT_RUN = /\d[\d ]{8,}\d/;
 
 /** How many lines a context label reaches forward to a bare number. */
 const CONTEXT_REACH = 6;
@@ -153,6 +173,14 @@ export function detectCardMaskBands(
             valueStart = km.index + km[0].length;
             kind = 'cashier';
             reason = 'kasininkas';
+        } else if (LOYALTY_NUMBER_LABEL.test(f) && LONG_DIGIT_RUN.test(line.text)) {
+            // Loyalty card number printed in full (not star-masked) — mask the
+            // long digit run; the "… KORTELĖS NR." label stays visible.
+            const dm = line.text.match(LONG_DIGIT_RUN);
+            if (!dm || dm.index == null) continue;
+            valueStart = dm.index;
+            kind = 'loyalty';
+            reason = 'loyalty-number';
         } else {
             // Bare digit runs (barcode / Inv. Nr. / RRN), labels, amounts —
             // not sensitive. Left untouched.
@@ -166,22 +194,60 @@ export function detectCardMaskBands(
         const span = Math.max(1, line.xRight - line.xLeft);
         const padX = span * 0.04 + 8;
         const valXLeft = line.xLeft + (valueStart / len) * span;
-        const boxLeft = Math.max(line.xLeft, valXLeft - padX);
-        const boxRight = line.xRight + span * 0.02;
 
         // REDACT the value out of the display/stored text up front.
         const labelPart = line.text.slice(0, valueStart).trim();
         const redacted = labelPart ? `${labelPart} [•••]` : '[•••]';
 
+        // Per-line tilt from the line's OWN OCR corner Y (the smoothed per-line
+        // slope). The box bends with it on BOTH branches, so even a SINGLE-word PAN
+        // redaction follows the receipt curve (a single word's box is otherwise
+        // flat). FLAT row → slope 0 → rectangle; never a borrowed global tilt.
+        const lineW = Math.max(1, line.xRight - line.xLeft);
+        const lt = line.yLeftTop ?? line.yTop, rt = line.yRightTop ?? line.yTop;
+        const lb = line.yLeftBottom ?? line.yBottom, rb = line.yRightBottom ?? line.yBottom;
+        const slopeT = (rt - lt) / lineW;
+        const slopeB = (rb - lb) / lineW;
+
+        // WORD-ANCHORED box: real x-span from the masked words; Y anchored at those
+        // words' own top/bottom and TILTED by the line slope so it bends. Pad keeps
+        // it over-covering so the PAN is never exposed. Char→x + line edges when no
+        // words are present.
+        let boxLeft: number, boxRight: number, anchorX: number, anchorTop: number, anchorBot: number;
+        const valueWords = (line.words ?? [])
+            .filter((w) => (w.xLeft + w.xRight) / 2 >= valXLeft - padX)
+            .sort((a, b) => a.xLeft - b.xLeft);
+        if (valueWords.length > 0) {
+            const L = valueWords[0], R = valueWords[valueWords.length - 1];
+            boxLeft = Math.max(line.xLeft, L.xLeft - padX);
+            boxRight = R.xRight + padX;
+            anchorX = L.xLeft;
+            anchorTop = Math.min(L.yTop, R.yTop);   // highest top of the value words
+            anchorBot = Math.max(L.yBottom, R.yBottom); // lowest bottom → over-covers all
+        } else {
+            boxLeft = Math.max(line.xLeft, valXLeft - padX);
+            boxRight = line.xRight + span * 0.02;
+            anchorX = line.xLeft;
+            anchorTop = lt;
+            anchorBot = lb;
+        }
+        const topAt = (x: number) => anchorTop + slopeT * (x - anchorX) - padY;
+        const botAt = (x: number) => anchorBot + slopeB * (x - anchorX) + padY;
+        const yLT = topAt(boxLeft), yRT = topAt(boxRight);
+        const yLB = botAt(boxLeft), yRB = botAt(boxRight);
         bands.push({
-            yTop: line.yTop - padY,
-            yBottom: line.yBottom + padY,
+            yTop: Math.min(yLT, yRT),
+            yBottom: Math.max(yLB, yRB),
             xLeft: boxLeft,
             xRight: boxRight,
             kind,
             label: kind === 'bank' ? 'BANKAS' : kind === 'loyalty' ? 'LOJALUMO' : 'KASININKAS',
             reasons: [reason],
             text: redacted,
+            yLeftTop: yLT,
+            yRightTop: yRT,
+            yLeftBottom: yLB,
+            yRightBottom: yRB,
         });
     }
 
@@ -197,12 +263,96 @@ export function detectCardMaskBands(
             last.yBottom = Math.max(last.yBottom, b.yBottom);
             last.xLeft = Math.min(last.xLeft, b.xLeft);
             last.xRight = Math.max(last.xRight, b.xRight);
+            // Union the skew corners too (top = highest, bottom = lowest).
+            last.yLeftTop = Math.min(last.yLeftTop ?? last.yTop, b.yLeftTop ?? b.yTop);
+            last.yRightTop = Math.min(last.yRightTop ?? last.yTop, b.yRightTop ?? b.yTop);
+            last.yLeftBottom = Math.max(last.yLeftBottom ?? last.yBottom, b.yLeftBottom ?? b.yBottom);
+            last.yRightBottom = Math.max(last.yRightBottom ?? last.yBottom, b.yRightBottom ?? b.yBottom);
             for (const r of b.reasons) if (!last.reasons.includes(r)) last.reasons.push(r);
         } else {
             merged.push(b);
         }
     }
     return merged;
+}
+
+/** A recognised data band (product / header / footer line) the mask must not
+ *  cover. Same pixel space as the mask bands; optional per-corner Y (skew) so
+ *  the clamp can follow a tilted band's edge instead of a flat bound. */
+export interface ProtectedRegion {
+    yTop: number;
+    yBottom: number;
+    xLeft: number;
+    xRight: number;
+    yLeftTop?: number;
+    yRightTop?: number;
+    yLeftBottom?: number;
+    yRightBottom?: number;
+}
+
+/** Interpolate a band edge's Y at a given x (x clamped into the band's span). */
+const edgeYAt = (xL: number, xR: number, yL: number, yR: number, x: number): number => {
+    if (xR <= xL) return (yL + yR) / 2;
+    const cx = Math.max(xL, Math.min(xR, x));
+    return yL + ((cx - xL) / (xR - xL)) * (yR - yL);
+};
+
+/**
+ * Trim mask bands so they never cover a recognised data band — the same
+ * "no band overlaps another" rule the product/header/footer bands follow.
+ * Real receipts stack rows tightly, so a mask's vertical padding (and the odd
+ * px of OCR-box overlap) can bleed into the row above/below — e.g. the cashier
+ * mask creeping up over the "Kvito Nr." (receipt number) band.
+ *
+ * TILT-AWARE: each mask corner is pushed only as far as the protected band's
+ * actual (interpolated) edge AT THAT CORNER'S X, not the band's flat min/max.
+ * On a skewed receipt that means the mask top nests parallel to the protected
+ * band's bottom edge — so we don't over-push the mask down (which would reveal
+ * the top of the PII below). Never past the mask's own mid-line, so the PII the
+ * mask exists to hide always stays covered. Masks only constrain against
+ * protected bands they actually overlap horizontally.
+ */
+export function clampMaskBandsToProtected(
+    bands: MaskBand[],
+    protectedRegions: ProtectedRegion[],
+): MaskBand[] {
+    if (!bands.length || !protectedRegions.length) return bands;
+    return bands.map((b) => {
+        const mid = (b.yTop + b.yBottom) / 2;
+        let yLeftTop = b.yLeftTop ?? b.yTop;
+        let yRightTop = b.yRightTop ?? b.yTop;
+        let yLeftBottom = b.yLeftBottom ?? b.yBottom;
+        let yRightBottom = b.yRightBottom ?? b.yBottom;
+        for (const p of protectedRegions) {
+            const xOverlap = !(p.xRight <= b.xLeft || p.xLeft >= b.xRight);
+            if (!xOverlap) continue;
+            const pCenter = (p.yTop + p.yBottom) / 2;
+            if (pCenter <= mid) {
+                // protected band above → push the mask's TOP corners down to its
+                // bottom edge at each corner's x (capped at the mask mid-line).
+                const blY = p.yLeftBottom ?? p.yBottom;
+                const brY = p.yRightBottom ?? p.yBottom;
+                yLeftTop = Math.min(mid, Math.max(yLeftTop, edgeYAt(p.xLeft, p.xRight, blY, brY, b.xLeft)));
+                yRightTop = Math.min(mid, Math.max(yRightTop, edgeYAt(p.xLeft, p.xRight, blY, brY, b.xRight)));
+            } else {
+                // protected band below → pull the mask's BOTTOM corners up to its
+                // top edge at each corner's x (capped at the mask mid-line).
+                const tlY = p.yLeftTop ?? p.yTop;
+                const trY = p.yRightTop ?? p.yTop;
+                yLeftBottom = Math.max(mid, Math.min(yLeftBottom, edgeYAt(p.xLeft, p.xRight, tlY, trY, b.xLeft)));
+                yRightBottom = Math.max(mid, Math.min(yRightBottom, edgeYAt(p.xLeft, p.xRight, tlY, trY, b.xRight)));
+            }
+        }
+        return {
+            ...b,
+            yTop: Math.min(yLeftTop, yRightTop),
+            yBottom: Math.max(yLeftBottom, yRightBottom),
+            yLeftTop,
+            yRightTop,
+            yLeftBottom,
+            yRightBottom,
+        };
+    });
 }
 
 /**
@@ -233,6 +383,12 @@ export function redactReceiptText(text: string | null | undefined): string {
                 while (numStart > 0 && NUM_CHAR.test(line[numStart - 1])) numStart--;
                 while (numStart < m.index && line[numStart] === ' ') numStart++;
                 const label = line.slice(0, numStart).trimEnd();
+                return label ? `${label} [•••]` : '[•••]';
+            }
+            // Loyalty card number printed in full (e.g. "IKI KORTELĖS NR. 9911…").
+            if (LOYALTY_NUMBER_LABEL.test(f) && LONG_DIGIT_RUN.test(line)) {
+                const dm = line.match(LONG_DIGIT_RUN)!;
+                const label = line.slice(0, dm.index).trimEnd();
                 return label ? `${label} [•••]` : '[•••]';
             }
             return line;
