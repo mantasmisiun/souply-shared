@@ -70,6 +70,12 @@ export interface MaskBand {
     yRightTop?: number;
     yLeftBottom?: number;
     yRightBottom?: number;
+    /** The PII TEXT extent (the masked words' top/bottom), WITHOUT the padding.
+     *  The clamp must never trim a mask past these — the card/loyalty number stays
+     *  covered even when a recognised band overlaps the same rows. Absent (old stored
+     *  receipts) → the clamp falls back to the band's own edges (no trim). */
+    piiTop?: number;
+    piiBottom?: number;
 }
 
 // ── text folding ────────────────────────────────────────────────────
@@ -125,6 +131,41 @@ export function detectCardMaskBands(
         .sort((a, b) => a - b);
     const medianH = heights.length ? heights[Math.floor(heights.length / 2)] : 20;
     const padY = Math.max(2, medianH * 0.2);
+
+    // RECEIPT tilt SAMPLES: each WIDE multi-word line's (yCentre, slope). The receipt is
+    // CURVED, so a single global median over-tilts a mask near the flat top and under/over-
+    // tilts one near the steep bottom — we read the LOCAL slope at the mask's own Y
+    // (localSlopeAtY). refTilt is only the fallback when <1 sample brackets it.
+    const refSamples: { y: number; slope: number }[] = [];
+    {
+        const xs = lines.map((l) => l.xLeft).concat(lines.map((l) => l.xRight));
+        const W = Math.max(1, Math.max(...xs) - Math.min(...xs));
+        for (const l of lines) {
+            const ws = l.words;
+            if (!ws || ws.length < 2) continue;
+            const lw = ws.reduce((a, b) => ((b.xLeft + b.xRight) < (a.xLeft + a.xRight) ? b : a));
+            const rw = ws.reduce((a, b) => ((b.xLeft + b.xRight) > (a.xLeft + a.xRight) ? b : a));
+            const lcx = (lw.xLeft + lw.xRight) / 2, rcx = (rw.xLeft + rw.xRight) / 2;
+            if (rcx - lcx > 0.4 * W) refSamples.push({ y: (lw.yTop + rw.yTop) / 2, slope: (rw.yTop - lw.yTop) / (rcx - lcx) });
+        }
+    }
+    const refTilt = refSamples.length
+        ? Math.max(-0.12, Math.min(0.12, [...refSamples].sort((a, b) => a.slope - b.slope)[Math.floor(refSamples.length / 2)].slope))
+        : 0;
+    // LOCAL receipt slope at a given Y — linear interpolation between the two bracketing
+    // wide lines (nearest outside the range; refTilt with <1 sample). Same shape as
+    // ikiParser.localSlopeAtY so masks and parser bands follow the curve identically.
+    const localSlopeAtY = (y: number): number => {
+        if (!refSamples.length) return refTilt;
+        const a = [...refSamples].sort((p, q) => p.y - q.y);
+        if (y <= a[0].y) return a[0].slope;
+        if (y >= a[a.length - 1].y) return a[a.length - 1].slope;
+        let i = 0;
+        while (i < a.length - 1 && a[i + 1].y < y) i++;
+        const L = a[i], R = a[i + 1];
+        const t = (y - L.y) / ((R.y - L.y) || 1);
+        return Math.max(-0.12, Math.min(0.12, L.slope + (R.slope - L.slope) * t));
+    };
 
     const bands: MaskBand[] = [];
     // Carry the most recent payment/loyalty label forward so a bare
@@ -199,21 +240,19 @@ export function detectCardMaskBands(
         const labelPart = line.text.slice(0, valueStart).trim();
         const redacted = labelPart ? `${labelPart} [•••]` : '[•••]';
 
-        // Per-line tilt from the line's OWN OCR corner Y (the smoothed per-line
-        // slope). The box bends with it on BOTH branches, so even a SINGLE-word PAN
-        // redaction follows the receipt curve (a single word's box is otherwise
-        // flat). FLAT row → slope 0 → rectangle; never a borrowed global tilt.
+        // The line's OWN OCR corner Y is unreliable for tilt — MLKit returns
+        // cornerPoints FLAT on skewed text — so the slope is derived below from the
+        // masked WORDS / receipt reference tilt. lt/lb remain the anchor for the
+        // no-word fallback branch.
         const lineW = Math.max(1, line.xRight - line.xLeft);
-        const lt = line.yLeftTop ?? line.yTop, rt = line.yRightTop ?? line.yTop;
-        const lb = line.yLeftBottom ?? line.yBottom, rb = line.yRightBottom ?? line.yBottom;
-        const slopeT = (rt - lt) / lineW;
-        const slopeB = (rb - lb) / lineW;
+        const lt = line.yLeftTop ?? line.yTop;
+        const lb = line.yLeftBottom ?? line.yBottom;
 
         // WORD-ANCHORED box: real x-span from the masked words; Y anchored at those
         // words' own top/bottom and TILTED by the line slope so it bends. Pad keeps
         // it over-covering so the PAN is never exposed. Char→x + line edges when no
         // words are present.
-        let boxLeft: number, boxRight: number, anchorX: number, anchorTop: number, anchorBot: number;
+        let boxLeft: number, boxRight: number, anchorTop: number, anchorBot: number;
         const valueWords = (line.words ?? [])
             .filter((w) => (w.xLeft + w.xRight) / 2 >= valXLeft - padX)
             .sort((a, b) => a.xLeft - b.xLeft);
@@ -221,18 +260,56 @@ export function detectCardMaskBands(
             const L = valueWords[0], R = valueWords[valueWords.length - 1];
             boxLeft = Math.max(line.xLeft, L.xLeft - padX);
             boxRight = R.xRight + padX;
-            anchorX = L.xLeft;
-            anchorTop = Math.min(L.yTop, R.yTop);   // highest top of the value words
-            anchorBot = Math.max(L.yBottom, R.yBottom); // lowest bottom → over-covers all
+            // Span ALL value words (not just the first/last) so a multi-fragment PAN
+            // whose MIDDLE fragment sits below its ends still has its true top/bottom —
+            // keeps the piiTop/piiBottom caps conservative (defence-in-depth).
+            anchorTop = Math.min(...valueWords.map((w) => w.yTop));   // highest top across all
+            anchorBot = Math.max(...valueWords.map((w) => w.yBottom)); // lowest bottom across all
         } else {
             boxLeft = Math.max(line.xLeft, valXLeft - padX);
             boxRight = line.xRight + span * 0.02;
-            anchorX = line.xLeft;
             anchorTop = lt;
             anchorBot = lb;
         }
-        const topAt = (x: number) => anchorTop + slopeT * (x - anchorX) - padY;
-        const botAt = (x: number) => anchorBot + slopeB * (x - anchorX) + padY;
+        // TILT for the band edges: the masked WORDS' own slope when 2+ span enough, else the
+        // LOCAL receipt slope at this mask's Y (NOT a global median that over-tilts near the
+        // curved receipt's flat top). EXCEPT when the fragment tops are STAGGERED (a number
+        // split across rows is not one tilted line — any tilt lifts a corner off a fragment):
+        // then use a FLAT envelope (slope 0) of the min-top/max-bottom, which hugs all fragments.
+        let slope: number;
+        if (valueWords.length >= 2) {
+            const L2 = valueWords[0], R2 = valueWords[valueWords.length - 1];
+            const lcx = (L2.xLeft + L2.xRight) / 2, rcx = (R2.xLeft + R2.xRight) / 2;
+            const wordSlope = rcx - lcx > 0.15 * lineW
+                ? Math.max(-0.12, Math.min(0.12, (R2.yTop - L2.yTop) / (rcx - lcx)))
+                : localSlopeAtY(anchorTop);
+            const wH = valueWords.map((w) => w.yBottom - w.yTop).sort((a, b) => a - b);
+            const medianWordH = wH[Math.floor(wH.length / 2)] || 1;
+            const stagger = Math.max(...valueWords.map((w) => w.yTop)) - Math.min(...valueWords.map((w) => w.yTop));
+            slope = stagger > 0.5 * medianWordH ? 0 : wordSlope;
+        } else {
+            slope = localSlopeAtY(anchorTop);
+        }
+        // PIVOT at the value words' CENTRE (like ikiParser.footBand), not the left edge — a
+        // left pivot lifts the far edge off the PII. The masked-word BBOX is axis-aligned but
+        // ALREADY encloses the tilted glyphs, so its height H = glyphThickness + |slope|·width:
+        // tilting that bbox AGAIN (and padding) inflates a single word to ~3 rows that spill
+        // onto the line below. Instead build a TIGHT band of the real glyph thickness, pivoted
+        // on the bbox vertical CENTRE, following the slope — it hugs the glyph strip (bottom-
+        // left→top-right) without the empty bbox corners. Floored at 0.35·H + padY so a tighter-
+        // than-modelled OCR box can never expose a glyph. For slope 0 (flat/staggered) this
+        // reduces to exactly the old flat envelope [anchorTop−padY, anchorBot+padY].
+        const cxAnchor = valueWords.length > 0
+            ? (Math.min(...valueWords.map((w) => w.xLeft)) + Math.max(...valueWords.map((w) => w.xRight))) / 2
+            : (boxLeft + boxRight) / 2;
+        const valueWidth = valueWords.length > 0
+            ? Math.max(...valueWords.map((w) => w.xRight)) - Math.min(...valueWords.map((w) => w.xLeft))
+            : (boxRight - boxLeft);
+        const H = anchorBot - anchorTop;
+        const cyAnchor = (anchorTop + anchorBot) / 2;
+        const halfT = Math.max(H - Math.abs(slope) * valueWidth, 0.35 * H) / 2 + padY;
+        const topAt = (x: number) => cyAnchor + slope * (x - cxAnchor) - halfT;
+        const botAt = (x: number) => cyAnchor + slope * (x - cxAnchor) + halfT;
         const yLT = topAt(boxLeft), yRT = topAt(boxRight);
         const yLB = botAt(boxLeft), yRB = botAt(boxRight);
         bands.push({
@@ -248,6 +325,9 @@ export function detectCardMaskBands(
             yRightTop: yRT,
             yLeftBottom: yLB,
             yRightBottom: yRB,
+            // PII text extent (no padding) — the inviolable core the clamp must not trim.
+            piiTop: anchorTop,
+            piiBottom: anchorBot,
         });
     }
 
@@ -268,6 +348,9 @@ export function detectCardMaskBands(
             last.yRightTop = Math.min(last.yRightTop ?? last.yTop, b.yRightTop ?? b.yTop);
             last.yLeftBottom = Math.max(last.yLeftBottom ?? last.yBottom, b.yLeftBottom ?? b.yBottom);
             last.yRightBottom = Math.max(last.yRightBottom ?? last.yBottom, b.yRightBottom ?? b.yBottom);
+            // Union the PII core too (covers both originals — clamp can't trim either).
+            last.piiTop = Math.min(last.piiTop ?? last.yTop, b.piiTop ?? b.yTop);
+            last.piiBottom = Math.max(last.piiBottom ?? last.yBottom, b.piiBottom ?? b.yBottom);
             for (const r of b.reasons) if (!last.reasons.includes(r)) last.reasons.push(r);
         } else {
             merged.push(b);
@@ -318,7 +401,12 @@ export function clampMaskBandsToProtected(
 ): MaskBand[] {
     if (!bands.length || !protectedRegions.length) return bands;
     return bands.map((b) => {
+        // PII guard: the clamp may NEVER move a mask edge past the PII text — the card /
+        // loyalty number must stay covered. Fall back to the mid-line for old stored
+        // masks that predate piiTop/piiBottom.
         const mid = (b.yTop + b.yBottom) / 2;
+        const piiTop = b.piiTop ?? mid;      // top edge may be pushed DOWN no further than here
+        const piiBottom = b.piiBottom ?? mid; // bottom edge may be pulled UP no higher than here
         let yLeftTop = b.yLeftTop ?? b.yTop;
         let yRightTop = b.yRightTop ?? b.yTop;
         let yLeftBottom = b.yLeftBottom ?? b.yBottom;
@@ -326,21 +414,33 @@ export function clampMaskBandsToProtected(
         for (const p of protectedRegions) {
             const xOverlap = !(p.xRight <= b.xLeft || p.xLeft >= b.xRight);
             if (!xOverlap) continue;
+            // SUBSTANTIAL overlap only (fast-path). A mask that merely clips the EDGE of a
+            // protected band is not hiding its data; skip so we don't disturb the mask.
+            const overlapW = Math.min(p.xRight, b.xRight) - Math.max(p.xLeft, b.xLeft);
+            const maskW = Math.max(1, b.xRight - b.xLeft);
+            const protW = Math.max(1, p.xRight - p.xLeft);
+            if (overlapW / maskW < 0.35 && overlapW / protW < 0.35) continue;
+            // PER-CORNER X-CONTAINMENT: only move a corner whose x ACTUALLY falls inside
+            // the protected band's x-range. Never extrapolate the band's edge across a
+            // corner that lies outside it — that is what lifted the PAN mask's far-left
+            // corner (nowhere near the total) up off the card number on receipt 77.
+            const leftIn = b.xLeft >= p.xLeft && b.xLeft <= p.xRight;
+            const rightIn = b.xRight >= p.xLeft && b.xRight <= p.xRight;
             const pCenter = (p.yTop + p.yBottom) / 2;
             if (pCenter <= mid) {
-                // protected band above → push the mask's TOP corners down to its
-                // bottom edge at each corner's x (capped at the mask mid-line).
+                // protected band above → push the mask's TOP corners down to its bottom
+                // edge, but never below the PII top (else the card number's top shows).
                 const blY = p.yLeftBottom ?? p.yBottom;
                 const brY = p.yRightBottom ?? p.yBottom;
-                yLeftTop = Math.min(mid, Math.max(yLeftTop, edgeYAt(p.xLeft, p.xRight, blY, brY, b.xLeft)));
-                yRightTop = Math.min(mid, Math.max(yRightTop, edgeYAt(p.xLeft, p.xRight, blY, brY, b.xRight)));
+                if (leftIn) yLeftTop = Math.min(piiTop, Math.max(yLeftTop, edgeYAt(p.xLeft, p.xRight, blY, brY, b.xLeft)));
+                if (rightIn) yRightTop = Math.min(piiTop, Math.max(yRightTop, edgeYAt(p.xLeft, p.xRight, blY, brY, b.xRight)));
             } else {
-                // protected band below → pull the mask's BOTTOM corners up to its
-                // top edge at each corner's x (capped at the mask mid-line).
+                // protected band below → pull the mask's BOTTOM corners up to its top
+                // edge, but never above the PII bottom (else the card number's bottom shows).
                 const tlY = p.yLeftTop ?? p.yTop;
                 const trY = p.yRightTop ?? p.yTop;
-                yLeftBottom = Math.max(mid, Math.min(yLeftBottom, edgeYAt(p.xLeft, p.xRight, tlY, trY, b.xLeft)));
-                yRightBottom = Math.max(mid, Math.min(yRightBottom, edgeYAt(p.xLeft, p.xRight, tlY, trY, b.xRight)));
+                if (leftIn) yLeftBottom = Math.max(piiBottom, Math.min(yLeftBottom, edgeYAt(p.xLeft, p.xRight, tlY, trY, b.xLeft)));
+                if (rightIn) yRightBottom = Math.max(piiBottom, Math.min(yRightBottom, edgeYAt(p.xLeft, p.xRight, tlY, trY, b.xRight)));
             }
         }
         return {
@@ -394,6 +494,35 @@ export function redactReceiptText(text: string | null | undefined): string {
             return line;
         })
         .join('\n');
+}
+
+/** A word/line box in the same pixel space as the mask bands. */
+export interface PiiBox { xLeft: number; xRight: number; yTop: number; yBottom: number; }
+
+/** True when a box's CENTRE sits inside ANY mask band (band Y = the UNION of its skew
+ *  corners AND piiTop/piiBottom, so a tilted card/loyalty row is never under-covered).
+ *  Redacts PII words out of the persisted wordsDump (it ships in staging+prod). Uses the
+ *  CENTRE — not any overlap — so a neighbouring label that merely EDGE-clips a tall card
+ *  band (e.g. "Pardavimas" grazing the bank band by a few px) is NOT blanked; a real PII
+ *  word sits fully inside its band so its centre is always within. looksLikePiiText
+ *  backstops every digit/star run regardless. */
+export function wordCentreInMaskBand(box: PiiBox, bands: MaskBand[]): boolean {
+    const cx = (box.xLeft + box.xRight) / 2, cy = (box.yTop + box.yBottom) / 2;
+    for (const b of bands) {
+        if (cx < b.xLeft || cx > b.xRight) continue;
+        const top = Math.min(b.yTop, b.yLeftTop ?? b.yTop, b.yRightTop ?? b.yTop, b.piiTop ?? b.yTop);
+        const bot = Math.max(b.yBottom, b.yLeftBottom ?? b.yBottom, b.yRightBottom ?? b.yBottom, b.piiBottom ?? b.yBottom);
+        if (cy >= top && cy <= bot) return true;
+    }
+    return false;
+}
+
+/** Defence-in-depth for wordsDump redaction: word text that LOOKS like a card/loyalty
+ *  number regardless of band detection (which is fragile) — a 10+ digit run (loyalty
+ *  number; 8-digit trader IDs stay clear) or a star-masked PAN. Cashier NAMES have no
+ *  pattern, so they rely on the band overlap. */
+export function looksLikePiiText(text: string): boolean {
+    return LONG_DIGIT_RUN.test(text) || MASK_RUN.test(text);
 }
 
 /** Copy-paste-friendly trace of detected mask boxes for the dev batch log.

@@ -450,6 +450,82 @@ function stripBarcodePrefix(name: string): string {
 
 // ───────── footer ─────────
 
+/**
+ * Resolve the Lidl document / receipt number from a set of OCR lines.
+ *
+ * Lidl prints it in up to three forms, and MLKit frequently line-splits the
+ * labelled one — which is why the old same-line-only capture returned null and
+ * receipt numbers came back missing:
+ *   1. "Dokumento numeris:"   — value often on the NEXT line   (most authoritative)
+ *   2. "Kvitas NNNNN/NN"      — header row, can also split across two lines
+ *   3. "#00NNNNN" / "00NNNNN" — zero-padded document line (header + VMI footer block)
+ *
+ * Every candidate is collected and the value the MOST sources agree on wins, so a
+ * single garbled read (e.g. "80151269" for "00151269") can't take over; ties break
+ * by the priority order above. Returns null when no source yields a number.
+ */
+export function extractReceiptNo(lines: LidlLine[]): { value: string; line: LidlLine } | null {
+    const cands: { value: string; line: LidlLine; priority: number }[] = [];
+    for (let i = 0; i < lines.length; i++) {
+        const t = lines[i].text.trim();
+
+        // (1) Dokumento numeris — same line, else the digits on the next line.
+        if (/dokumento\s+numeris/i.test(t)) {
+            const same = t.match(/dokumento\s+numeris\s*:?\s*(\d{4,})/i);
+            if (same) {
+                cands.push({ value: same[1], line: lines[i], priority: 0 });
+            } else {
+                const nx = lines[i + 1];
+                const m = nx?.text.match(/(\d{4,})/);
+                if (m && nx) cands.push({ value: m[1], line: nx, priority: 0 });
+            }
+        }
+
+        // (2) Kvitas NNNNN/NN — same line, else "NNNNN/NN" on the next line.
+        const kv = t.match(/^kvitas\s+(\d{4,})\s*\/\s*\d+/i);
+        if (kv) {
+            cands.push({ value: kv[1], line: lines[i], priority: 1 });
+        } else if (/^kvitas$/i.test(t)) {
+            const nx = lines[i + 1];
+            const m = nx?.text.match(/^\s*(\d{4,})\s*\/\s*\d+/);
+            if (m && nx) cands.push({ value: m[1], line: nx, priority: 1 });
+        }
+
+        // (3) Zero-padded document line "#00NNNNN" / "00NNNNN". Strip the pad and
+        //     keep only 4–7 digit results, so the 10-digit merchant number
+        //     ("0017300621") and other long ids can't masquerade as the doc number.
+        const doc = t.match(/^#?(0{2,}\d{2,})$/);
+        if (doc) {
+            const v = doc[1].replace(/^0+/, '');
+            if (v.length >= 4 && v.length <= 7) {
+                cands.push({ value: v, line: lines[i], priority: 2 });
+            }
+        }
+    }
+    if (!cands.length) return null;
+
+    // Self-heal: the value with the most corroborating sources wins; ties break
+    // by the most authoritative source (Dokumento numeris > Kvitas > #00NNNNN).
+    const byValue = new Map<string, { count: number; priority: number; line: LidlLine }>();
+    for (const c of cands) {
+        const e = byValue.get(c.value);
+        if (!e) {
+            byValue.set(c.value, { count: 1, priority: c.priority, line: c.line });
+        } else {
+            e.count++;
+            if (c.priority < e.priority) { e.priority = c.priority; e.line = c.line; }
+        }
+    }
+    let best: { value: string; count: number; priority: number; line: LidlLine } | null = null;
+    for (const [value, e] of byValue) {
+        if (!best || e.count > best.count
+            || (e.count === best.count && e.priority < best.priority)) {
+            best = { value, count: e.count, priority: e.priority, line: e.line };
+        }
+    }
+    return best ? { value: best.value, line: best.line } : null;
+}
+
 function parseFooter(lines: LidlLine[]): LidlFooter {
     let total: number | null = null;
     let totalSavings: number | null = null;
@@ -508,13 +584,16 @@ function parseFooter(lines: LidlLine[]): LidlFooter {
             time = dtMatch[2].replace(/\s/g, '');
             trackLine(lines[i], 'dateTime');
         }
-        if (!receiptNo) {
-            const rn = t.match(/dokumento\s+numeris\s*:?\s*(\d+)/i);
-            if (rn) {
-                receiptNo = rn[1];
-                trackLine(lines[i], 'receiptNo');
-            }
-        }
+    }
+
+    // Receipt number via the multi-source, self-healing resolver. Handles MLKit
+    // splitting the "Dokumento numeris" label from its value onto separate lines
+    // (the old same-line `\d+` capture missed it) and cross-checks the zero-padded
+    // document line, so the band lands on whichever line actually carries it.
+    const rn = extractReceiptNo(lines);
+    if (rn) {
+        receiptNo = rn.value;
+        trackLine(rn.line, 'receiptNo');
     }
 
     lineRegions.sort((a, b) => a.yTop - b.yTop);
@@ -553,6 +632,14 @@ export function parseLidlReceipt(
     const footerStart = findFooterStart(rawLines, headerEnd);
     const header = parseHeader(rawLines.slice(0, headerEnd));
     const footer = parseFooter(rawLines.slice(footerStart));
+
+    // Self-heal: if the footer yielded no receipt number (the whole "Dokumento
+    // numeris" block cropped or garbled), recover it from the header — the
+    // "Kvitas NNNNN/NN" / "#00NNNNN" rows carry the same document number.
+    if (!footer.receiptNo) {
+        const rn = extractReceiptNo(rawLines.slice(0, headerEnd));
+        if (rn) footer.receiptNo = rn.value;
+    }
     const plan = findReceiptBandsLidl(rawLines, options);
     const products: LidlProduct[] = [];
     for (const internal of plan.productInternals) {

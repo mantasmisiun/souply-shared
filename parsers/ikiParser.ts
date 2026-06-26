@@ -490,7 +490,12 @@ const T_NEG_RE = /-\s?(\d{1,4}[.,]\s?\d{2})/;
 // "Taškais" (IKI loyalty points) loses its tail ("Taškals" with i→l, "Taškai").
 // Match the STABLE stems — "KUPON" / "…PONAS" for coupons, "MAI[SŠ]ELIS" for
 // bags, and "TA[SŠ]KA" for points — so none slips through as a phantom product.
-const T_SKIP_NAME_RE = /KUPON|\b[A-Z]{0,2}PONAS\b|MAI[SŠ]ELIS|TA[SŠ]KA/i;
+// HARD-skip names (dropped entirely): coupons ("KUPONAS"/"…PONAS", incl. the merged
+// "xPiginoRuponas" via PIGIN = "Piginimo"), plastic bags, loyalty points.
+const T_SKIP_NAME_RE = /KUPON|\b[A-Z]{0,2}PONAS\b|PIGIN|MAI[SŠ]ELIS|TA[SŠ]KA/i;
+// Bottle DEPOSIT / UŽSTATAS — handled SEPARATELY (folds into the product above's
+// band, no value), not hard-skipped. OCR rots the O→0 ("DEP0ZIAS").
+const T_DEPOSIT_RE = /DEP[O0]Z|U[ŽZ]STAT/i;
 const T_LEAD_DISC_RE = /^(-\s?\d{1,4}[.,]\s?\d{2})\s*[ABC]?\s+(\S.*)$/;        // "-0,72 A RAUDONOSIOS PAPRIKOS"
 const T_LEAD_PRICE_RE = /^(\d{1,4}[.,]\s?\d{2})\s*[ABC]?\s*-?\s*(\S.*)$/;      // "18,15 A- 1,068 kg X 16,99 EUR/kg"
 const T_DISC_NAME_RE = /^(NUOL.{0,4}D[A4](?:\s+SU\s+KORTELE)?)\s+(.+)$/i;      // "NUOLAIDA 2A RAUDONOS IOS PAPRIKOS" (label fused w/ next name)
@@ -501,10 +506,22 @@ const T_TRAIL_PRICE_RE = /^(.*?[A-Za-zĄČĘĖĮŠŲŪŽąčęėįšųūž].*?)\
 // can only be a price, so whatever follows it starts a NEW product. The price
 // digits are loose (OCR drops the integer/decimal) — the VAT letter is the anchor.
 const T_MID_PRICE_NAME_RE = /^(.+?)\s+(\d{1,4}(?:[.,]\s?\d{0,2})?)\s*([ABC])\s+(.+)$/;
-const T_PRODUCTS_END_RE = /Prekiautojo\s+ID|^\s*Pardavimas\b|MASTERCARD|^\s*SUMA\b|Mok[eė]ti\b/i;
+const T_PRODUCTS_END_RE = /^\s*Pardavimas\b|MASTERCARD|^\s*SUMA\b|Mok[eė]ti\b/i;
+// "Prekiautojo ID <number>" (trader-id line) ends the product section. The "Prekia…"
+// seller stem alone is too loose ("Prekiautojo nuolaida" — a promo — would truncate the
+// product list). Confirm it with EITHER the trader number (6+ digits) OR an "ID"/"1D"
+// token whose D is UPPERCASE (case-sensitive — the OCR keeps "ID"/"g1D" capitalised, but
+// the lowercase "id" buried in "nuolaida"/"idejos" stays excluded). I→1 tolerant.
+const T_TRADER_LINE_RE = /Prekia\w{0,8}/i;
+const T_TRADER_NUM_RE = /\d{6,}/;
+const T_TRADER_ID_RE = /[I1]D/; // case-SENSITIVE: uppercase D only
 const T_DATE_RE = /(\d{4})-(\d{2})-(\d{2})/;
 const T_TIME_RE = /(\d{2}):(\d{2}):(\d{2})/;
 const T_RECEIPTNO_RE = /Kvito\s+Nr[.,]?\s*([0-9/]+)/i;   // OCR reads "Nr." or "Nr,"
+// Fallback receipt id when "Kvito Nr." is missing/unreadable: the shorter "Kvitas"
+// sequence number on the terminal line ("Term. 15027037 Kvitas 3157 Atsk 000").
+// Distinct from "Kvito" (no trailing "s"), so it can't match the primary line.
+const T_KVITAS_RE = /\bKvitas[\s.:]*(\d{3,6})\b/i;
 // Canonical total line, amount on EITHER side of SUMA — OCR flips the order:
 // "SUMA 26,52 EUR" and "26,52 EUR SUMA" both seen. Requires EUR so the multi-
 // column VAT header ("…Suma su PVM Be PVM…") with no EUR can't false-match.
@@ -651,6 +668,7 @@ interface EWord { text: string; xLeft: number; xRight: number; yTop: number; yBo
 interface ERow {
   words: EWord[]; leftText: string;
   total: number | null; perKg: number | null; discount: number; isSkip: boolean;
+  isDeposit: boolean;                                                 // bottle deposit — folds into the product above's band, no value
   kgQty: boolean;                                                     // row bears a weighed-quantity token
   topY: number; botY: number; leftX: number; slope: number;
 }
@@ -732,8 +750,24 @@ function ikiClassifyRow(ws: EWord[], lines: IkiLine[]): ERow {
   const topY = Math.min(...ws.map((w) => w.yTop));
   const botY = Math.max(...ws.map((w) => w.yBottom));
   const slope = emedian(ws.map((w) => w.slope));
-  const base: ERow = { words: ws, leftText: '', total: null, perKg: null, discount: 0, isSkip: false, kgQty: T_KG_QTY_RE.test(text), topY, botY, leftX: ws[0].xLeft, slope };
-  if (isTSkip(text)) return { ...base, isSkip: true, leftText: text };
+  const base: ERow = { words: ws, leftText: '', total: null, perKg: null, discount: 0, isSkip: false, isDeposit: false, kgQty: T_KG_QTY_RE.test(text), topY, botY, leftX: ws[0].xLeft, slope };
+  // Skip from the row text OR the source line — "0,10 DEPOZITAS" keeps only the
+  // "0,10" amount as words (the DEPOZITAS label is dropped), so the row text alone
+  // misses it; the line text still has it. EXTRA signal: a deposit amount has NO
+  // VAT-class letter (every real IKI product total ends in A/B/C), so a weak deposit
+  // hint ("DEP0…") on a NO-VAT amount is a deposit even when too garbled to match
+  // the strict skip name — and a real product (which always has the VAT letter) is
+  // never caught by it.
+  const hadVat = /[ABC]\s*$/.test(text);
+  const depositHint = /\bDEP[O0]|U[ŽZ]ST/i.test(firstSrc);
+  // DEPOSIT (folds into the product above's band, no value). The no-VAT extra catches
+  // deposits too garbled for the strict name: a real product total always ends in A/B/C.
+  if (T_DEPOSIT_RE.test(text) || T_DEPOSIT_RE.test(firstSrc) || (depositHint && !hadVat)) {
+    return { ...base, isSkip: true, isDeposit: true, leftText: text };
+  }
+  if (isTSkip(text) || isTSkip(firstSrc)) {
+    return { ...base, isSkip: true, leftText: text };
+  }
   const srcPerKg = extractPerKg(firstSrc);
   // WEIGHT row — straight from the words, OR RECOVERED when OCR shattered the
   // "kg X … EUR" tokens (only the leading kg-quantity survived as a word, the "kg"
@@ -867,17 +901,21 @@ function parseIkiColumnar(lines: IkiLine[], start: number, end: number): IkiProd
         pricePerUnit: unitPrice,
         // FULL row text per product, so all parsed info lands in rawData even when
         // a band/coordinate is imperfect.
-        rawLines: c.rows.map(rowText).filter(Boolean),
+        rawLines: c.rows.filter((r) => !r.isSkip).map(rowText).filter(Boolean),
         region: { yTop: c.top.topY, yBottom: c.top.botY, xLeft: c.top.leftX, xRight: c.top.leftX },
       },
     });
   };
   for (const r of rows) {
     if (r.isSkip) {
-      // A coupon/bag/points marker CLOSES the current product: it's the trailer
-      // section, so a trailing points amount (e.g. "IKI Taškais -0,05 A", whose
-      // skip word didn't survive into the row's words) can't attach to the last
-      // real product as a phantom discount.
+      // A bottle DEPOSIT belongs to the product ABOVE — fold it into that product's
+      // rows so the SAME band covers it, but DON'T flush and DON'T add its amount
+      // (it's a charge, not a product; total was never set on a skip row anyway).
+      if (r.isDeposit && cur.top != null) { cur.rows.push(r); continue; }
+      // Any OTHER skip (coupon/bag/points) CLOSES the current product: it's the
+      // trailer section, so a trailing points amount (e.g. "IKI Taškais -0,05 A",
+      // whose skip word didn't survive into the row's words) can't attach to the
+      // last real product as a phantom discount.
       if (cur.total != null) flush();
       continue;
     }
@@ -991,7 +1029,7 @@ function parseIkiColumnar(lines: IkiLine[], start: number, end: number): IkiProd
         ews = [{ text: cands[best].name, xLeft: src.xLeft, xRight: Math.max(src.xLeft + 1, amtX - 10), yTop: src.yTop, yBottom: src.yBottom, slope: 0, line: cands[best].li }];
       }
       o.rows.unshift({
-        words: ews, leftText: cands[best].name, total: null, perKg: null, discount: 0, isSkip: false, kgQty: false,
+        words: ews, leftText: cands[best].name, total: null, perKg: null, discount: 0, isSkip: false, isDeposit: false, kgQty: false,
         topY: Math.min(...ews.map((w) => w.yTop)), botY: Math.max(...ews.map((w) => w.yBottom)),
         leftX: Math.min(...ews.map((w) => w.xLeft)), slope: 0,
       });
@@ -1021,7 +1059,7 @@ function parseIkiColumnar(lines: IkiLine[], start: number, end: number): IkiProd
       if (lk.length < 4 || !(lk.includes(probe) || key.includes(lk.slice(0, 6)))) continue;
       const ews: EWord[] = nw.map((w) => ({ text: w.text, xLeft: w.xLeft, xRight: w.xRight, yTop: w.yTop, yBottom: w.yBottom, slope: 0, line: i }));
       o.rows.unshift({
-        words: ews, leftText: o.p.name, total: null, perKg: null, discount: 0, isSkip: false, kgQty: false,
+        words: ews, leftText: o.p.name, total: null, perKg: null, discount: 0, isSkip: false, isDeposit: false, kgQty: false,
         topY: Math.min(...ews.map((w) => w.yTop)), botY: Math.max(...ews.map((w) => w.yBottom)),
         leftX: Math.min(...ews.map((w) => w.xLeft)), slope: 0,
       });
@@ -1235,46 +1273,119 @@ function parseThermalProducts(lines: IkiLine[], start: number, end: number): Iki
 function parseIkiThermal(lines: IkiLine[]): IkiParseResult {
   const rawText = lines.map((l) => l.text).join('\n');
   const region = regionOf(lines);
-  // ── ONE receipt tilt (gFoot), measured from WIDE OCR lines (a real left-to-right
-  // line): Δy/Δx of its left-most vs right-most word. Used to BEND footer bands so
-  // they follow the skew instead of sitting flat. Clamped to a sane rotation. ──
-  const fSlopes: number[] = [];
-  const fW = (region.xRight - region.xLeft) || 1;
-  for (const l of lines) {
-    const ws = l.words;
-    if (!ws || ws.length < 2) continue;
-    const lw = ws.reduce((a, b) => (b.xLeft < a.xLeft ? b : a));
-    const rw = ws.reduce((a, b) => (b.xRight > a.xRight ? b : a));
-    const lx = (lw.xLeft + lw.xRight) / 2, rx = (rw.xLeft + rw.xRight) / 2;
-    if (rx - lx > 0.4 * fW) fSlopes.push((rw.yTop - lw.yTop) / (rx - lx));
+  // RECEIPT tilt SAMPLES: each WIDE multi-word line's (yCentre, slope). The receipt is
+  // CURVED (≈flat at the top, steep at the bottom), so a single global median over-bends
+  // a flat header line and under/over-bends a footer one. We keep per-line samples and read
+  // the LOCAL slope at a band's own Y (localSlopeAtY) — refTilt is only the last-resort
+  // median for a receipt too short to bracket a band.
+  const refSamples: { y: number; slope: number }[] = [];
+  {
+    const W = (region.xRight - region.xLeft) || 1;
+    for (const l of lines) {
+      const ws = l.words;
+      if (!ws || ws.length < 2) continue;
+      const lw = ws.reduce((a, b) => (b.xLeft + b.xRight < a.xLeft + a.xRight ? b : a));
+      const rw = ws.reduce((a, b) => (b.xLeft + b.xRight > a.xLeft + a.xRight ? b : a));
+      const lcx = (lw.xLeft + lw.xRight) / 2, rcx = (rw.xLeft + rw.xRight) / 2;
+      if (rcx - lcx > 0.4 * W) refSamples.push({ y: (lw.yTop + rw.yTop) / 2, slope: (rw.yTop - lw.yTop) / (rcx - lcx) });
+    }
   }
-  const gFoot = Math.max(-0.06, Math.min(0.06, emedian(fSlopes)));
-  // FOOTER field band: FULL WIDTH (receipt left→right) + BENT by gFoot, anchored in Y
-  // to the words that carry the field VALUE when they survived (tight, off the merged
-  // neighbour line), else the whole line bbox (stable — covers the value even when OCR
-  // dropped its words). One rule for total / dateTime / receiptNo so they stop drifting.
+  const refTilt = refSamples.length ? Math.max(-0.12, Math.min(0.12, emedian(refSamples.map((s) => s.slope)))) : 0;
+  // The LOCAL receipt slope at a given Y: linearly interpolate between the two wide lines
+  // that bracket it (nearest sample's slope outside the sampled range — no extrapolation),
+  // so a band follows the receipt's curve at its OWN height instead of one global tilt.
+  const localSlopeAtY = (y: number): number => {
+    if (!refSamples.length) return refTilt;
+    const a = [...refSamples].sort((p, q) => p.y - q.y);
+    if (y <= a[0].y) return a[0].slope;
+    if (y >= a[a.length - 1].y) return a[a.length - 1].slope;
+    let i = 0;
+    while (i < a.length - 1 && a[i + 1].y < y) i++;
+    const L = a[i], R = a[i + 1];
+    const t = (y - L.y) / ((R.y - L.y) || 1);
+    return Math.max(-0.12, Math.min(0.12, L.slope + (R.slope - L.slope) * t));
+  };
+  // FOOTER/HEADER field band: put the band where the field VALUE actually is, BENT to
+  // follow the receipt.
+  //   • value words SURVIVED  → cover exactly those boxes (tight, on the value).
+  //   • value words DROPPED    → cover the whole LINE FRAME (real MLKit line box) — it
+  //     CONTAINS the value wherever OCR scrambled it, and is narrower than the receipt.
+  // The band tilts by THIS LINE'S OWN local slope (its leftmost→rightmost word) — NOT a
+  // global tilt. The receipt is CURVED (tilt drifts from ~flat at the top to steep at the
+  // bottom), so a single receipt-wide refTilt over-bends a near-flat header line. Using
+  // the line's own words means a single-word value (storeCode/receiptNo) and a multi-word
+  // value (address — where no one word matches the whole value) BOTH bend by their own
+  // line. refTilt is only the last resort for a line too narrow to define its own tilt.
   const footBand = (l: IkiLine, kind: RegionKind, value: string): LabeledRegion => {
-    const X0 = region.xLeft, X1 = region.xRight;
-    const key = value.replace(/[^0-9A-Za-z]/g, '');
     const ws = l.words ?? [];
-    // words whose digits/letters overlap the value (e.g. "26,52" for total "26,52",
-    // "2026-06-11" for the date) — these mark where the field actually sits.
+    const key = value.replace(/[^0-9A-Za-z]/g, '');
     const hit = ws.filter((w) => {
       const k = w.text.replace(/[^0-9A-Za-z]/g, '');
-      return k.length >= 2 && (key.includes(k) || k.includes(key.slice(0, 4)));
+      // HUG a word only when it IS the value, or CONTAINS the whole value plus a little
+      // decoration (≤3 chars, e.g. "26,52EUR"/"1,05A"). NOT when the word is merely a
+      // FRAGMENT of the value ("26" of "26,52" → drops the ",52") or a longer number
+      // that happens to share the value's leading digits (term-id "15001934" vs total
+      // "1500"); those fall through to the value-containing LINE FRAME instead.
+      return k.length >= 2 && (k === key || (k.includes(key) && k.length - key.length <= 3));
     });
     const src = hit.length ? hit : null;
-    const cx = (w: IkiWord) => (w.xLeft + w.xRight) / 2;
-    const aTop = src
-      ? Math.min(...src.map((w) => w.yTop - gFoot * cx(w)))
-      : l.yTop - gFoot * ((l.xLeft + l.xRight) / 2);
-    const aBot = src
-      ? Math.max(...src.map((w) => w.yBottom - gFoot * cx(w)))
-      : l.yBottom - gFoot * ((l.xLeft + l.xRight) / 2);
-    const yLT = aTop + gFoot * X0, yRT = aTop + gFoot * X1;
-    const yLB = aBot + gFoot * X0, yRB = aBot + gFoot * X1;
+    // X: the value words when present, else the whole LINE FRAME (so it still contains
+    // the value wherever OCR scrambled it).
+    const xL = src ? Math.min(...src.map((w) => w.xLeft)) : l.xLeft;
+    const xR = src ? Math.max(...src.map((w) => w.xRight)) : l.xRight;
+    // Y (HEIGHT): the value words, else the SURVIVING line words — a thin text-height
+    // strip. NOT the line's full bbox: for a tilted, wide line that bbox is ~2 rows tall
+    // (left words high, right words low), so the band read as "covering a line above +
+    // half the line below". Fall back to the bbox only when no word survived at all.
+    let yAnchor = src ?? (ws.length ? ws : null);
+    // VALUE-DROPPED 2-ROW MERGE (receipt-84): MLKit sometimes merges two physical rows into
+    // one line ("Contactless" + "Term. … Kvitas 7317 …"); only the TOP row's words survive but
+    // the value is on the BOTTOM row, so the frame extends a whole text-row BELOW the survivors.
+    // Anchor the band to that lower slice (survivors' bottom → frame bottom) so it sits ON the
+    // value, not the survivors above it. A SINGLE tilted row (receipt-79) has survivors that
+    // fill the frame top-to-bottom (tiny gap) → unchanged thin word-strip.
+    let lowerRow = false;
+    if (!src && ws.length) {
+      const maxBot = Math.max(...ws.map((w) => w.yBottom));
+      const hs = ws.map((w) => w.yBottom - w.yTop).sort((a, b) => a - b);
+      const medH = hs[Math.floor(hs.length / 2)] || 1;
+      if (l.yBottom - maxBot > 0.5 * medH) { lowerRow = true; yAnchor = null; }
+    }
+    const yT = lowerRow ? Math.max(...ws.map((w) => w.yBottom)) : (yAnchor ? Math.min(...yAnchor.map((w) => w.yTop)) : l.yTop);
+    const yB = lowerRow ? l.yBottom : (yAnchor ? Math.max(...yAnchor.map((w) => w.yBottom)) : l.yBottom);
+    // SLOPE from the WHOLE line's words (the local tilt at this line), reliable when they
+    // span ≥15% of the receipt width; else the LOCAL receipt slope at this band's Y (a
+    // single-word value on a flat header stays flat instead of borrowing the steep median).
+    let slope = localSlopeAtY(yT);
+    if (ws.length >= 2) {
+      const lw = ws.reduce((a, b) => (b.xLeft < a.xLeft ? b : a));
+      const rw = ws.reduce((a, b) => (b.xRight > a.xRight ? b : a));
+      const lcx = (lw.xLeft + lw.xRight) / 2, rcx = (rw.xLeft + rw.xRight) / 2;
+      if (rcx - lcx > 0.15 * (region.xRight - region.xLeft)) {
+        slope = Math.max(-0.12, Math.min(0.12, (rw.yTop - lw.yTop) / (rcx - lcx)));
+      }
+    }
+    // PIVOT the tilt at the ANCHOR words' centre (where yT/yB were measured), NOT the
+    // band centre. When the band is wide because the line frame reaches a far-left label
+    // ("SUMA … 1,15 EUR": the value is on the RIGHT, SUMA at the left), a centre pivot
+    // lifts the right edge OFF the amount — it covers only the top of the total. Pivoting
+    // at the value's centre keeps the band ON the amount and tilts the far side down.
+    // Each edge offset still capped at ±30px (≈ one thermal row) so a wide band can't
+    // re-create the "bent too much" complaint.
+    // PAD a little so the first/last glyph sits INSIDE the band, not flush against the
+    // edge — OCR word boxes are tight, so the leading digit ("1" of "1,15 EUR") poked out
+    // the left edge. Proportional to the text height. Pivot stays the value's centre.
+    const pad = Math.max(3, (yB - yT) * 0.09);
+    const bxL = xL - pad, bxR = xR + pad, byT = yT - pad, byB = yB + pad;
+    const cxA = yAnchor
+      ? (Math.min(...yAnchor.map((w) => w.xLeft)) + Math.max(...yAnchor.map((w) => w.xRight))) / 2
+      : (bxL + bxR) / 2;
+    const offL = Math.max(-30, Math.min(30, slope * (bxL - cxA)));
+    const offR = Math.max(-30, Math.min(30, slope * (bxR - cxA)));
+    const yLT = byT + offL, yRT = byT + offR;
+    const yLB = byB + offL, yRB = byB + offR;
     return {
-      kind, xLeft: X0, xRight: X1,
+      kind, xLeft: bxL, xRight: bxR,
       yLeftTop: yLT, yRightTop: yRT, yLeftBottom: yLB, yRightBottom: yRB,
       yTop: Math.min(yLT, yRT), yBottom: Math.max(yLB, yRB),
     };
@@ -1414,7 +1525,9 @@ function parseIkiThermal(lines: IkiLine[]): IkiParseResult {
   }
   let pEnd = lines.length;
   for (let i = pStart; i < lines.length; i++) {
-    if (T_PRODUCTS_END_RE.test(lines[i].text)) { pEnd = i; break; }
+    const endText = lines[i].text;
+    const isTrader = T_TRADER_LINE_RE.test(endText) && (T_TRADER_NUM_RE.test(endText) || T_TRADER_ID_RE.test(endText));
+    if (T_PRODUCTS_END_RE.test(endText) || isTrader) { pEnd = i; break; }
   }
   // COLUMN ENGINE dispatch (flag-gated): use it when enough per-word data exists
   // AND it actually yields products; otherwise fall back to the legacy tokenizer.
@@ -1533,6 +1646,10 @@ function parseIkiThermal(lines: IkiLine[]): IkiParseResult {
   // ── footer fields (scan whole receipt; take first hit) + bbox bands ──
   let total: number | null = null;
   let receiptNo = '';
+  // Captured separately so "Kvito Nr." (the canonical key) always wins over the
+  // "Kvitas" fallback even though Kvitas is printed FIRST (higher up the receipt).
+  let kvitoVal = ''; let kvitoLine: IkiLine | undefined;
+  let kvitasVal = ''; let kvitasLine: IkiLine | undefined;
   let totalSavings: number | null = null;
   let date = '';
   let time = '';
@@ -1540,6 +1657,8 @@ function parseIkiThermal(lines: IkiLine[]): IkiParseResult {
   let timeLine: IkiLine | undefined;
   let timeMatch: RegExpMatchArray | undefined;
   let sumaPending = false; // previous line had a bare "SUMA" keyword w/o an amount
+  let prevAmtLine: IkiLine | undefined; // previous line carried "X,XX EUR" but no SUMA
+  let prevAmtVal: string | undefined;
   const footerRegions: LabeledRegion[] = [];
   for (const l of lines) {
     const t = l.text;
@@ -1569,10 +1688,25 @@ function parseIkiThermal(lines: IkiLine[]): IkiParseResult {
         footerRegions.push(footBand(l, 'total', m[1]));
       }
     }
+    // LOOK-BEHIND (form 4): OCR split the amount onto the line BEFORE a bare "SUMA"
+    // ("1,15 EUR" then "SUMA") — the look-ahead above only catches SUMA-then-amount.
+    // Band the AMOUNT line (where "1,15 EUR" actually is), NOT the bare "SUMA" line —
+    // the total VALUE is on the amount line, so the band must sit there. When the amount
+    // words survived footBand hugs them; when they were dropped it covers that line frame.
+    if (total == null && /\bSUMA\b/i.test(t) && !/\d{1,4}[.,]\s?\d{2}\s*EUR/i.test(t) && prevAmtLine && prevAmtVal) {
+      total = parseNum(prevAmtVal);
+      footerRegions.push(footBand(prevAmtLine, 'total', prevAmtVal));
+    }
     // Arm the split-SUMA look-ahead for the NEXT line: this line names SUMA but
     // carries no amount itself.
     sumaPending = !sumaAmt && /\bSUMA\b/i.test(t) && !/\d{1,4}[.,]\s?\d{2}\s*EUR/i.test(t);
-    if (!receiptNo) { const m = t.match(T_RECEIPTNO_RE); if (m) { receiptNo = m[1]; footerRegions.push(footBand(l, 'receiptNo', m[1])); } }
+    // Remember a standalone "X,XX EUR" amount line (no SUMA keyword) so the NEXT
+    // iteration's look-behind can claim it when a bare SUMA follows.
+    const prevM = /\bSUMA\b/i.test(t) ? null : t.match(/(\d{1,4}[.,]\s?\d{2})\s*EUR/i);
+    prevAmtLine = prevM ? l : undefined;
+    prevAmtVal = prevM ? prevM[1] : undefined;
+    if (!kvitoVal) { const m = t.match(T_RECEIPTNO_RE); if (m) { kvitoVal = m[1]; kvitoLine = l; } }
+    if (!kvitasVal) { const m = t.match(T_KVITAS_RE); if (m) { kvitasVal = m[1]; kvitasLine = l; } }
     if (totalSavings == null) { const m = t.match(T_SAVINGS_RE); if (m) totalSavings = parseNum(m[1]); }
     if (!date) { const m = t.match(T_DATE_RE); if (m) { date = `${m[1]}-${m[2]}-${m[3]}`; dateLine = l; } }
     if (!time) { const m = t.match(T_TIME_RE); if (m) { time = `${m[1]}:${m[2]}`; timeLine = l; timeMatch = m; } }
@@ -1593,6 +1727,16 @@ function parseIkiThermal(lines: IkiLine[]): IkiParseResult {
     } else if (timeLine) {
       footerRegions.push(footBand(timeLine, 'time', time));
     }
+  }
+  // Resolve the receipt id: prefer the canonical "Kvito Nr.", else the "Kvitas"
+  // sequence number, else synthesize from date+time+total (same scheme as the
+  // column-header path) so a readable receipt ALWAYS gets a stable id — without one
+  // the app can't tell a duplicate from a new receipt and stalls the scan flow.
+  const rnVal = kvitoVal || kvitasVal;
+  const rnLine = kvitoVal ? kvitoLine : kvitasLine;
+  if (rnVal && rnLine) { receiptNo = rnVal; footerRegions.push(footBand(rnLine, 'receiptNo', rnVal)); }
+  if (!receiptNo && date && time && total !== null) {
+    receiptNo = `${date.replace(/-/g, '')}-${time.replace(/:/g, '')}-${Math.round(total * 100)}-iki-receipt`;
   }
   footerRegions.sort((a, b) => a.yTop - b.yTop);
 
