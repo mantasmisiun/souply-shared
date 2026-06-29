@@ -256,6 +256,23 @@ export function detectCardMaskBands(
         const valueWords = (line.words ?? [])
             .filter((w) => (w.xLeft + w.xRight) / 2 >= valXLeft - padX)
             .sort((a, b) => a.xLeft - b.xLeft);
+        // CASHIER band must not swallow the receipt number / register that share its
+        // row ("Kvito Nr. 168/645/104148 Kasa 0027 Kasininkas <name>"). The char→x
+        // value-start under-estimates when the wide "Nr." token skews the proportion,
+        // pulling those tokens under the mask (receipt 116). Drop LEADING tokens that
+        // are clearly NOT the cashier value — a receipt number (has a slash) / a long
+        // digit run / the literal "Kasa" — so the band starts at the real cashier
+        // value. Only ever NARROWS; the stop-at-first-real-word guard never strips a
+        // name. (The Kvito Nr is extracted pre-mask, so it stays shown but unmasked.)
+        if (kind === 'cashier' && valueWords.length > 1) {
+            const notCashierValue = (txt: string) => {
+                const s = (txt ?? '').trim();
+                return /\d\/\d/.test(s) || /^[0-9]{6,}$/.test(s) || /^kasa$/i.test(s);
+            };
+            while (valueWords.length > 1 && notCashierValue(valueWords[0].text)) {
+                valueWords.shift();
+            }
+        }
         if (valueWords.length > 0) {
             const L = valueWords[0], R = valueWords[valueWords.length - 1];
             boxLeft = Math.max(line.xLeft, L.xLeft - padX);
@@ -277,18 +294,26 @@ export function detectCardMaskBands(
         // split across rows is not one tilted line — any tilt lifts a corner off a fragment):
         // then use a FLAT envelope (slope 0) of the min-top/max-bottom, which hugs all fragments.
         let slope: number;
+        const locSlope = localSlopeAtY(anchorTop);
         if (valueWords.length >= 2) {
             const L2 = valueWords[0], R2 = valueWords[valueWords.length - 1];
             const lcx = (L2.xLeft + L2.xRight) / 2, rcx = (R2.xLeft + R2.xRight) / 2;
             const wordSlope = rcx - lcx > 0.15 * lineW
                 ? Math.max(-0.12, Math.min(0.12, (R2.yTop - L2.yTop) / (rcx - lcx)))
-                : localSlopeAtY(anchorTop);
+                : locSlope;
             const wH = valueWords.map((w) => w.yBottom - w.yTop).sort((a, b) => a - b);
             const medianWordH = wH[Math.floor(wH.length / 2)] || 1;
             const stagger = Math.max(...valueWords.map((w) => w.yTop)) - Math.min(...valueWords.map((w) => w.yTop));
-            slope = stagger > 0.5 * medianWordH ? 0 : wordSlope;
+            // The masked WORDS' own slope is noisy (redacted/short tokens) — on receipt-96 the
+            // cashier value tilted the WRONG way vs the receipt, lifting the mask's right edge UP
+            // into the receipt-number line above. Trust the word slope ONLY when it CONFIRMS the
+            // receipt's local tilt (same direction, within 0.02); otherwise ride the receipt tilt
+            // so every mask slopes consistently with the product bands (and stays off the row above).
+            slope = stagger > 0.5 * medianWordH
+                ? 0
+                : (Math.abs(wordSlope - locSlope) <= 0.02 ? wordSlope : locSlope);
         } else {
-            slope = localSlopeAtY(anchorTop);
+            slope = locSlope;
         }
         // PIVOT at the value words' CENTRE (like ikiParser.footBand), not the left edge — a
         // left pivot lifts the far edge off the PII. The masked-word BBOX is axis-aligned but

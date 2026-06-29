@@ -43,15 +43,18 @@ export interface Region {
   yRightTop?: number;
   yLeftBottom?: number;
   yRightBottom?: number;
-  // Optional MID-COLUMN connection (column engine's two-box band): when present,
-  // the band is a 6-point polygon — a NAME box on the left [xLeft..xMid] joined to
-  // a PRICE box on the right [xMid..xRight]. The left half rides the name curve,
-  // the right half rides the price curve, connected at xMid. Lets the right edge
-  // sit on the price row while the left edge sits on the name row (no diagonal
-  // clip of the middle rows). Absent → ordinary quad from the four corners.
+  // Optional MID-COLUMN step (column engine's two-box band): when present, the band is an
+  // 8-point polygon — a NAME box on the left [xLeft..xMid] and a PRICE/discount box on the
+  // right [xMid..xRight], EACH a clean parallelogram riding the receipt tilt, joined by a
+  // VERTICAL step at xMid. yMidTop/yMidBottom = the LEFT column's top/bottom AT xMid;
+  // yMidTopR/yMidBottomR = the RIGHT column's. Equal pairs → no step (degenerates to a quad).
+  // Lets the right column drop to a fused discount the left column excludes, without either
+  // edge leaving the tilt. Absent → ordinary quad from the four corners.
   xMid?: number;
   yMidTop?: number;
   yMidBottom?: number;
+  yMidTopR?: number;
+  yMidBottomR?: number;
 }
 
 export interface IkiWord {
@@ -84,6 +87,11 @@ export interface IkiProduct {
   quantity: number;
   unit: string;
   pricePerUnit: number | null;
+  // A by-WEIGHT line (priced per kg) is weighable. Set true on weighed rows so
+  // the server resolver keeps a weighable catalog SP instead of treating the
+  // null/false flag as a form mismatch and falling through to name-dedup (which
+  // can capture a garbled same-name orphan). See receiptLineResolver weighableMismatch.
+  isWeighable?: boolean;
   rawLines: string[];
   region: Region;
 }
@@ -191,7 +199,21 @@ export function isIkiReceipt(lines: string[]): boolean {
   if (/\bIKI\s*[-–—]/.test(head)) return true;
   // Thermal POS receipts open with "IKI Lietuva, UAB" (no column header).
   if (/\bIKI\s+LIETUVA\b/.test(head)) return true;
-  return lines.slice(0, 30).some(isColumnHeader);
+  if (lines.slice(0, 30).some(isColumnHeader)) return true;
+  // STAINED / CUT-OFF HEADER FALLBACK: when the top is unreadable, the rest of an IKI receipt
+  // is saturated with IKI-only markers — the iki.lt domain, the "IKI kortelė" loyalty card,
+  // and the "IKI taškai" points lines (Buvę / Pridėti / Panaudoti / VISI IKI Taškai). Any ONE
+  // is decisive. Each is a COMPOUND form unique to IKI — never a bare "IKI", which is also the
+  // Lithuanian word "until" (e.g. "galioja iki 2026-…") — so this can't false-positive on
+  // another chain. OCR-tolerant: IK! / IKl / IK1 for the mangled final I, S-or-Š in taškai.
+  const full = lines.join(" ").toUpperCase();
+  const IKI = 'IK[I!L1]';
+  return (
+    new RegExp(`\\b${IKI}\\s*[.,]\\s*LT\\b`).test(full) ||   // the iki.lt / www.iki.lt domain
+    new RegExp(`\\b${IKI}\\s*KORTEL`).test(full) ||          // "IKI KORTELĖS" / "su IKI kortele"
+    new RegExp(`\\b${IKI}\\s*TA[SŠ]K`).test(full) ||         // "IKI Taškai" / "IKI taškų"
+    new RegExp(`\\b${IKI}\\s+LIETUVA\\b`).test(full)         // header line wherever it landed
+  );
 }
 
 // ───────── section boundaries ─────────
@@ -467,12 +489,19 @@ function parseFooter(lines: IkiLine[]): IkiFooter {
 const T_PRICE_RE = /^-?\s*\d{1,4}[.,]\s?\d{2}\s*[ABC]?\s*$/;          // "3,29 A" | "-7, 48 A"
 const T_POS_PRICE_RE = /^\s*\d{1,4}[.,]\s?\d{2}\s*[ABC]?\s*$/;        // positive only (a line total)
 const T_BARE_NEG_RE = /^-\s?\d{1,4}[.,]\s?\d{2}\s*[ABC]?\s*$/;        // "-7, 48 A" — a bare discount
-const T_WEIGHT_LOOSE_RE = /\bkg\b\s*[xXyY×*].*EUR/i;                  // any "… kg X … EUR/kg" row (OCR reads the × as X/Y/*)
+// "EUR" but OCR-tolerant: the E/U/R routinely come back accented/garbled on a curled
+// thermal print — "ÉUR", "ĖUR", "EUŘ", "ÉUŘ", and the E mis-read as F ("FUR", a very
+// common thermal glyph confusion — receipt-105 salmon "16 99 FUR/kg" + paprikos
+// "3,49 FUR/kg"). Without this, a weighed row's €/kg slot is unrecognised and the
+// whole item silently drops to a unit price / leaks the weight line into the name
+// (receipt-96 POMIDORAI, receipt-105 salmon).
+const T_EUR = '[EÉĖÈÊF][UÜŪ][RŘ]';
+const T_WEIGHT_LOOSE_RE = new RegExp(`\\bkg\\b\\s*[xXyY×*].*${T_EUR}`, 'i'); // any "… kg X … EUR/kg" row (OCR reads the × as X/Y/*)
 // A weighed QUANTITY token ("0,470 kg", "2,090 kg") — 3-decimal kg. Survives even
 // when OCR drops the "X €/kg" tail (so the EUR-based weight test above misses it).
 // Every weighed IKI item prints exactly ONE, so a SECOND one = a new product.
 const T_KG_QTY_RE = /\d[.,]\s?\d{3}\s*kg\b/i;
-const T_PERKG_RE = /(\d{1,4}[.,]\s?\d+)\s*[:;.]?\s*EUR/i;             // €/kg = number before EUR (tolerate a stray ":" OCR adds, "3,4: EUR")
+const T_PERKG_RE = new RegExp(`(\\d{1,4}[.,]\\s?\\d+)\\s*[:;.]?\\s*${T_EUR}`, 'i'); // €/kg = number before EUR (tolerate a stray ":" OCR adds, "3,4: EUR")
 // "NUOLAIDA" but OCR-tolerant: the middle letters are routinely mangled on
 // thermal photos — "NUOLA1DA" (I→1), "NUOLAI DA" (one space), "NUOLA I DA"
 // (two spaces, 4 chars between NUOL and DA), "NUOLAlDA". Match NUOL + up to 4
@@ -492,7 +521,13 @@ const T_NEG_RE = /-\s?(\d{1,4}[.,]\s?\d{2})/;
 // bags, and "TA[SŠ]KA" for points — so none slips through as a phantom product.
 // HARD-skip names (dropped entirely): coupons ("KUPONAS"/"…PONAS", incl. the merged
 // "xPiginoRuponas" via PIGIN = "Piginimo"), plastic bags, loyalty points.
-const T_SKIP_NAME_RE = /KUPON|\b[A-Z]{0,2}PONAS\b|PIGIN|MAI[SŠ]ELIS|TA[SŠ]KA/i;
+// Bag/coupon/points/discount-promo skip stems. The bag "MAIŠELIS PLASTIKINIS" is
+// matched TWO ways so an OCR split or mis-read still skips it: a split/char-tolerant
+// maišelis (MLKit gave "MAISEL IS" — the \s* bridges the split, [SŠ5]/[I1l] the
+// mis-reads) AND the distinctive long word PLASTIKIN (no grocery product contains it),
+// so either surviving the OCR is enough. Kept TIGHT — these stems never appear in real
+// product names (e.g. "ŠAMPONAS" stays safe: PONAS needs ≤2 chars before it at a \b).
+const T_SKIP_NAME_RE = /KUPON|\b[A-Z]{0,2}PONAS\b|PIGIN|MAI[SŠ5]EL\s*[I1l][SŠ5]|PLAST[I1l]K[I1l]N|TA[SŠ]KA/i;
 // Bottle DEPOSIT / UŽSTATAS — handled SEPARATELY (folds into the product above's
 // band, no value), not hard-skipped. OCR rots the O→0 ("DEP0ZIAS").
 const T_DEPOSIT_RE = /DEP[O0]Z|U[ŽZ]STAT/i;
@@ -549,16 +584,26 @@ const isNameStart = (t: string) =>
   !!t && !isTPrice(t) && !isTWeight(t) && !isTDiscount(t) && !isTSkip(t) &&
   t.replace(/[^A-Za-zĄČĘĖĮŠŲŪŽąčęėįšųūž]/g, '').length >= 2;
 
-const extractPerKg = (t: string): number | null => {
+// €/kg where OCR dropped the decimal comma: "… 16 99 EUR/kg" (was "16,99"). Anchored
+// to the EUR slot with exactly 2 trailing cents, so a stray "<int> <2-digit>" elsewhere
+// can't match. Only consulted when the strict comma form fails.
+const T_PERKG_SPACE_RE = new RegExp(`(\\d{1,3})\\s+(\\d{2})\\s*[:;.]?\\s*${T_EUR}`, 'i');
+export const extractPerKg = (t: string): number | null => {
   const m = t.match(T_PERKG_RE);
-  const v = m ? parseNum(m[1]) : NaN;
+  let v = m ? parseNum(m[1]) : NaN;
+  if (!(Number.isFinite(v) && v > 0)) {
+    const ms = t.match(T_PERKG_SPACE_RE);
+    if (ms) v = parseFloat(`${ms[1]}.${ms[2]}`);   // "16 99 EUR" → 16.99
+  }
   return Number.isFinite(v) && v > 0 ? v : null;
 };
 // The kg quantity at the START of a weight row: "0,720 kg X …" → "0,720".
 // Returns null if there's no "<number> kg". A result WITHOUT a decimal (e.g. "0")
 // is a degenerate kg — the signature of OCR splitting "0,720 kg" into "0,72" +
 // "0 kg", where the real quantity is the decimal fragment on the preceding line.
-const T_KG_LEAD_RE = /(\d{1,4}(?:[.,]\s?\d+)?)\s*kg\b/i;
+// "kg" is routinely mis-OCR'd as "ka"/"kq"/"k9" on the quantity unit ("0,720 ka X
+// … EUR/ kg"), so tolerate those reads when capturing the leading kg quantity.
+const T_KG_LEAD_RE = /(\d{1,4}(?:[.,]\s?\d+)?)\s*k[gqa9]\b/i;
 const leadingKg = (t: string): string | null => {
   const m = t.match(T_KG_LEAD_RE);
   return m ? m[1].trim() : null;
@@ -668,8 +713,12 @@ interface EWord { text: string; xLeft: number; xRight: number; yTop: number; yBo
 interface ERow {
   words: EWord[]; leftText: string;
   total: number | null; perKg: number | null; discount: number; isSkip: boolean;
+  trailDisc: number;                                                  // trailing text-only discount on a NAME row that belongs to the PREVIOUS product (OCR fused the prior product's discount onto this name with no word box)
   isDeposit: boolean;                                                 // bottle deposit — folds into the product above's band, no value
   kgQty: boolean;                                                     // row bears a weighed-quantity token
+  weigh?: boolean;                                                    // classified as a WEIGHT row (kg × €/kg), even if €/kg unreadable
+  kgVal?: number | null;                                             // printed kg quantity on a weight row ("0,720"), for total÷qty €/kg recovery
+  softTotal?: boolean;                                               // `total` was RECOVERED from the source line (no word box) — must not anchor a product on a name-CONTINUATION row (the boxless value can be an MLKit leak onto a wrapped name)
   topY: number; botY: number; leftX: number; slope: number;
 }
 const T_TRAIL_AMT_RE = /(-?\d{1,4}[.,]\s?\d{2})\s*[ABC]?\s*$/;       // a line's trailing amount
@@ -750,7 +799,7 @@ function ikiClassifyRow(ws: EWord[], lines: IkiLine[]): ERow {
   const topY = Math.min(...ws.map((w) => w.yTop));
   const botY = Math.max(...ws.map((w) => w.yBottom));
   const slope = emedian(ws.map((w) => w.slope));
-  const base: ERow = { words: ws, leftText: '', total: null, perKg: null, discount: 0, isSkip: false, isDeposit: false, kgQty: T_KG_QTY_RE.test(text), topY, botY, leftX: ws[0].xLeft, slope };
+  const base: ERow = { words: ws, leftText: '', total: null, perKg: null, discount: 0, trailDisc: 0, isSkip: false, isDeposit: false, kgQty: T_KG_QTY_RE.test(text), topY, botY, leftX: ws[0].xLeft, slope };
   // Skip from the row text OR the source line — "0,10 DEPOZITAS" keeps only the
   // "0,10" amount as words (the DEPOZITAS label is dropped), so the row text alone
   // misses it; the line text still has it. EXTRA signal: a deposit amount has NO
@@ -769,19 +818,51 @@ function ikiClassifyRow(ws: EWord[], lines: IkiLine[]): ERow {
     return { ...base, isSkip: true, leftText: text };
   }
   const srcPerKg = extractPerKg(firstSrc);
+  // A leading 3-decimal kg quantity + an "EUR/kg" marker on the line ⇒ a weighed
+  // item, EVEN WHEN the €/kg number itself is OCR-garbled ("3.ga EUR/ kg" →
+  // unreadable, and the unit "kg" mis-read as "ka"). Without this the calc row gets
+  // mistaken for a clean total and fused into the name ("LIETUVISKI POMIDORAI 0,720
+  // ka X 3.ga EUR/kg"), losing the weight. The €/kg is then recovered at assembly
+  // from total ÷ qty. (receipt-111 POMIDORAI.)
+  const hasLeadingKgQty = /^\d{1,4}[.,]\s?\d{3}\b/.test(text);
+  const hasPerKgMarker = /eur\s*\/?\s*k[ga]/i.test(text) || /eur\s*\/?\s*k[ga]/i.test(firstSrc);
   // WEIGHT row — straight from the words, OR RECOVERED when OCR shattered the
   // "kg X … EUR" tokens (only the leading kg-quantity survived as a word, the "kg"
   // itself even mis-read — salmon "1,068 KORTELL X 16.99 EUR/ kg" kept only "1,068")
   // but the source line still holds the €/kg. Lead with a 3-decimal quantity + a €/kg
-  // on the line ⇒ a weighed item whose calc was otherwise lost.
-  if (isTWeight(text) || (srcPerKg != null && /^\d{1,4}[.,]\s?\d{3}\b/.test(text))) {
+  // (readable OR just an "EUR/kg" marker) on the line ⇒ a weighed item.
+  if (isTWeight(text) || ((srcPerKg != null || hasPerKgMarker) && hasLeadingKgQty)) {
     // A weight row can carry the product NAME fused before the quantity
     // ("BE GAL 1,068 kg X …") AND the line TOTAL fused after it ("… EUR/kg 18,15 A").
     // Keep both so the product gets its name and its total.
     const lead = text.match(/^([A-Za-zĄČĘĖĮŠŲŪŽąčęėįšųūž][A-Za-zĄČĘĖĮŠŲŪŽąčęėįšųūž .]+?)\s+\d/);
-    const tm = text.match(T_TRAIL_AMT_RE);
+    // The line TOTAL ("0,78 A") can be word-boxless on a weight row too — MLKit keeps it in
+    // the line TEXT but drops its box, so the word-only `text` misses it. Fall back to the
+    // source line. This MATTERS when the €/kg is ALSO garbled: without a total the assembler
+    // can't recover €/kg = total ÷ qty and the price-poisoning guard zeroes the item
+    // (receipt-96 garbled-EUR class). GUARD: only when the source line carries EXACTLY ONE
+    // VAT-lettered amount (the row's own total). TWO means the NEXT product's total fused onto
+    // this calc line ("…EUR/kg 2,87 A 1,49 A") — the `$`-anchored match would grab the FOREIGN
+    // amount and write a wrong per-kg REFERENCE price (the worst outcome the poisoning guard
+    // exists to prevent); ambiguous ⇒ recover nothing and let weighedNoPpu zero it. The `> 0`
+    // guard keeps a trailing NEGATIVE (a fused discount, parseNum keeps the sign) out (a
+    // discount's "0,30 A" still counts toward the VAT-amount tally, so own-total + discount
+    // also reads as TWO ⇒ skip rather than risk grabbing the discount). The €/kg and kg
+    // quantity carry no trailing VAT letter, so they are never counted nor picked up.
+    const tmText = text.match(T_TRAIL_AMT_RE);
+    let tm = tmText;
+    if (!tmText) {
+      const vatAmts = firstSrc.match(/\d{1,4}[.,]\s?\d{2}\s*[ABC]\b/g);
+      if (vatAmts && vatAmts.length === 1) tm = firstSrc.match(T_TRAIL_AMT_RE);
+    }
     const tot = tm && parseNum(tm[1]) > 0 ? parseNum(tm[1]) : null;
-    return { ...base, perKg: extractPerKg(text) ?? srcPerKg, total: tot, leftText: lead ? lead[1].trim() : '' };
+    // Keep the printed kg quantity ("0,720") so a garbled €/kg ("3,9a EUR" → unreadable)
+    // can be recovered at assembly from total ÷ qty (the total may sit on a separate OCR
+    // row). A bare "0 kg" (OCR dropped the decimals) → null: dividing by it can't recover
+    // a real €/kg, so the item is left for the poisoning guard.
+    const lk = leadingKg(text);
+    const kgVal = lk && /[.,]/.test(lk) ? parseNum(lk) : null;
+    return { ...base, perKg: extractPerKg(text) ?? srcPerKg, total: tot, leftText: lead ? lead[1].trim() : '', weigh: true, kgVal };
   }
   const tm = text.match(T_TRAIL_AMT_RE);
   let amt = tm ? parseNum(tm[1]) : null;
@@ -791,12 +872,45 @@ function ikiClassifyRow(ws: EWord[], lines: IkiLine[]): ERow {
     const lv = matchVatAmt(text);                     // OCR dropped the decimal but kept the VAT letter
     if (lv != null) { amt = lv; amtRe = T_AMT_VAT_RE; }
   }
+  // TRAILING text-only discount fused onto THIS name's line — IKI prints a product's
+  // discount UNDER it, but OCR can glue the "-X,XX" onto the NEXT product's name line
+  // with NO word box (it survives only in the source-line text). Recover the VALUE here,
+  // BEFORE the positive-total early returns below: a name row can ALSO carry the next
+  // product's own positive total (the salmon → "NAMINIS … -7,48 … 1,49 A" case, where the
+  // 1,49 clustered into this row), and the clean-total return would otherwise hit first
+  // and silently drop the fused minus. Suppress ONLY when a NEGATIVE amount is itself
+  // word-boxed on this row (then the discount really belongs here); the row's own
+  // POSITIVE total must NOT suppress it. The band still comes from the name's words; the
+  // assembler attaches the value to the open PREVIOUS product. (receipt-99 RAUDONOSIOS /
+  // POMIDORAI discounts, receipt-109 salmon.)
+  // `-\s*` (not `-\s?`): OCR can leave MULTIPLE spaces between the minus and the number
+  // ("-  0,40 A"). A single-space guard let such a discount slip past as a positive total.
+  const trailNeg = firstSrc.match(/-\s*(\d{1,4}[.,]\s?\d{2})\s*[ABC]?\s*$/);
+  const negInWords = ws.some((w) => /-\s*\d{1,4}[.,]\s?\d{2}/.test(w.text));
+  const trailDisc = trailNeg && !negInWords ? parseNum(trailNeg[1]) : 0;
+  // TRAILING positive TOTAL fused onto THIS name's line but with NO word box — MLKit keeps
+  // the price in the LINE text ("CLEVER SVIESI RAIKY TA DUO 0, 45 A") yet drops its right-
+  // column boxes, so `text` (words only) sees just the name and the row would fall through
+  // as NAME-ONLY below: the price is lost AND, with no total to anchor it, the NEXT
+  // product's total merges into this one via the assembler's `cur.total != null` boundary
+  // (receipt-127: 2nd CLEVER loaf swallowed LIETUVIŠKI AGURKAI). Recover the VALUE from the
+  // source line — symmetric to trailDisc above — but ONLY when: the words carry no amount of
+  // their own (amt == null, so the clean/loose-total returns below didn't fire), it isn't a
+  // discount line, and the line ends in a VAT-lettered POSITIVE amount that is NOT the
+  // trailing negative trailDisc already captured. Geometry (the band) still comes from the
+  // name's words; this recovers the scalar total only. Used ONLY in the name-only fallthrough.
+  const trailPos = firstSrc.match(/(\d{1,4}[.,]\s?\d{2})\s*[ABC]\s*$/);
+  const trailPosNeg = !!trailPos && /-\s*$/.test(firstSrc.slice(0, trailPos.index));
+  const trailTotal =
+    trailPos && !trailPosNeg && amt == null && trailDisc === 0 &&
+    !isTDiscount(text) && !isTDiscount(firstSrc)
+      ? parseNum(trailPos[1]) : 0;
   // A CLEAN positive decimal is always a TOTAL — even when a discount LABEL got fused
   // onto the line ("NUOLAIDA ŠU 18,15" = a label + the total from the line above, an
   // MLKit mis-group on a tilted receipt). Discounts always print a minus; a positive
   // decimal is never a discount. (A decimal-LESS loose amount like "48 A" stays a
   // discount on a NUOLAIDA line — there the minus was just dropped by OCR.)
-  if (cleanDecimal && amt! > 0) return { ...base, total: amt, leftText: text.replace(amtRe, '').trim() };
+  if (cleanDecimal && amt! > 0) return { ...base, total: amt, trailDisc, leftText: text.replace(amtRe, '').trim() };
   if (isTDiscount(text) || (amt != null && amt < 0)) {
     // recover a word-dropped discount amount from the source line ("NUOLAIDA" word
     // survived, "-0,30 A" did not — but it's still in the line text)
@@ -804,8 +918,13 @@ function ikiClassifyRow(ws: EWord[], lines: IkiLine[]): ERow {
     const dv = d ? parseNum(d[1]) : (amt != null ? Math.abs(amt) : 0);
     return { ...base, discount: dv, leftText: text.replace(amtRe, '').replace(T_DISCOUNT_RE, '').trim() };
   }
-  if (amt != null && amt > 0) return { ...base, total: amt, leftText: text.replace(amtRe, '').trim() };
-  return { ...base, leftText: text };
+  if (amt != null && amt > 0) return { ...base, total: amt, trailDisc, leftText: text.replace(amtRe, '').trim() };
+  // Name-only fallthrough — but recover a word-boxless positive total from the source line
+  // so the name anchors its OWN product instead of letting the next product's total merge in.
+  // Flagged `softTotal` so the assembler can refuse it when this row is only CONTINUING a
+  // wrapped name (where the boxless amount may be an unrelated MLKit leak, not a real total).
+  if (trailTotal > 0) return { ...base, total: trailTotal, softTotal: true, leftText: text, trailDisc };
+  return { ...base, leftText: text, trailDisc };
 }
 
 // "SU KORTELĖ" discount-label tails (OCR-garbled: "SU K HT", "ŠU KORTEL.") must
@@ -861,7 +980,7 @@ function ikiBuildRows(words: EWord[], lineH: number, medSlope: number, xMid: num
   return rows;
 }
 
-function parseIkiColumnar(lines: IkiLine[], start: number, end: number): IkiProduct[] {
+export function parseIkiColumnar(lines: IkiLine[], start: number, end: number): IkiProduct[] {
   const words = ikiCollectWords(lines, start, end);
   if (words.length < 2) return [];
   const lineH = emedian(words.map((w) => w.yBottom - w.yTop).filter((h) => h > 0)) || 24;
@@ -876,9 +995,9 @@ function parseIkiColumnar(lines: IkiLine[], start: number, end: number): IkiProd
   //    IKI, so it attaches to the current product (not the next). A name fused onto
   //    a weight/total/discount row is recovered: on a discount row that name starts
   //    the NEXT product. Guarded recovery for a trailing name with no total. ──
-  interface Cur { nameParts: string[]; perKg: number | null; total: number | null; discount: number; top: ERow | null; price: ERow | null; rows: ERow[]; aCount: number; kgRows: number; }
+  interface Cur { nameParts: string[]; perKg: number | null; total: number | null; discount: number; top: ERow | null; price: ERow | null; rows: ERow[]; aCount: number; kgRows: number; weighRows: number; kgVal: number | null; }
   const out: { p: IkiProduct; top: ERow; price: ERow | null; rows: ERow[] }[] = [];
-  const fresh = (): Cur => ({ nameParts: [], perKg: null, total: null, discount: 0, top: null, price: null, rows: [], aCount: 0, kgRows: 0 });
+  const fresh = (): Cur => ({ nameParts: [], perKg: null, total: null, discount: 0, top: null, price: null, rows: [], aCount: 0, kgRows: 0, weighRows: 0, kgVal: null });
   const rowText = (r: ERow) => r.words.map((w) => w.text).join(' ').replace(/\s+/g, ' ').trim();
   let cur = fresh();
   const flush = () => {
@@ -887,18 +1006,60 @@ function parseIkiColumnar(lines: IkiLine[], start: number, end: number): IkiProd
     const name = c.nameParts.map((s) => s.trim()).filter(Boolean).join(' ');
     if (c.total == null && !ikiStrongName(name)) return; // guarded recovery
     const lt = c.total ?? 0;
-    const quantity = c.perKg != null && c.perKg > 0 && c.total != null ? round3(c.total / c.perKg) : 1;
-    const unitPrice = c.perKg ?? lt;
+    // LINE-TEXT weight recovery: MLKit sometimes drops the weight row's word-boxes, leaving
+    // only the product NAME boxed on a fused "NAME … X,XXX kg X … EUR/kg" line — the column
+    // engine (word-box based) then never sees the weight and the item drops to a unit price
+    // (receipt-96 RAUDONOSIOS). Re-read the ORIGINAL line TEXT of the product's rows for a kg
+    // quantity + €/kg on a weight-pattern line, so it stays weighed.
+    if (c.perKg == null && c.kgVal == null) {
+      for (const r of c.rows) {
+        const li = r.words[0]?.line;
+        const srcText = li != null ? lines[li]?.text : undefined;
+        if (!srcText || !isTWeight(srcText)) continue;
+        const km = srcText.match(/(\d[.,]\s?\d{3})\s*kg\b/i);
+        if (km) { const q = parseNum(km[1]); if (q > 0) c.kgVal = q; }
+        const pk = extractPerKg(srcText);
+        if (pk != null) c.perKg = pk;
+        if (c.kgVal != null) break;
+      }
+    }
+    // RECOVER a garbled €/kg: the printed €/kg was unreadable ("3,9a EUR" → null) but we
+    // have the line total and the printed kg quantity, so €/kg = total ÷ qty
+    // (2,87 ÷ 0,720 = 3,99). Keeps the item WEIGHED with a real €/kg instead of a unit
+    // price equal to the line total (which would poison the per-kg reference price).
+    let perKg = c.perKg;
+    if (perKg == null && c.kgVal != null && c.kgVal > 0 && c.total != null) {
+      const derived = round2(c.total / c.kgVal);
+      if (derived > 0 && derived < 1000) perKg = derived;
+    }
+    // PRICE-POISONING GUARD: a WEIGHED item (a "kg X … EUR" / "X,XXX kg" row was seen) whose
+    // €/kg STILL couldn't be established — €/kg unreadable AND the total÷qty recovery failed
+    // (e.g. the qty was OCR-garbled too). It must NOT fall back to a unit price equal to the
+    // LINE TOTAL: that total is for a FRACTION of a kg, so storing it as the product's price
+    // would poison the per-kg reference price. Keep the item (unit 'kg' so it still SHOWS on
+    // the receipt) but null its price / €-per-kg → the server's price ingestion skips it
+    // (`item.price <= 0`) and never updates reference price. (User: "show it, never write price".)
+    const weighedNoPpu = (c.weighRows >= 1 || c.kgRows >= 1) && perKg == null;
+    // Prefer the PRINTED kg quantity ("1,992 kg") over total÷€/kg, which rounds to a
+    // wrong figure (0,78 ÷ 0,39 = 2,0 instead of 1,992). Fall back to the derived value
+    // only when the printed kg couldn't be read.
+    const quantity = c.kgVal != null && c.kgVal > 0
+      ? c.kgVal
+      : (perKg != null && perKg > 0 && c.total != null ? round3(c.total / perKg) : 1);
+    const unitPrice = weighedNoPpu ? 0 : (perKg ?? lt);
     const paid = round2(lt - c.discount);
     out.push({
       top: c.top, price: c.price, rows: c.rows.slice(),
       p: {
         name: cleanProductName(name || '?'),
         price: unitPrice,
-        promoPrice: c.discount > 0 && quantity > 0 ? round2(paid / quantity) : null,
+        promoPrice: weighedNoPpu ? null : (c.discount > 0 && quantity > 0 ? round2(paid / quantity) : null),
         quantity,
-        unit: c.perKg != null ? 'kg' : 'vnt',
-        pricePerUnit: unitPrice,
+        unit: (perKg != null || weighedNoPpu) ? 'kg' : 'vnt',
+        // Priced per kg → weighable. Drives the server resolver to keep a weighable
+        // catalog SP (rather than falling through to a garbled same-name orphan).
+        isWeighable: perKg != null || weighedNoPpu,
+        pricePerUnit: weighedNoPpu ? null : unitPrice,
         // FULL row text per product, so all parsed info lands in rawData even when
         // a band/coordinate is imperfect.
         rawLines: c.rows.filter((r) => !r.isSkip).map(rowText).filter(Boolean),
@@ -919,9 +1080,53 @@ function parseIkiColumnar(lines: IkiLine[], start: number, end: number): IkiProd
       if (cur.total != null) flush();
       continue;
     }
+    // AGGREGATE/LOYALTY savings-line guard (receipt 119): the receipt's "sutaupėte 2,50
+    // EUR" total can OCR-fuse onto a stray RE-PRINT of an already-bought product's name
+    // ("CLEVER … DUO -2,50 A"). It arrives as a strong name whose ONLY amount is a
+    // WORD-BOXLESS trailing negative (trailDisc; no own total/weight/word-boxed discount)
+    // and whose name DUPLICATES an already-emitted product. Left alone the block below
+    // would attach the 2,50 to the open product (poisoning its promo) and then the name
+    // would mint a phantom duplicate. Drop the whole row. A GENUINE fused discount
+    // (receipt-99/-109) carries the NEXT product's name, never a duplicate of one already
+    // emitted, so it is untouched.
+    if (r.trailDisc > 0 && r.total == null && r.perKg == null && !r.discount) {
+      const nm = r.leftText && ikiNameText(r.leftText) ? r.leftText : '';
+      const key = nm && ikiStrongName(nm)
+        ? nm.replace(/[^A-Za-zĄČĘĖĮŠŲŪŽąčęėįšųūž]/g, '').toUpperCase() : '';
+      if (key.length >= 6 && out.some((o) =>
+        o.p.name.replace(/[^A-Za-zĄČĘĖĮŠŲŪŽąčęėįšųūž]/g, '').toUpperCase() === key)) {
+        continue;
+      }
+    }
+    // A trailing text-only discount fused onto THIS name row belongs to the PREVIOUS
+    // product (IKI prints the discount under its product; OCR glued it onto the next
+    // name with no word box). Attach the value to the open product BEFORE this name
+    // boundary flushes it. Guarded to an open product that already has a total so a
+    // stray leading-row minus can't invent a discount. (receipt-99 RAUDONOSIOS/POMIDORAI.)
+    if (
+      r.trailDisc > 0 && cur.top != null && cur.total != null &&
+      // PLAUSIBILITY GUARD (user rule): a discount can't exceed the item's own total, so
+      // a lost discount only belongs to the open previous product when that product's net
+      // stays non-negative (gross − already-applied − this ≥ 0). The salmon takes the
+      // fused -7,48 (18.15 − 7.48 = 10.67 ✓); a candidate it would drive negative (e.g. a
+      // €1,49 milk) cannot own it, so it is left for the right product rather than
+      // poisoning this one. (receipt-109 salmon vs NAMINIS.)
+      cur.total - cur.discount - r.trailDisc >= -0.005
+    ) {
+      cur.discount += r.trailDisc;
+      cur.aCount++;
+    }
     const name = r.leftText && ikiNameText(r.leftText) ? r.leftText : '';   // usable name text
     const strong = !!name && ikiStrongName(name);                          // can START a product
-    const carriesAmt = r.total != null || r.discount > 0;                  // an A-terminated price
+    // A trailTotal-RECOVERED total (no word box) must NOT anchor a product when this row is
+    // merely CONTINUING the name of an already-open, still-totalless product: MLKit can leak
+    // an unrelated "X,XX A" into a wrapped name's source text, and honoring it would split one
+    // product into a phantom-priced half + an orphan "?". A FRESH product (cur.top == null,
+    // first row) still honors it — that is the receipt-127 win. Suppressed here → the row falls
+    // through as a name continuation; the product's REAL total arrives on a later row.
+    const softCont = r.softTotal === true && cur.top != null && cur.total == null && cur.nameParts.length >= 1;
+    const rTotal = softCont ? null : r.total;                              // effective total for assembly
+    const carriesAmt = rTotal != null || r.discount > 0;                   // an A-terminated price
     // SELF-HEAL (user rule): an IKI product has AT MOST two A-prices — one total
     // and one discount. A 3rd A-price proves two products were merged, so the 3rd
     // one opens a new product. This catches over-absorption even when a fused
@@ -962,12 +1167,14 @@ function parseIkiColumnar(lines: IkiLine[], start: number, end: number): IkiProd
     // ALSO ends the current product when it already has a weight (perKg) even with
     // NO total — IKI dropped the total on this scan, but a new named product still
     // means the old one is done (prevents POMIDORAI absorbing RAUDONOSIOS).
-    if ((strong || r.total != null) && cur.total != null) flush();
+    if ((strong || rTotal != null) && cur.total != null) flush();
     else if (strong && cur.perKg != null) flush();
     if (name) cur.nameParts.push(name);
     if (r.perKg != null) cur.perKg = r.perKg;
-    if (r.total != null) { cur.total = r.total; cur.price = r; cur.aCount++; }
+    if (rTotal != null) { cur.total = rTotal; cur.price = r; cur.aCount++; }
     if (r.kgQty) cur.kgRows++;
+    if (r.weigh) cur.weighRows++;
+    if (r.kgVal != null && cur.kgVal == null) cur.kgVal = r.kgVal;
     cur.top ??= r; cur.rows.push(r);
   }
   flush();
@@ -996,8 +1203,16 @@ function parseIkiColumnar(lines: IkiLine[], start: number, end: number): IkiProd
       const nm = m[1].trim();
       if (!isNameStart(nm) || isTSkip(nm) || isTWeight(nm) || ikiLabelTail(nm)) continue;
       const clean = cleanProductName(nm);
-      if (have.has(clean)) continue;                       // it already made it into a product
-      cands.push({ name: clean, y: (lines[i].yTop + lines[i].yBottom) / 2, li: i, used: false });
+      const candY = (lines[i].yTop + lines[i].yBottom) / 2;
+      // The name already belongs to a product → normally a stray re-mention, so skip it.
+      // BUT IKI lists the SAME item twice when you buy two (e.g. two "CLEVER … DUO" loaves,
+      // only one discounted): the 2nd unit's name is dropped by OCR and survives only as the
+      // LEAD of a discount line, while a SEPARATE nameless product sits right next to it.
+      // Keep the duplicate candidate when such a nameless product is adjacent, so the 2nd
+      // unit gets its real name instead of "?". (The pairing below still gives each nameless
+      // product its NEAREST name, so this can't steal a far-away product's identity.)
+      if (have.has(clean) && !nameless.some((o) => Math.abs(o.top.topY - candY) <= lineH * 2)) continue;
+      cands.push({ name: clean, y: candY, li: i, used: false });
     }
     for (const o of nameless) {
       // Anchor on the product's TOP (placeholder region = its first row): the fused
@@ -1029,7 +1244,7 @@ function parseIkiColumnar(lines: IkiLine[], start: number, end: number): IkiProd
         ews = [{ text: cands[best].name, xLeft: src.xLeft, xRight: Math.max(src.xLeft + 1, amtX - 10), yTop: src.yTop, yBottom: src.yBottom, slope: 0, line: cands[best].li }];
       }
       o.rows.unshift({
-        words: ews, leftText: cands[best].name, total: null, perKg: null, discount: 0, isSkip: false, isDeposit: false, kgQty: false,
+        words: ews, leftText: cands[best].name, total: null, perKg: null, discount: 0, trailDisc: 0, isSkip: false, isDeposit: false, kgQty: false,
         topY: Math.min(...ews.map((w) => w.yTop)), botY: Math.max(...ews.map((w) => w.yBottom)),
         leftX: Math.min(...ews.map((w) => w.xLeft)), slope: 0,
       });
@@ -1059,7 +1274,7 @@ function parseIkiColumnar(lines: IkiLine[], start: number, end: number): IkiProd
       if (lk.length < 4 || !(lk.includes(probe) || key.includes(lk.slice(0, 6)))) continue;
       const ews: EWord[] = nw.map((w) => ({ text: w.text, xLeft: w.xLeft, xRight: w.xRight, yTop: w.yTop, yBottom: w.yBottom, slope: 0, line: i }));
       o.rows.unshift({
-        words: ews, leftText: o.p.name, total: null, perKg: null, discount: 0, isSkip: false, isDeposit: false, kgQty: false,
+        words: ews, leftText: o.p.name, total: null, perKg: null, discount: 0, trailDisc: 0, isSkip: false, isDeposit: false, kgQty: false,
         topY: Math.min(...ews.map((w) => w.yTop)), botY: Math.max(...ews.map((w) => w.yBottom)),
         leftX: Math.min(...ews.map((w) => w.xLeft)), slope: 0,
       });
@@ -1092,33 +1307,156 @@ function parseIkiColumnar(lines: IkiLine[], start: number, end: number): IkiProd
   // Per product: the de-skewed OVERALL content range [aTop,aBot]. Bands are PARALLEL-
   // OGRAMS (both edges share the ONE receipt tilt g), so a band can never twist or
   // invert and every product's box contains all of its own words.
+  // Per product: merged de-skewed top (aTop, for ordering) AND per-column extents —
+  // the NAME column (left of Xmid) and the PRICE column (right of Xmid). Columns are
+  // DIVERGED only at a "claimed" seam (a product whose NAME was recovered from the
+  // PRIOR product's fused discount line). There a single straight seam can't cover the
+  // recovered name (left) without dragging the prior product's discount (right) into
+  // this band. EVERY OTHER seam stays the SAME single midpoint as before, so all the
+  // non-discount fixtures keep their exact quad bands.
+  const colT = (sub: EWord[], all: EWord[]) => Math.min(...(sub.length ? sub : all).map(dT));
+  const colB = (sub: EWord[], all: EWord[]) => Math.max(...(sub.length ? sub : all).map(dB));
   const metas = out.map((o) => {
     const ws = o.rows.flatMap((r) => r.words);
-    return { o, aTop: Math.min(...ws.map(dT)), aBot: Math.max(...ws.map(dB)) };
+    const lw = ws.filter((w) => cx(w) < Xmid), rw = ws.filter((w) => cx(w) >= Xmid);
+    return {
+      o, split: false, aTop: Math.min(...ws.map(dT)),
+      lT: colT(lw, ws), lB: colB(lw, ws), rT: colT(rw, ws), rB: colB(rw, ws),
+    };
   });
   metas.sort((a, b) => a.aTop - b.aTop);
-  // ONE consistent seam per pair: a single straight line at the MIDPOINT between
-  // consecutive products' de-skewed content (closes gaps AND splits tilt overlaps),
-  // shared on both edges so every seam has the SAME bend (parallel to g) and nothing
-  // gets sliced or twisted. CLAIM puts the seam at the lower product's own top so a
-  // name recovered from the prior discount line isn't cut. NOTE: discount/€-kg VALUES
-  // are recovered during PARSING (ikiClassifyRow), independent of this geometry — so a
-  // fused discount+name line still extracts correctly even though its band boundary is
-  // a single straight seam (a tilted per-column seam there only ever twisted the band).
   for (let i = 1; i < metas.length; i++) {
-    let s = (metas[i - 1].aBot + metas[i].aTop) / 2;
-    if (claimed.has(metas[i].o)) s = Math.min(s, metas[i].aTop);
-    metas[i - 1].aBot = s; metas[i].aTop = s;
+    const A = metas[i - 1], B = metas[i];
+    // Two-box ONLY for a GENUINE discount-bleed conflict: B's name was recovered from a
+    // fused discount line AND the upper product A actually OWNS a discount (so B's name
+    // really landed on A's own NUOLAIDA row), AND the resulting per-column seams stay
+    // non-inverted. A heavily-scrambled receipt can sort a 3rd product (with no discount)
+    // between the discounted product and the claimed one, or cross a column — there the
+    // two-box would invert a band, so we fall back to the safe quad.
+    if (claimed.has(B.o) && A.o.p.promoPrice != null) {
+      const ls = Math.min((A.lB + B.lT) / 2, B.lT);   // LEFT (names): CLAIM B's name
+      const rs = (A.rB + B.rT) / 2;                    // RIGHT (prices/discounts): midpoint
+      if (ls >= A.lT && rs >= A.rT && ls <= B.lB && rs <= B.rB) {
+        A.lB = ls; B.lT = ls;
+        A.rB = rs; B.rT = rs;
+        A.split = true; B.split = true;
+        continue;
+      }
+    }
+    // Ordinary seam — ONE shared midpoint (the pre-two-box quad; never inverted). Claim
+    // for a claimed B so its recovered name isn't cut.
+    const bTop = Math.min(B.lT, B.rT);
+    const aBot = Math.max(A.lB, A.rB);
+    let s = (aBot + bTop) / 2;
+    if (claimed.has(B.o)) {
+      s = Math.min(s, bTop);
+    } else {
+      // FLOOR the seam at A's own lowest word so a weighed upper product's
+      // "amount × €/kg" / price row (which de-skews BELOW the next product's name on a
+      // tilted scan) stays inside A's band instead of bleeding into B. Capped at B's
+      // bottom so B can never invert (the degenerate-band fallback backstops residue).
+      // No-op when bands don't overlap in de-skewed y (the common case: aBot < bTop).
+      s = Math.min(Math.max(s, aBot), Math.min(B.lB, B.rB));
+    }
+    // NEVER drop the seam below B's OWN top content (its name). On a column-scrambled
+    // receipt the right (price) column lags the left (name) column by 1-2 products, so A's
+    // lagged price/discount/weigh rows de-skew straight INTO B's name; the midpoint (or the
+    // weigh-floor above) would then push the seam through B's name and CLIP it — the
+    // receipt-120 P2/P3 "name cropped too low" regression. Capping at bTop anchors every
+    // band at its own name top and keeps the tile clean (A.bottom == B.top). No-op on
+    // ordinary receipts (A sits above B → s < bTop already). The unavoidable flat-band cost
+    // is that A's lagged row may fall just below the seam (its VALUE is still extracted
+    // correctly; only the crop rectangle misses it) — a stepped 8-point band would be the
+    // only way to show both, and the user asked for flat (non-"choppy") bands.
+    s = Math.min(s, bTop);
+    A.lB = A.rB = s; B.lT = B.rT = s;
   }
-  // FULL WIDTH (section X0..X1); re-skewed by g into a parallelogram following the tilt.
+  // Re-skew by g → every product is ONE flat parallelogram (both edges ride the single
+  // receipt tilt g). For a two-box product the NAME column and PRICE column ended at
+  // different rows (the old 8-point step / "choppy" band); collapse that step into a
+  // single STRAIGHT border by AVERAGING the two — the user's "average" edge: the true
+  // border sits between where the name row and the price row were heading. Non-split
+  // products already have lT==rT / lB==rB (shared straight seams) so the average is a
+  // no-op for them. Because the two-box wrote the SAME seam into A's bottom and B's top
+  // at every boundary, the averaged edges stay equal too → adjacent bands tile EXACTLY
+  // (A.bottom == B.top), no overlap and no gap, with no per-column step.
   for (const m of metas) {
-    const yLT = m.aTop + g * X0, yRT = m.aTop + g * X1;
-    const yLB = m.aBot + g * X0, yRB = m.aBot + g * X1;
+    // SPLIT (two-box) product: its name column and price column ended at different rows.
+    // Collapse to a STRAIGHT border by AVERAGING the two (the user's "average" edge — the
+    // truth sits between where the name and price rows were heading). Because the two-box
+    // wrote the SAME seam into A's bottom and B's top, the averaged edges stay equal too,
+    // so adjacent split bands still tile EXACTLY. NON-split product: keep the union
+    // (min-top / max-bottom) so a normal/weighed band still strictly CONTAINS every word.
+    const aT = m.split ? (m.lT + m.rT) / 2 : Math.min(m.lT, m.rT);
+    const aB = m.split ? (m.lB + m.rB) / 2 : Math.max(m.lB, m.rB);
+    const yLT = aT + g * X0, yRT = aT + g * X1, yLB = aB + g * X0, yRB = aB + g * X1;
     m.o.p.region = {
       xLeft: X0, xRight: X1,
       yLeftTop: yLT, yRightTop: yRT, yLeftBottom: yLB, yRightBottom: yRB,
       yTop: Math.min(yLT, yRT), yBottom: Math.max(yLB, yRB),
     };
+  }
+  // DEGENERATE-BAND FALLBACK: when two products' OCR rows interleave in y (MLKit dropped a
+  // name's boxes and fused the text onto a neighbour's row), the seam can collapse a band to
+  // a sliver or invert it — the word-box geometry is broken and untrustworthy. Detect that
+  // (any column height < MIN_BAND_H or inverted) and REDRAW from what we DO trust: the line
+  // height × the product's content-line count. A product spans one line for its name+price
+  // row, +1 for a weighed "amount × €/kg" row, +1 for a discount row — anchored at the
+  // product's real name top. Always a clean, sane band instead of an empty sliver.
+  const MIN_BAND_H = 3;
+  for (const m of metas) {
+    const r = m.o.p.region;
+    const hL = (r.yLeftBottom ?? r.yBottom) - (r.yLeftTop ?? r.yTop);
+    const hR = (r.yRightBottom ?? r.yBottom) - (r.yRightTop ?? r.yTop);
+    if (hL >= MIN_BAND_H && hR >= MIN_BAND_H) continue;          // band is fine — leave it
+    const ws = m.o.rows.flatMap((row) => row.words);
+    if (!ws.length) continue;
+    const lw = ws.filter((w) => cx(w) < Xmid);                  // name-column words (reliable anchor)
+    const aT = (lw.length ? lw : ws).reduce((mn, w) => Math.min(mn, dT(w)), Infinity);
+    let nLines = 1;                                              // name + price share one IKI row
+    if (m.o.p.unit === 'kg') nLines++;                          // weighed: amount × €/kg row
+    if (m.o.p.promoPrice != null) nLines++;                     // discount row
+    const aB = aT + lineH * nLines;
+    const yLT = aT + g * X0, yRT = aT + g * X1, yLB = aB + g * X0, yRB = aB + g * X1;
+    m.o.p.region = {
+      xLeft: X0, xRight: X1,
+      yLeftTop: yLT, yRightTop: yRT, yLeftBottom: yLB, yRightBottom: yRB,
+      yTop: Math.min(yLT, yRT), yBottom: Math.max(yLB, yRB),
+    };
+  }
+  // FINAL TILE ENFORCEMENT: the degenerate fallback above redraws collapsed bands from
+  // their OWN name-top + line count, ignoring neighbours — so a redrawn band can OVERLAP
+  // the band above or leave a GAP below (receipt-121 P4/P5). Walk the products top-to-
+  // bottom and snap each band's BOTTOM edge to the NEXT band's TOP edge (per corner) so
+  // consecutive crops tile seam-to-seam: no overlap, no gap. Anchor on the LOWER band's
+  // top (its name) so a name is never clipped. Skip a pair that would INVERT the upper
+  // band (next.top sits at/above this.top — only a pathological same-row scramble); leave
+  // it rather than collapse it. Bands the main seam loop already tiled are a no-op (their
+  // bottom already equals the next top).
+  const tileRegions = metas
+    .map((m) => m.o.p.region)
+    .filter((r): r is NonNullable<typeof r> => !!r)
+    .sort((a, b) => (a.yTop ?? 0) - (b.yTop ?? 0));
+  for (let i = 1; i < tileRegions.length; i++) {
+    const A = tileRegions[i - 1], B = tileRegions[i];
+    const bLT = B.yLeftTop ?? B.yTop, bRT = B.yRightTop ?? B.yTop;
+    const aLT = A.yLeftTop ?? A.yTop, aRT = A.yRightTop ?? A.yTop;
+    if (bLT > aLT + 1 && bRT > aRT + 1) {
+      A.yLeftBottom = bLT; A.yRightBottom = bRT;
+      A.yBottom = Math.max(bLT, bRT);
+      A.yTop = Math.min(aLT, aRT);
+    } else if (bLT <= aLT + 1 && bRT <= aRT + 1) {
+      // B's top sits AT or ABOVE A's top → B's band would SWALLOW A (its de-skewed top
+      // collided with A's, e.g. a scrambled price column pulling B's top up to A's name).
+      // Clamp B's top DOWN to A's bottom so B starts where A ends — A keeps its own lines,
+      // B can no longer cover them. (receipt: CLEVER bread band landing on the bulvės band.)
+      const aLB = A.yLeftBottom ?? A.yBottom, aRB = A.yRightBottom ?? A.yBottom;
+      // Only clamp when B stays non-inverted (its own bottom is still below A's bottom).
+      if ((B.yLeftBottom ?? B.yBottom) > aLB + 1 && (B.yRightBottom ?? B.yBottom) > aRB + 1) {
+        B.yLeftTop = aLB; B.yRightTop = aRB;
+        B.yTop = Math.min(aLB, aRB);
+      }
+    }
   }
   return out.map((o) => o.p);
 }
@@ -1185,6 +1523,17 @@ function parseThermalProducts(lines: IkiLine[], start: number, end: number): Iki
     if (lineTotal == null && perKg != null && !derivedFromQty) {
       for (const b of block) if (isTPosPrice(b.text)) { lineTotal = parseNum(b.text); break; }
     }
+    // RECOVER a garbled €/kg from lineTotal ÷ the printed kg quantity (mirrors the column
+    // engine). A weighed item whose printed €/kg was unreadable would otherwise price at the
+    // line total, poisoning the per-kg reference price.
+    if (perKg == null && weightPos >= 0 && lineTotal != null) {
+      const lead = leadingKg(block[weightPos].text);
+      const qty = lead && /[.,]/.test(lead) ? parseNum(lead) : NaN;
+      if (Number.isFinite(qty) && qty > 0) {
+        const derived = round2(lineTotal / qty);
+        if (derived > 0 && derived < 1000) perKg = derived;
+      }
+    }
     if (lineTotal == null) {
       // A real name with an EMPTY block (immediately followed by another name) is
       // the signature of column-scrambled OCR — its price was emitted out of
@@ -1228,8 +1577,13 @@ function parseThermalProducts(lines: IkiLine[], start: number, end: number): Iki
     // Convention (matches the A4 parser + the price×quantity display): `price` is
     // the UNIT price. Weighed → €/kg + derived kg quantity; unit items → line
     // price + qty 1. `promoPrice` = per-unit price after discount (paid ÷ qty).
+    // PRICE-POISONING GUARD: a weighed item whose €/kg still couldn't be established (€/kg
+    // unreadable AND total÷qty recovery failed) keeps unit 'kg' so it still SHOWS, but its
+    // price/€-per-kg are nulled → the server skips it (`item.price <= 0`), never writing a
+    // line-total as the per-kg reference price. (User: "show it, never write price".)
+    const weighedNoPpu = weightPos >= 0 && perKg == null;
     const quantity = perKg != null && perKg > 0 ? round3(lineTotal / perKg) : 1;
-    const unitPrice = perKg ?? lineTotal;
+    const unitPrice = weighedNoPpu ? 0 : (perKg ?? lineTotal);
     const paid = round2(lineTotal - discount);
     // Band = the NAME line's OWN box (tight, tilt-following). This is the one
     // thing OCR is sure about — where the product name sits. The unified tiler
@@ -1251,12 +1605,13 @@ function parseThermalProducts(lines: IkiLine[], start: number, end: number): Iki
     out.push({
       name: cleanProductName(name),
       price: unitPrice,
-      promoPrice: discount > 0 && quantity > 0 ? round2(paid / quantity) : null,
+      promoPrice: weighedNoPpu ? null : (discount > 0 && quantity > 0 ? round2(paid / quantity) : null),
       quantity,
-      // Weighed items (have a €/kg) are kg, not vnt — drives the
-      // "0,720 kg × 3,99 €/kg" calculation line in the detail view.
-      unit: perKg != null ? 'kg' : 'vnt',
-      pricePerUnit: unitPrice,
+      // Weighed items (have a €/kg, OR a weight row we couldn't price) are kg, not vnt —
+      // drives the "0,720 kg × 3,99 €/kg" calculation line in the detail view.
+      unit: (perKg != null || weighedNoPpu) ? 'kg' : 'vnt',
+      isWeighable: perKg != null || weighedNoPpu,
+      pricePerUnit: weighedNoPpu ? null : unitPrice,
       rawLines: [name, ...block.map((b) => b.text)],
       region,
     });
@@ -1488,7 +1843,10 @@ function parseIkiThermal(lines: IkiLine[]): IkiParseResult {
     // alphanumeric run after "kodas" (spaces allowed inside, stripped after), else
     // a bare 2-letter+digits token. OCR also garbles "kelio kodas" → "kel jo
     // kodas", so match a bare "kodas".
-    const pv = lines[i].text.match(/kodas\s*([A-Z]{0,2}\d[\d ]{6,14}\d)/i) ?? lines[i].text.match(/\b([A-Z]{2}\d{9,12})\b/);
+    // Tolerate OCR garble of the "PVM mokėtojo kodas" line: "kodas"→"kadas" (o↔a) and
+    // the "LT" code prefix lower-cased/garbled to "Li" (receipt 116). Without this the
+    // VAT line isn't found → pStart stays 0 → the whole header folds into product 1.
+    const pv = lines[i].text.match(/k[oa]das\s*([A-Za-z]{0,2}[\d ]{8,16})/i) ?? lines[i].text.match(/\b([A-Za-z]{2}\s?\d[\d ]{7,12}\d)\b/i);
     // FULL-WIDTH + bent band (footBand), not a word-span: OCR routinely drops every
     // word of this line but "PVN" (receipt-64), which would shrink a word-anchored
     // band to a stub. footBand spans the receipt and falls back to the line bbox Y.
@@ -1516,7 +1874,12 @@ function parseIkiThermal(lines: IkiLine[]): IkiParseResult {
   let storeAddress = '';
   const addrEnd = pvmLineIdx >= 0 ? pvmLineIdx + 1 : Math.min(4, lines.length);
   for (let i = 0; i < addrEnd; i++) {
-    const stripped = lines[i].text.replace(/^.*?Lietuva,?\s*UA[B8]?\s*/i, '').trim();
+    let stripped = lines[i].text.replace(/^.*?Lietuva,?\s*UA[B8]?\s*/i, '').trim();
+    // The address is often OCR-fused onto the PVM/company-code line ("…Šiauliai Pyw
+    // mokttoo kodas I101027210", receipt 117). Cut that trailing "PVM…kodas <code>"
+    // run so the address survives instead of being rejected for containing "kodas".
+    // (OCR garbles "PVM"→"Pyw"/"Py" and "kodas"→"kadas".)
+    stripped = stripped.replace(/\s+(?:PVM|P[vy]w?|k[oa]das)\b.*$/i, '').trim();
     if (/\d/.test(stripped) && /,/.test(stripped) && /[A-Za-zĄČĘĖĮŠŲŪŽ]/.test(stripped) && !/PVM|kodas/i.test(stripped)) {
       storeAddress = stripped;
       headerRegions.push(footBand(lines[i], 'storeAddress', storeAddress));
@@ -1527,7 +1890,20 @@ function parseIkiThermal(lines: IkiLine[]): IkiParseResult {
   for (let i = pStart; i < lines.length; i++) {
     const endText = lines[i].text;
     const isTrader = T_TRADER_LINE_RE.test(endText) && (T_TRADER_NUM_RE.test(endText) || T_TRADER_ID_RE.test(endText));
-    if (T_PRODUCTS_END_RE.test(endText) || isTrader) { pEnd = i; break; }
+    if (T_PRODUCTS_END_RE.test(endText) || isTrader) {
+      pEnd = i;
+      // The LAST product's NUOLAIDA discount can OCR-fuse onto this footer-boundary line
+      // as a LEADING discount, with the trader/footer text UNBOXED ("-0,40 A Prekiautojo
+      // ID 15132001": only "-0,40 A" carries word boxes). Excluding the whole line drops
+      // the discount — the product keeps its NUOLAIDA label but no amount → promoPrice null
+      // (receipt-129 cucumber). When the line's BOXED words are EXACTLY a bare discount and
+      // not a name, KEEP the line in the product range: the column engine then reads only
+      // the "-0,40 A" and attaches it to the open last product; the unboxed trader text is
+      // ignored. Guarded to the column-engine path (no boxes → no change → legacy untouched).
+      const boxed = (lines[i].words ?? []).map((w) => w.text).join(' ').trim();
+      if (boxed && isTDiscount(boxed) && !ikiStrongName(boxed)) pEnd = i + 1;
+      break;
+    }
   }
   // COLUMN ENGINE dispatch (flag-gated): use it when enough per-word data exists
   // AND it actually yields products; otherwise fall back to the legacy tokenizer.
@@ -1643,6 +2019,51 @@ function parseIkiThermal(lines: IkiLine[]): IkiParseResult {
     last.yBottom = Math.max(last.yLeftBottom, last.yRightBottom);
   }
 
+  // ── COLUMN-ENGINE path: fit the skipped-line bands into the engine's layout ──
+  // The engine tiles its OWN products, so the legacy edge-to-edge tiler above is skipped
+  // (bands=[] when usedEngine) and the skipped-line boxes (coupons / bags / points) are left
+  // as raw NAME-only lineBoxes: they CLIP their right-aligned price and OVERLAP the product
+  // below. Fit each one in: widen it to the product span (continuing its own tilt so the
+  // right-aligned price is covered, not clipped) and drop its BOTTOM to the NEXT product's
+  // name-top so it tiles flush above that product with no overlap. (receipt-129 MAIŠELIS.)
+  if (usedEngine && skippedRegions.length > 0 && products.length > 0) {
+    const prod = products.map((p) => p.region);
+    const X0 = Math.min(...prod.map((r) => r.xLeft), ...skippedRegions.map((r) => r.xLeft));
+    const X1 = Math.max(...prod.map((r) => r.xRight), ...skippedRegions.map((r) => r.xRight));
+    const clampS = (s: number) => Math.max(-0.08, Math.min(0.08, s));
+    for (const r of skippedRegions) {
+      const origTop = r.yLeftTop ?? r.yTop;
+      const w = r.xRight - r.xLeft;
+      if (w > 1) {
+        const ltY = r.yLeftTop ?? r.yTop, rtY = r.yRightTop ?? r.yTop;
+        const lbY = r.yLeftBottom ?? r.yBottom, rbY = r.yRightBottom ?? r.yBottom;
+        const sT = clampS((rtY - ltY) / w), sB = clampS((rbY - lbY) / w);
+        r.yLeftTop = ltY + sT * (X0 - r.xLeft);
+        r.yRightTop = ltY + sT * (X1 - r.xLeft);
+        r.yLeftBottom = lbY + sB * (X0 - r.xLeft);
+        r.yRightBottom = lbY + sB * (X1 - r.xLeft);
+        r.xLeft = X0; r.xRight = X1;
+      }
+      // Seam = the NEAREST product starting below this skip (its name-top corners), so the
+      // skip ends exactly where that product begins: no overlap, and — because the seam
+      // slants DOWN toward the right where the price sits — the right-aligned price is
+      // covered rather than clipped. A skip with no product below keeps its widened box.
+      let belowL = Infinity, belowR = Infinity, found = false;
+      for (const pr of prod) {
+        const prTop = pr.yLeftTop ?? pr.yTop;
+        if (prTop > origTop + 1 && prTop < belowL) {
+          belowL = prTop; belowR = pr.yRightTop ?? pr.yTop; found = true;
+        }
+      }
+      if (found) {
+        r.yLeftBottom = belowL;
+        r.yRightBottom = belowR;
+        r.yTop = Math.min(r.yLeftTop ?? r.yTop, r.yRightTop ?? r.yTop);
+        r.yBottom = Math.max(belowL, belowR);
+      }
+    }
+  }
+
   // ── footer fields (scan whole receipt; take first hit) + bbox bands ──
   let total: number | null = null;
   let receiptNo = '';
@@ -1740,10 +2161,19 @@ function parseIkiThermal(lines: IkiLine[]): IkiParseResult {
   }
   footerRegions.sort((a, b) => a.yTop - b.yTop);
 
+  // header/footer `region` was the whole-receipt union of EVERY line (regionOf(lines)),
+  // so when no store-address / PVM line is detected the header band rendered as a
+  // FULL-HEIGHT box over the receipt. Bound each section to ONLY its own detected line
+  // bands; empty → zero-extent {0,0,0,0} (onPageOne requires yBottom>yTop → renders
+  // nothing). (`region` itself stays for the internal tilt sampling above.)
+  const unionOf = (rs: LabeledRegion[]): Region => rs.length
+    ? { yTop: Math.min(...rs.map(r => r.yTop)), yBottom: Math.max(...rs.map(r => r.yBottom)), xLeft: Math.min(...rs.map(r => r.xLeft)), xRight: Math.max(...rs.map(r => r.xRight)) }
+    : { yTop: 0, yBottom: 0, xLeft: 0, xRight: 0 };
+
   return {
-    header: { chainName: 'IKI', storeCode: '', storeName: '', storeAddress, pvmCode, rawText, region, lineRegions: headerRegions },
+    header: { chainName: 'IKI', storeCode: '', storeName: '', storeAddress, pvmCode, rawText, region: unionOf(headerRegions), lineRegions: headerRegions },
     products,
-    footer: { total, date, time, receiptNo, totalSavings, rawText, region, lineRegions: footerRegions },
+    footer: { total, date, time, receiptNo, totalSavings, rawText, region: unionOf(footerRegions), lineRegions: footerRegions },
     skippedRegions,
   };
 }
