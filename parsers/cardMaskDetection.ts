@@ -103,11 +103,15 @@ const BANK_CTX = /mokejim|bankin|\bbanko\b|kortel\w*\s*(nr|numer)|\b(visa|master
 // Loyalty LABELS — the loyalty programmes of the five chains.
 const LOYALTY_CTX = /lojalum|mano\s+rimi|lidl\s*plus|mano\s+iki|\bikiuk|aciu\w*\s+(kortel|nuolaid)/;
 // Cashier line: `Kasininkas` / `Kasininkė` + the name/id after it (PII).
-// Captures the label + separators so the VALUE start is the match end.
-const CASHIER_LABEL = /kasinink\w*\s*(nr\.?|nr)?\s*[:.\-–]?\s*/;
+// Captures the label + separators so the VALUE start is the match end. OCR mangles the middle of
+// the word (the 2nd n → r/m: "Kasinirkas", receipt-146 SIMKUTE), so anchor only on the reliable
+// "kasin…k" stem (kasin + ≤3 garbled chars + k) instead of a literal "kasinink".
+const CASHIER_LABEL = /kasin\w{0,3}k\w*\s*(nr\.?|nr)?\s*[:.\-–]?\s*/;
 // Loyalty card number printed in FULL (not PCI star-masked) — e.g. IKI's
 // "IKI KORTELĖS NR. 99110000000005068582". The label is a loyalty-card "NR".
-const LOYALTY_NUMBER_LABEL = /kortel\w*\s*nr/;
+// "kor?el" (1 optional char between KOR and EL) tolerates the common OCR misread
+// KORTELĖS → KORIELĖS (T→I), which otherwise left the full card number unmasked.
+const LOYALTY_NUMBER_LABEL = /kor\w?el\w*\s*nr/;
 // A long bare digit run (the full loyalty number; spaces allowed between groups).
 const LONG_DIGIT_RUN = /\d[\d ]{8,}\d/;
 

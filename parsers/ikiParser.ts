@@ -112,7 +112,8 @@ export interface IkiFooter {
   total: number | null;
   date: string;
   time: string;
-  receiptNo: string;
+  receiptNo: string;             // CANONICAL id (= receiptNos[0]) — backwards-compatible single value
+  receiptNos: string[];          // every distinct receipt identifier on the footer (canonical first)
   totalSavings: number | null;
   rawText: string;
   region: Region;
@@ -472,6 +473,7 @@ function parseFooter(lines: IkiLine[]): IkiFooter {
     date: "",
     time: "",
     receiptNo: "",
+    receiptNos: [],
     totalSavings,
     rawText: lines.map((l) => l.text).join("\n"),
     region: regionOf(lines),
@@ -531,7 +533,17 @@ const T_SKIP_NAME_RE = /KUPON|\b[A-Z]{0,2}PONAS\b|PIGIN|MAI[SŠ5]EL\s*[I1l][SŠ5
 // Bottle DEPOSIT / UŽSTATAS — handled SEPARATELY (folds into the product above's
 // band, no value), not hard-skipped. OCR rots the O→0 ("DEP0ZIAS").
 const T_DEPOSIT_RE = /DEP[O0]Z|U[ŽZ]STAT/i;
+// Deposit REFUND / RETURN ("UŽSTATO GRĄŽINIMAS", "Išimta (Užstatas)"): a genuinely
+// NEGATIVE deposit ledger line (returning empties), NOT a loyalty discount. Must NOT be
+// reinterpreted as a fused product discount — its negative amount is the refund itself.
+const T_DEPOSIT_REFUND_RE = /GR[ĄA][ŽZ2]IN|I[ŠS]IMT/i;
 const T_LEAD_DISC_RE = /^(-\s?\d{1,4}[.,]\s?\d{2})\s*[ABC]?\s+(\S.*)$/;        // "-0,72 A RAUDONOSIOS PAPRIKOS"
+// OCR can garble the fused discount amount so T_LEAD_DISC_RE misses it: it drops the decimal
+// comma ("-000" for "-0,00") or reads the cents as digit-shaped letters ("-0,CO"). Fall back to
+// a leading minus + a SHORT (≤5) digit-ish blob + a MANDATORY VAT letter [ABC] (the only reliable
+// discount/name separator once the amount is malformed) + the trailing name. The mandatory letter
+// + the downstream name guards (isNameStart/!isTSkip/!ikiLabelTail) keep this from over-splitting.
+const T_LEAD_DISC_GARBLED_RE = /^(-\s?[\dOoSsCcIl][\dOoSsCcIl.,\s]{0,4})\s*[ABC]\s+(\S.*)$/;  // "-000 A RAUDONOSIOS PAPRIKOS"
 const T_LEAD_PRICE_RE = /^(\d{1,4}[.,]\s?\d{2})\s*[ABC]?\s*-?\s*(\S.*)$/;      // "18,15 A- 1,068 kg X 16,99 EUR/kg"
 const T_DISC_NAME_RE = /^(NUOL.{0,4}D[A4](?:\s+SU\s+KORTELE)?)\s+(.+)$/i;      // "NUOLAIDA 2A RAUDONOS IOS PAPRIKOS" (label fused w/ next name)
 const T_TRAIL_PRICE_RE = /^(.*?[A-Za-zĄČĘĖĮŠŲŪŽąčęėįšųūž].*?)\s+(\d{1,4}[.,]\s?\d{2})\s*[ABC]?\s*$/; // "NAME 1,99 A"
@@ -541,7 +553,14 @@ const T_TRAIL_PRICE_RE = /^(.*?[A-Za-zĄČĘĖĮŠŲŪŽąčęėįšųūž].*?)\
 // can only be a price, so whatever follows it starts a NEW product. The price
 // digits are loose (OCR drops the integer/decimal) — the VAT letter is the anchor.
 const T_MID_PRICE_NAME_RE = /^(.+?)\s+(\d{1,4}(?:[.,]\s?\d{0,2})?)\s*([ABC])\s+(.+)$/;
-const T_PRODUCTS_END_RE = /^\s*Pardavimas\b|MASTERCARD|^\s*SUMA\b|Mok[eė]ti\b/i;
+// End of the product list. Besides the payment markers, the IKI TRAILER starts with the loyalty
+// card line ("IKI KORTELĖS NR. …") and the VAT-invoice notice ("PVM sąskaitos-faktūros …") — on a
+// CASH receipt (no "Prekiautojo ID" trader line, payment block garbled at the very bottom) those
+// are the only reliable "products are over" signals; without them the whole loyalty/savings
+// trailer gets parsed as phantom products (receipt-148). `KORTEL…\s+NR` is the card-NUMBER label,
+// distinct from the "… SU KORTELE" discount line (no "NR" after it). \S* tolerates the Ė/dropped
+// diacritic ("KORTELĖS"/"KORTELES").
+const T_PRODUCTS_END_RE = /^\s*Pardavimas\b|MASTERCARD|^\s*SUMA\b|Mok[eė]ti\b|KOR\w?EL\S*\s+NR|s[aą]skait\S*fakt/i;
 // "Prekiautojo ID <number>" (trader-id line) ends the product section. The "Prekia…"
 // seller stem alone is too loose ("Prekiautojo nuolaida" — a promo — would truncate the
 // product list). Confirm it with EITHER the trader number (6+ digits) OR an "ID"/"1D"
@@ -550,13 +569,20 @@ const T_PRODUCTS_END_RE = /^\s*Pardavimas\b|MASTERCARD|^\s*SUMA\b|Mok[eė]ti\b/i
 const T_TRADER_LINE_RE = /Prekia\w{0,8}/i;
 const T_TRADER_NUM_RE = /\d{6,}/;
 const T_TRADER_ID_RE = /[I1]D/; // case-SENSITIVE: uppercase D only
-const T_DATE_RE = /(\d{4})-(\d{2})-(\d{2})/;
+// Separators are [-.]{1,2}: IKI prints "YYYY-MM-DD" but OCR sometimes DOUBLES a hyphen
+// ("2026-06--18"). A repeated hyphen/dot stays a date; a slash or space is NOT accepted, so
+// the card/receipt/module numbers ("CR-000014698", "42/610/114559", "7229 0429/…") can't match.
+const T_DATE_RE = /(\d{4})[-.]{1,2}(\d{2})[-.]{1,2}(\d{2})/;
 const T_TIME_RE = /(\d{2}):(\d{2}):(\d{2})/;
 const T_RECEIPTNO_RE = /Kvito\s+Nr[.,]?\s*([0-9/]+)/i;   // OCR reads "Nr." or "Nr,"
 // Fallback receipt id when "Kvito Nr." is missing/unreadable: the shorter "Kvitas"
 // sequence number on the terminal line ("Term. 15027037 Kvitas 3157 Atsk 000").
 // Distinct from "Kvito" (no trailing "s"), so it can't match the primary line.
 const T_KVITAS_RE = /\bKvitas[\s.:]*(\d{3,6})\b/i;
+// A THIRD IKI identifier — "Kvito numeris 104148" in the VMI footer block (the sequence number,
+// an INDEPENDENT OCR read of the tail of "Kvito Nr."). OCR splits "numeris" → "numer i s", so the
+// stem is tolerant. Captured for the receiptNos array + its own band; never the canonical id.
+const T_KVITONUM_RE = /Kvito\s+numer[a-z]*\s*i?\s*s?\s*[:.]?\s*([0-9/]{4,})/i;
 // Canonical total line, amount on EITHER side of SUMA — OCR flips the order:
 // "SUMA 26,52 EUR" and "26,52 EUR SUMA" both seen. Requires EUR so the multi-
 // column VAT header ("…Suma su PVM Be PVM…") with no EUR can't false-match.
@@ -639,7 +665,7 @@ function explodeThermalLine(line: IkiLine): ThermalTok[] {
   // the leading negative is a points redemption, not a product discount.
   // The bbox is halved so the discount (top) and the next name (bottom) get
   // distinct y — the band seam then falls BETWEEN them, not above both.
-  const lead = t.match(T_LEAD_DISC_RE);
+  const lead = t.match(T_LEAD_DISC_RE) ?? t.match(T_LEAD_DISC_GARBLED_RE);
   if (lead && T_LETTER_RE.test(lead[2]) && !isTSkip(lead[2])) {
     const { top, bottom } = splitLineVert(line);
     return [{ text: lead[1].trim(), src: top }, ...explodeThermalLine({ ...bottom, text: lead[2] })];
@@ -719,6 +745,7 @@ interface ERow {
   weigh?: boolean;                                                    // classified as a WEIGHT row (kg × €/kg), even if €/kg unreadable
   kgVal?: number | null;                                             // printed kg quantity on a weight row ("0,720"), for total÷qty €/kg recovery
   softTotal?: boolean;                                               // `total` was RECOVERED from the source line (no word box) — must not anchor a product on a name-CONTINUATION row (the boxless value can be an MLKit leak onto a wrapped name)
+  depositFollows?: boolean;                                          // this DISCOUNT row's source line had a bottle-deposit LABEL fused onto it ("-0,33 A DEP0ZITAS") — the deposit's own bare price sits on the NEXT row and must be folded (skipped), not made a phantom product
   topY: number; botY: number; leftX: number; slope: number;
 }
 const T_TRAIL_AMT_RE = /(-?\d{1,4}[.,]\s?\d{2})\s*[ABC]?\s*$/;       // a line's trailing amount
@@ -809,11 +836,28 @@ function ikiClassifyRow(ws: EWord[], lines: IkiLine[]): ERow {
   // never caught by it.
   const hadVat = /[ABC]\s*$/.test(text);
   const depositHint = /\bDEP[O0]|U[ŽZ]ST/i.test(firstSrc);
+  // FUSED "discount + deposit-label": OCR can glue a product's loyalty discount AMOUNT
+  // (right column of the NUOLAIDA row) onto the deposit LABEL of the row below
+  // ("-0,33 A DEP0ZITAS"). The row's OWN words are the NEGATIVE discount; only the
+  // unboxed label rode along in the source line. Such a row is a DISCOUNT (it belongs to
+  // the product above), NEVER a deposit — a real deposit amount is positive and carries no
+  // VAT letter. Without this guard the deposit-by-firstSrc test below would swallow the
+  // discount (folded as a no-value deposit → promo lost) AND the deposit's own bare price
+  // on the next row would mint a phantom "DEP0ZITAS" product (receipt-139 AKVILĖ GAZ.).
+  const negWordsDisc = /^-\s*\d/.test(text.trim());                  // the row's OWN words ARE a leading discount amount
+  // A deposit REFUND ("-1,00 A UŽSTATO GRĄŽINIMAS") is ALSO a leading negative fused with a
+  // deposit-family label — but there the negative IS the refund, not a stray loyalty discount.
+  // Exclude it: it stays a deposit-family SKIP (harmless), never a product discount.
+  const fusedDepositLabel = negWordsDisc && !T_DEPOSIT_RE.test(text) &&
+    T_DEPOSIT_RE.test(firstSrc) && !T_DEPOSIT_REFUND_RE.test(firstSrc);
   // DEPOSIT (folds into the product above's band, no value). The no-VAT extra catches
   // deposits too garbled for the strict name: a real product total always ends in A/B/C.
-  if (T_DEPOSIT_RE.test(text) || T_DEPOSIT_RE.test(firstSrc) || (depositHint && !hadVat)) {
+  if (!fusedDepositLabel && (T_DEPOSIT_RE.test(text) || T_DEPOSIT_RE.test(firstSrc) || (depositHint && !hadVat))) {
     return { ...base, isSkip: true, isDeposit: true, leftText: text };
   }
+  // Carry the deposit-follows signal on the (about-to-be-built) discount row so the
+  // assembler can fold the deposit's bare price that lands on the very next row.
+  if (fusedDepositLabel) base.depositFollows = true;
   if (isTSkip(text) || isTSkip(firstSrc)) {
     return { ...base, isSkip: true, leftText: text };
   }
@@ -980,7 +1024,71 @@ function ikiBuildRows(words: EWord[], lineH: number, medSlope: number, xMid: num
   return rows;
 }
 
-export function parseIkiColumnar(lines: IkiLine[], start: number, end: number): IkiProduct[] {
+// PER-CORNER SEAM ENFORCEMENT — the ONE tiling rule shared by PRODUCT bands and SKIPPED
+// (coupon/bag/points) bands so both partition the receipt by the EXACT same rule. Each item
+// carries its own CONTENT-TOP (the name/first-row top, NOT the possibly-inflated band top — a
+// product band is tiled to extend UP to its predecessor, so its band top can sit above a skip
+// that physically follows its name; ordering by content-top keeps the partition in true
+// reading order). Sort by content-top, then snap each band's BOTTOM edge to the NEXT band's TOP
+// edge (per corner, so the seam follows the receipt tilt): consecutive bands tile seam-to-seam
+// — no overlap, no gap. Anchor on the LOWER band's own top so a name is never clipped. When a
+// lower band's band-top has collided AT/ABOVE the upper's (an inflated product top, or a
+// scrambled column), clamp the lower's top DOWN to the upper's bottom — never invert a band.
+// Mutates the regions in place.
+function enforceTileSeamsBy(items: Array<{ top: number; region: Region }>): void {
+  const tile = items.filter((it) => !!it.region).sort((a, b) => a.top - b.top);
+  for (let i = 1; i < tile.length; i++) {
+    const A = tile[i - 1].region, B = tile[i].region;
+    const bLT = B.yLeftTop ?? B.yTop, bRT = B.yRightTop ?? B.yTop;
+    const aLT = A.yLeftTop ?? A.yTop, aRT = A.yRightTop ?? A.yTop;
+    if (bLT > aLT + 1 && bRT > aRT + 1) {
+      A.yLeftBottom = bLT; A.yRightBottom = bRT;
+      A.yBottom = Math.max(bLT, bRT);
+      A.yTop = Math.min(aLT, aRT);
+    } else if (bLT <= aLT + 1 && bRT <= aRT + 1) {
+      // B's band-top sits AT/ABOVE A's top → B would SWALLOW A. Clamp B's top DOWN to A's bottom
+      // so B starts where A ends — but only when B stays non-inverted (its bottom still below A's).
+      const aLB = A.yLeftBottom ?? A.yBottom, aRB = A.yRightBottom ?? A.yBottom;
+      if ((B.yLeftBottom ?? B.yBottom) > aLB + 1 && (B.yRightBottom ?? B.yBottom) > aRB + 1) {
+        B.yLeftTop = aLB; B.yRightTop = aRB;
+        B.yTop = Math.min(aLB, aRB);
+      }
+    }
+  }
+}
+
+// Tile PRODUCTS + SKIPPED bands into ONE seam-to-seam partition in DE-SKEWED space, then re-skew
+// every band to the single receipt tilt `g`. Each item carries its de-skewed content extent
+// [dt, db] (computed from its own words / box, NOT the possibly-inflated band edges). The seam
+// between consecutive items (sorted by content-top) is max(upper.db, lower.dt):
+//   • upper.db  → the upper band NEVER loses its own rows. The receipt-142 case: a weighed
+//     product's price ("3,87 A") OCR-landed on the next coupon's row, so the product's content
+//     extends BELOW the coupon's top; the band must still reach that price, not be cut at the
+//     coupon and let the grey skip band "abduct" it.
+//   • lower.dt  → the lower band isn't cut into.
+//   • the max of the two → no gap, no overlap.
+// Re-skewing both edges at `g` makes EVERY band — incl. the grey skipped ones — a parallelogram
+// that BENDS with the receipt, exactly like the product bands (fixes flat skip bands). When the
+// seam pushes an item's top past its own bottom (its content was fully claimed by the band
+// above), it collapses to a thin sliver at the seam rather than inverting.
+function tileByContent(items: Array<{ dt: number; db: number; region: Region }>, g: number, x0: number, x1: number): void {
+  const tile = items.filter((it) => !!it.region && it.db > it.dt).sort((a, b) => a.dt - b.dt);
+  for (let i = 1; i < tile.length; i++) {
+    const seam = Math.max(tile[i - 1].db, tile[i].dt);
+    tile[i - 1].db = seam;
+    tile[i].dt = Math.min(seam, tile[i].db);   // never invert: clamp top at this item's own bottom
+  }
+  for (const it of tile) {
+    const r = it.region;
+    r.yLeftTop = it.dt + g * x0; r.yRightTop = it.dt + g * x1;
+    r.yLeftBottom = it.db + g * x0; r.yRightBottom = it.db + g * x1;
+    r.yTop = Math.min(r.yLeftTop, r.yRightTop);
+    r.yBottom = Math.max(r.yLeftBottom, r.yRightBottom);
+    r.xLeft = x0; r.xRight = x1;
+  }
+}
+
+export function parseIkiColumnar(lines: IkiLine[], start: number, end: number, skipped?: Region[]): IkiProduct[] {
   const words = ikiCollectWords(lines, start, end);
   if (words.length < 2) return [];
   const lineH = emedian(words.map((w) => w.yBottom - w.yTop).filter((h) => h > 0)) || 24;
@@ -1067,7 +1175,31 @@ export function parseIkiColumnar(lines: IkiLine[], start: number, end: number): 
       },
     });
   };
+  let prevRow: ERow | null = null;
   for (const r of rows) {
+    const afterFusedDepositLabel = prevRow?.depositFollows === true;
+    prevRow = r;
+    // The deposit's own bare PRICE ("0,10") lands on the row right after a fused
+    // "discount + DEPOSIT-label" row (the label having ridden the discount above). It
+    // arrives nameless with a small positive total, so the boundary logic below would
+    // mint it as a phantom product. Fold it into the open product's band instead — same
+    // as any other deposit: no value, no new product. (receipt-139 AKVILĖ GAZ.)
+    // TWO discriminators keep this fold from eating a real product that merely happens to
+    // follow a fused-deposit row (both signals are needed; a double OCR drop defeats either
+    // one alone):
+    //  (1) a real IKI deposit price carries NO VAT-class letter ("0, 10"); every product
+    //      total ends in A/B/C ("1,29 A"). But OCR sometimes drops that trailing letter too.
+    //  (2) the Lithuanian bottle deposit is €0,10 per container, so a deposit amount is a
+    //      SMALL MULTIPLE OF 0,10 (0,10 / 0,20 / 0,30). A real product total like "0,45" — the
+    //      double-drop case (name AND VAT letter gone) — is not, so it survives as its own
+    //      product instead of being swallowed.
+    const rowVatLettered = /[ABC]\s*$/.test(r.words.map((w) => w.text).join(' ').trim());
+    const cents = r.total != null ? Math.round(r.total * 100) : -1;
+    const depositLike = cents > 0 && cents <= 30 && cents % 10 === 0;   // 0,10 / 0,20 / 0,30 deposit denominations
+    if (
+      afterFusedDepositLabel && cur.top != null &&
+      depositLike && !rowVatLettered && r.discount === 0 && !r.perKg && !ikiStrongName(r.leftText)
+    ) { cur.rows.push({ ...r, isSkip: true, isDeposit: true }); continue; }
     if (r.isSkip) {
       // A bottle DEPOSIT belongs to the product ABOVE — fold it into that product's
       // rows so the SAME band covers it, but DON'T flush and DON'T add its amount
@@ -1194,14 +1326,20 @@ export function parseIkiColumnar(lines: IkiLine[], start: number, end: number): 
   const nameless = out.filter((o) => o.p.name === '?' || o.p.name === '');
   if (nameless.length) {
     const lead = /^\s*-\s?\d{1,4}[.,]\s?\d{2}\s*[ABC]?\s+(.+)$/;
+    // Same garble tolerance as T_LEAD_DISC_GARBLED_RE: a leading minus + short digit-ish blob +
+    // MANDATORY VAT letter recovers the fused name when OCR mangled the amount ("-000 A …").
+    const leadGarbled = /^\s*-\s?[\dOoSsCcIl][\dOoSsCcIl.,\s]{0,4}\s*[ABC]\s+(.+)$/;
     const isAmtTok = (t: string) => /^-?[\d.,]+$/.test(t.trim()) || /^[ABC]$/.test(t.trim());
     const have = new Set(out.map((o) => o.p.name).filter((n) => n && n !== '?'));
     const cands: { name: string; y: number; li: number; used: boolean }[] = [];
     for (let i = start; i < end; i++) {
-      const m = lines[i].text.match(lead);
+      const m = lines[i].text.match(lead) ?? lines[i].text.match(leadGarbled);
       if (!m) continue;
       const nm = m[1].trim();
-      if (!isNameStart(nm) || isTSkip(nm) || isTWeight(nm) || ikiLabelTail(nm)) continue;
+      // A bottle-deposit LABEL fused as the lead-discount tail ("-0,33 A DEP0ZITAS") is
+      // NEVER a product name — it would mint a phantom "DEP0ZITAS". (Belt-and-braces: the
+      // assembler already folds the deposit price, so no nameless product should reach here.)
+      if (!isNameStart(nm) || isTSkip(nm) || isTWeight(nm) || ikiLabelTail(nm) || T_DEPOSIT_RE.test(nm)) continue;
       const clean = cleanProductName(nm);
       const candY = (lines[i].yTop + lines[i].yBottom) / 2;
       // The name already belongs to a product → normally a stray re-mention, so skip it.
@@ -1433,30 +1571,31 @@ export function parseIkiColumnar(lines: IkiLine[], start: number, end: number): 
   // band (next.top sits at/above this.top — only a pathological same-row scramble); leave
   // it rather than collapse it. Bands the main seam loop already tiled are a no-op (their
   // bottom already equals the next top).
-  const tileRegions = metas
-    .map((m) => m.o.p.region)
-    .filter((r): r is NonNullable<typeof r> => !!r)
-    .sort((a, b) => (a.yTop ?? 0) - (b.yTop ?? 0));
-  for (let i = 1; i < tileRegions.length; i++) {
-    const A = tileRegions[i - 1], B = tileRegions[i];
-    const bLT = B.yLeftTop ?? B.yTop, bRT = B.yRightTop ?? B.yTop;
-    const aLT = A.yLeftTop ?? A.yTop, aRT = A.yRightTop ?? A.yTop;
-    if (bLT > aLT + 1 && bRT > aRT + 1) {
-      A.yLeftBottom = bLT; A.yRightBottom = bRT;
-      A.yBottom = Math.max(bLT, bRT);
-      A.yTop = Math.min(aLT, aRT);
-    } else if (bLT <= aLT + 1 && bRT <= aRT + 1) {
-      // B's top sits AT or ABOVE A's top → B's band would SWALLOW A (its de-skewed top
-      // collided with A's, e.g. a scrambled price column pulling B's top up to A's name).
-      // Clamp B's top DOWN to A's bottom so B starts where A ends — A keeps its own lines,
-      // B can no longer cover them. (receipt: CLEVER bread band landing on the bulvės band.)
-      const aLB = A.yLeftBottom ?? A.yBottom, aRB = A.yRightBottom ?? A.yBottom;
-      // Only clamp when B stays non-inverted (its own bottom is still below A's bottom).
-      if ((B.yLeftBottom ?? B.yBottom) > aLB + 1 && (B.yRightBottom ?? B.yBottom) > aRB + 1) {
-        B.yLeftTop = aLB; B.yRightTop = aRB;
-        B.yTop = Math.min(aLB, aRB);
-      }
-    }
+  if (skipped && skipped.length) {
+    // SKIPPED bands (coupons / bags / points) tile by the SAME rule as products: build the
+    // de-skewed content extent [dt, db] of every product (from its words) AND every skip (from its
+    // box), then run ONE content-aware partition (tileByContent) that re-skews all of them to the
+    // single receipt tilt g. This (a) makes the grey skip bands BEND like the product bands, and
+    // (b) guarantees a product never loses its own rows to a following skip even when its price
+    // OCR-landed on the skip's row (receipt-142). Done HERE, not post-hoc, because it needs each
+    // product's true de-skewed content extent. Skips keep their 'skipped' identity / exclusion.
+    const prodRegions = metas.map((m) => m.o.p.region).filter((r): r is Region => !!r);
+    const sx0 = Math.min(...prodRegions.map((r) => r.xLeft), ...skipped.map((r) => r.xLeft));
+    const sx1 = Math.max(...prodRegions.map((r) => r.xRight), ...skipped.map((r) => r.xRight));
+    const items: Array<{ dt: number; db: number; region: Region }> = [
+      ...metas.filter((m) => !!m.o.p.region).map((m) => {
+        const ws = m.o.rows.flatMap((r) => r.words);
+        return { dt: Math.min(...ws.map(dT)), db: Math.max(...ws.map(dB)), region: m.o.p.region! };
+      }),
+      ...skipped.map((r) => {
+        const cxr = (r.xLeft + r.xRight) / 2;                       // de-skew the box about its own centre
+        return { dt: (r.yLeftTop ?? r.yTop) - g * cxr, db: (r.yLeftBottom ?? r.yBottom) - g * cxr, region: r };
+      }),
+    ];
+    tileByContent(items, g, sx0, sx1);
+  } else {
+    // No skips → preserve the original product-only ordering (by band top) exactly.
+    enforceTileSeamsBy(metas.filter((m) => !!m.o.p.region).map((m) => ({ top: m.o.p.region!.yTop ?? 0, region: m.o.p.region! })));
   }
   return out.map((o) => o.p);
 }
@@ -1683,7 +1822,18 @@ function parseIkiThermal(lines: IkiLine[]): IkiParseResult {
       // "1500"); those fall through to the value-containing LINE FRAME instead.
       return k.length >= 2 && (k === key || (k.includes(key) && k.length - key.length <= 3));
     });
-    const src = hit.length ? hit : null;
+    // A MULTI-WORD value (the store ADDRESS) has no single word that hugs the whole value, so
+    // `hit` is empty and X/Y would fall back to the whole LINE FRAME. When the address is OCR-
+    // FUSED with the company-code line ("…Siaul iai PV moketojo kodas LT101937219"), that frame
+    // drags the band across the unboxed code (receipt-142). Instead HUG the value's own FRAGMENT
+    // words (each cleaned word is a piece of the value) so the band covers ONLY the address, not
+    // the trailing code. Restricted to multi-word values so single-token bands (code/total/date)
+    // keep their exact line-frame fallback.
+    const multiWordValue = /\S\s+\S/.test(value.trim());
+    const frag = (!hit.length && multiWordValue)
+      ? ws.filter((w) => { const k = w.text.replace(/[^0-9A-Za-z]/g, ''); return k.length >= 2 && key.includes(k); })
+      : [];
+    const src = hit.length ? hit : (frag.length >= 2 ? frag : null);
     // X: the value words when present, else the whole LINE FRAME (so it still contains
     // the value wherever OCR scrambled it).
     const xL = src ? Math.min(...src.map((w) => w.xLeft)) : l.xLeft;
@@ -1837,6 +1987,7 @@ function parseIkiThermal(lines: IkiLine[]): IkiParseResult {
   const headerRegions: LabeledRegion[] = [];
   let pvmCode = '';
   let pvmLineIdx = -1;
+  let pvmGarbledIdx = -1; // a header line that just STARTS with "PVM" but whose code OCR shredded
   for (let i = 0; i < Math.min(8, lines.length); i++) {
     // PVM/VAT code — tolerate OCR confusions in the "LT" prefix (e.g. "LI") and a
     // digit run SPLIT by stray spaces ("LT1019372 19" for LT101937219). Grab the
@@ -1851,7 +2002,14 @@ function parseIkiThermal(lines: IkiLine[]): IkiParseResult {
     // word of this line but "PVN" (receipt-64), which would shrink a word-anchored
     // band to a stub. footBand spans the receipt and falls back to the line bbox Y.
     if (pv) { pvmCode = pv[1].replace(/\s+/g, ''); pvmLineIdx = i; headerRegions.push(footBand(lines[i], 'storeCode', pvmCode)); break; }
+    // Fallback: a header line (first 3) that STARTS with "PVM" IS the VAT line even when its
+    // "mokėtojo kodas LT…" code is OCR-shredded to a stub ("PVM 7219"). Without it pvmLineIdx
+    // stays -1 → pStart stays 0 → the header lines fold into product 1's NAME and the address
+    // scan runs all the way down to the product PRICE ("0,65 A" grabbed as the store address —
+    // the same datum used twice). Remember the FIRST such line so pStart can skip the header.
+    if (pvmGarbledIdx < 0 && i < 3 && /^\s*PVM\b/i.test(lines[i].text)) pvmGarbledIdx = i;
   }
+  if (pvmLineIdx < 0 && pvmGarbledIdx >= 0) pvmLineIdx = pvmGarbledIdx;
 
   // ── product bounds ── Products begin AFTER the header block. Prefer an
   // explicit "PVM mokėtojo kodas" line; else the company-code line; else 0.
@@ -1880,7 +2038,11 @@ function parseIkiThermal(lines: IkiLine[]): IkiParseResult {
     // run so the address survives instead of being rejected for containing "kodas".
     // (OCR garbles "PVM"→"Pyw"/"Py" and "kodas"→"kadas".)
     stripped = stripped.replace(/\s+(?:PVM|P[vy]w?|k[oa]das)\b.*$/i, '').trim();
-    if (/\d/.test(stripped) && /,/.test(stripped) && /[A-Za-zĄČĘĖĮŠŲŪŽ]/.test(stripped) && !/PVM|kodas/i.test(stripped)) {
+    // A bare PRICE ("0, 65 A" — amount + optional VAT letter) is the ITEM's own datum, NEVER
+    // the address; reject it so the same value can't be used twice (the garbled-header case
+    // where the real address didn't survive and the scan reached the first product's price).
+    const isBarePrice = /^-?\d{1,4}[.,]\s?\d{2}\s*[ABC]?\s*$/.test(stripped);
+    if (/\d/.test(stripped) && /,/.test(stripped) && /[A-Za-zĄČĘĖĮŠŲŪŽ]/.test(stripped) && !/PVM|kodas/i.test(stripped) && !isBarePrice) {
       storeAddress = stripped;
       headerRegions.push(footBand(lines[i], 'storeAddress', storeAddress));
       break;
@@ -1905,10 +2067,20 @@ function parseIkiThermal(lines: IkiLine[]): IkiParseResult {
       break;
     }
   }
+  // ── skipped lines (coupons / bags / loyalty points) in the product section: their own grey
+  //    bands in the photo view, never counted as products. Built BEFORE the engine so the
+  //    column engine can tile them together with the products by the SAME rule (it needs each
+  //    product's true content-top, which it has internally). lineBox (whole-line bbox): a
+  //    coupon/bag/points line is often "<amount> <skip word>" where MLKit kept only the amount
+  //    word — a word-anchored band would grey just the amount; the full line bbox greys the row.
+  const skippedRegions: LabeledRegion[] = [];
+  for (let i = pStart; i < pEnd; i++) {
+    if (isTSkip(lines[i].text)) skippedRegions.push(lineBox(lines[i], 'skipped'));
+  }
   // COLUMN ENGINE dispatch (flag-gated): use it when enough per-word data exists
   // AND it actually yields products; otherwise fall back to the legacy tokenizer.
   const engineProducts = USE_COLUMN_ENGINE && ikiHasWords(lines, pStart, pEnd)
-    ? parseIkiColumnar(lines, pStart, pEnd)
+    ? parseIkiColumnar(lines, pStart, pEnd, skippedRegions)
     : null;
   const usedEngine = !!engineProducts && engineProducts.length > 0;
   const products = usedEngine ? engineProducts! : parseThermalProducts(lines, pStart, pEnd);
@@ -1950,15 +2122,8 @@ function parseIkiThermal(lines: IkiLine[]): IkiParseResult {
     }
   }
 
-  // ── skipped lines (coupons / bags / loyalty points) in the product section:
-  //    their own grey bands in the photo view, but never counted as products ──
-  const skippedRegions: LabeledRegion[] = [];
-  for (let i = pStart; i < pEnd; i++) {
-    // lineBox (whole-line bbox): a coupon/bag/points line is often "<amount> <skip
-    // word>" where MLKit kept only the amount word — a word-anchored band would grey
-    // just the amount. The full line bbox greys the whole skipped row.
-    if (isTSkip(lines[i].text)) skippedRegions.push(lineBox(lines[i], 'skipped'));
-  }
+  // (skippedRegions were built and — on the column-engine path — already tiled with the
+  //  products above, before the engine dispatch.)
 
   // ── band walls across PRODUCTS + SKIPPED lines (EDGE-TO-EDGE partition) ──
   // Dead-simple and STABLE: sort every band (each is its NAME-line box) top→bottom,
@@ -2019,50 +2184,8 @@ function parseIkiThermal(lines: IkiLine[]): IkiParseResult {
     last.yBottom = Math.max(last.yLeftBottom, last.yRightBottom);
   }
 
-  // ── COLUMN-ENGINE path: fit the skipped-line bands into the engine's layout ──
-  // The engine tiles its OWN products, so the legacy edge-to-edge tiler above is skipped
-  // (bands=[] when usedEngine) and the skipped-line boxes (coupons / bags / points) are left
-  // as raw NAME-only lineBoxes: they CLIP their right-aligned price and OVERLAP the product
-  // below. Fit each one in: widen it to the product span (continuing its own tilt so the
-  // right-aligned price is covered, not clipped) and drop its BOTTOM to the NEXT product's
-  // name-top so it tiles flush above that product with no overlap. (receipt-129 MAIŠELIS.)
-  if (usedEngine && skippedRegions.length > 0 && products.length > 0) {
-    const prod = products.map((p) => p.region);
-    const X0 = Math.min(...prod.map((r) => r.xLeft), ...skippedRegions.map((r) => r.xLeft));
-    const X1 = Math.max(...prod.map((r) => r.xRight), ...skippedRegions.map((r) => r.xRight));
-    const clampS = (s: number) => Math.max(-0.08, Math.min(0.08, s));
-    for (const r of skippedRegions) {
-      const origTop = r.yLeftTop ?? r.yTop;
-      const w = r.xRight - r.xLeft;
-      if (w > 1) {
-        const ltY = r.yLeftTop ?? r.yTop, rtY = r.yRightTop ?? r.yTop;
-        const lbY = r.yLeftBottom ?? r.yBottom, rbY = r.yRightBottom ?? r.yBottom;
-        const sT = clampS((rtY - ltY) / w), sB = clampS((rbY - lbY) / w);
-        r.yLeftTop = ltY + sT * (X0 - r.xLeft);
-        r.yRightTop = ltY + sT * (X1 - r.xLeft);
-        r.yLeftBottom = lbY + sB * (X0 - r.xLeft);
-        r.yRightBottom = lbY + sB * (X1 - r.xLeft);
-        r.xLeft = X0; r.xRight = X1;
-      }
-      // Seam = the NEAREST product starting below this skip (its name-top corners), so the
-      // skip ends exactly where that product begins: no overlap, and — because the seam
-      // slants DOWN toward the right where the price sits — the right-aligned price is
-      // covered rather than clipped. A skip with no product below keeps its widened box.
-      let belowL = Infinity, belowR = Infinity, found = false;
-      for (const pr of prod) {
-        const prTop = pr.yLeftTop ?? pr.yTop;
-        if (prTop > origTop + 1 && prTop < belowL) {
-          belowL = prTop; belowR = pr.yRightTop ?? pr.yTop; found = true;
-        }
-      }
-      if (found) {
-        r.yLeftBottom = belowL;
-        r.yRightBottom = belowR;
-        r.yTop = Math.min(r.yLeftTop ?? r.yTop, r.yRightTop ?? r.yTop);
-        r.yBottom = Math.max(belowL, belowR);
-      }
-    }
-  }
+  // (Column-engine path: the skipped-line bands were widened + tiled together with the products
+  //  inside parseIkiColumnar, by the SAME per-corner seam rule, so nothing to do here.)
 
   // ── footer fields (scan whole receipt; take first hit) + bbox bands ──
   let total: number | null = null;
@@ -2071,6 +2194,7 @@ function parseIkiThermal(lines: IkiLine[]): IkiParseResult {
   // "Kvitas" fallback even though Kvitas is printed FIRST (higher up the receipt).
   let kvitoVal = ''; let kvitoLine: IkiLine | undefined;
   let kvitasVal = ''; let kvitasLine: IkiLine | undefined;
+  let kvitoNumVal = ''; let kvitoNumLine: IkiLine | undefined;   // "Kvito numeris <n>" (VMI block)
   let totalSavings: number | null = null;
   let date = '';
   let time = '';
@@ -2080,6 +2204,8 @@ function parseIkiThermal(lines: IkiLine[]): IkiParseResult {
   let sumaPending = false; // previous line had a bare "SUMA" keyword w/o an amount
   let prevAmtLine: IkiLine | undefined; // previous line carried "X,XX EUR" but no SUMA
   let prevAmtVal: string | undefined;
+  let prevBareLine: IkiLine | undefined; // immediately-preceding line that was JUST a bare amount
+  let prevBareVal: string | undefined;
   const footerRegions: LabeledRegion[] = [];
   for (const l of lines) {
     const t = l.text;
@@ -2104,9 +2230,23 @@ function parseIkiThermal(lines: IkiLine[]): IkiParseResult {
       // A "Mokėti" line with the amount on either side; ignore the VAT-breakdown
       // header ("…Mokestis Suma su PVM…") which has "Mok…" but no bare price.
       const m = t.match(/(\d{1,4}[.,]\s?\d{2})/);
+      // OCR sometimes drops the decimal comma on the Mokėti amount, leaving a space
+      // ("Mokėti 7 10" = 7,10). Only accept this right AFTER the Mokėti keyword (so a
+      // stray "7 10" elsewhere can't be misread) and only when there's no comma form.
+      const sp = m ? null : t.match(/Mok[eė]t\s?i\D{0,3}(\d{1,4})\s+(\d{2})(?!\d)/i);
       if (m) {
         if (total == null) total = parseNum(m[1]);
         footerRegions.push(footBand(l, 'total', m[1]));
+      } else if (sp) {
+        const v = `${sp[1]},${sp[2]}`;
+        if (total == null) total = parseFloat(`${sp[1]}.${sp[2]}`);
+        footerRegions.push(footBand(l, 'total', v));
+      } else if (total == null && prevBareVal && prevBareLine) {
+        // CASH receipt: "Mokėti" prints as a COLUMN HEADER ("PVM suma Moketi Be PVM") with the
+        // amount split onto the line ABOVE ("3, 95"); no clean "SUMA … EUR" anywhere. Take the
+        // immediately-preceding bare amount as the to-pay total. (receipt-148.)
+        total = parseNum(prevBareVal);
+        footerRegions.push(footBand(prevBareLine, 'total', prevBareVal));
       }
     }
     // LOOK-BEHIND (form 4): OCR split the amount onto the line BEFORE a bare "SUMA"
@@ -2126,11 +2266,31 @@ function parseIkiThermal(lines: IkiLine[]): IkiParseResult {
     const prevM = /\bSUMA\b/i.test(t) ? null : t.match(/(\d{1,4}[.,]\s?\d{2})\s*EUR/i);
     prevAmtLine = prevM ? l : undefined;
     prevAmtVal = prevM ? prevM[1] : undefined;
+    // Remember a line that is JUST a bare amount ("3, 95") so the Mokėti look-behind above can
+    // claim it on the NEXT line. Reset on any other line → only the IMMEDIATELY preceding one.
+    const bareM = t.match(/^\s*(-?\d{1,4}[.,]\s?\d{2})\s*$/);
+    prevBareLine = bareM ? l : undefined;
+    prevBareVal = bareM ? bareM[1] : undefined;
     if (!kvitoVal) { const m = t.match(T_RECEIPTNO_RE); if (m) { kvitoVal = m[1]; kvitoLine = l; } }
     if (!kvitasVal) { const m = t.match(T_KVITAS_RE); if (m) { kvitasVal = m[1]; kvitasLine = l; } }
+    if (!kvitoNumVal) { const m = t.match(T_KVITONUM_RE); if (m) { kvitoNumVal = m[1]; kvitoNumLine = l; } }
     if (totalSavings == null) { const m = t.match(T_SAVINGS_RE); if (m) totalSavings = parseNum(m[1]); }
     if (!date) { const m = t.match(T_DATE_RE); if (m) { date = `${m[1]}-${m[2]}-${m[3]}`; dateLine = l; } }
     if (!time) { const m = t.match(T_TIME_RE); if (m) { time = `${m[1]}:${m[2]}`; timeLine = l; timeMatch = m; } }
+  }
+  // LAST RESORT (cash receipt): total = Grynieji (cash tendered) − Grąža (change). When the VAT/
+  // payment table is too scrambled to read a "Mokėti"/"SUMA" total but the cash + change survived,
+  // this still recovers it. Only when BOTH are cleanly present and cash ≥ change. (user-suggested.)
+  if (total == null) {
+    const amtIn = (re: RegExp): number | null => {
+      for (const l of lines) {
+        if (re.test(l.text)) { const m = l.text.match(/(\d{1,4}[.,]\s?\d{2})/); if (m) return parseNum(m[1]); }
+      }
+      return null;
+    };
+    const cash = amtIn(/Grynie/i);
+    const change = amtIn(/Gr[aą][zž]a/i);
+    if (cash != null && change != null && cash >= change) total = round2(cash - change);
   }
   // Date + time bands: one combined 'dateTime' band when they share a line,
   // else a 'date' AND a 'time' band so BOTH are covered — IKI prints
@@ -2149,16 +2309,24 @@ function parseIkiThermal(lines: IkiLine[]): IkiParseResult {
       footerRegions.push(footBand(timeLine, 'time', time));
     }
   }
-  // Resolve the receipt id: prefer the canonical "Kvito Nr.", else the "Kvitas"
-  // sequence number, else synthesize from date+time+total (same scheme as the
-  // column-header path) so a readable receipt ALWAYS gets a stable id — without one
-  // the app can't tell a duplicate from a new receipt and stalls the scan flow.
+  // Resolve the receipt id: the CANONICAL id (and the unique dedup key) stays EXACTLY as before —
+  // prefer "Kvito Nr.", else "Kvitas", else synthesise from date+time+total — so no existing
+  // receipt's dedup key churns. The full receiptNos[] ARRAY additionally carries every distinct
+  // identifier on the footer (canonical first) for display + recovery; each gets its OWN band.
   const rnVal = kvitoVal || kvitasVal;
   const rnLine = kvitoVal ? kvitoLine : kvitasLine;
-  if (rnVal && rnLine) { receiptNo = rnVal; footerRegions.push(footBand(rnLine, 'receiptNo', rnVal)); }
+  if (rnVal && rnLine) receiptNo = rnVal;
   if (!receiptNo && date && time && total !== null) {
     receiptNo = `${date.replace(/-/g, '')}-${time.replace(/:/g, '')}-${Math.round(total * 100)}-iki-receipt`;
   }
+  // One band per captured identifier line (Kvito Nr., Kvito numeris, Kvitas) — all shown.
+  if (kvitoVal && kvitoLine) footerRegions.push(footBand(kvitoLine, 'receiptNo', kvitoVal));
+  if (kvitoNumVal && kvitoNumLine) footerRegions.push(footBand(kvitoNumLine, 'receiptNo', kvitoNumVal));
+  if (kvitasVal && kvitasLine) footerRegions.push(footBand(kvitasLine, 'receiptNo', kvitasVal));
+  // Array: canonical first, then any other distinct identifier (dedupe, keep order). Falls back to
+  // just the canonical (incl. the synthetic id) when no printed identifier survived OCR.
+  const receiptNos = [...new Set([rnVal, kvitoVal, kvitoNumVal, kvitasVal].filter(Boolean))];
+  if (receiptNos.length === 0 && receiptNo) receiptNos.push(receiptNo);
   footerRegions.sort((a, b) => a.yTop - b.yTop);
 
   // header/footer `region` was the whole-receipt union of EVERY line (regionOf(lines)),
@@ -2173,7 +2341,7 @@ function parseIkiThermal(lines: IkiLine[]): IkiParseResult {
   return {
     header: { chainName: 'IKI', storeCode: '', storeName: '', storeAddress, pvmCode, rawText, region: unionOf(headerRegions), lineRegions: headerRegions },
     products,
-    footer: { total, date, time, receiptNo, totalSavings, rawText, region: unionOf(footerRegions), lineRegions: footerRegions },
+    footer: { total, date, time, receiptNo, receiptNos, totalSavings, rawText, region: unionOf(footerRegions), lineRegions: footerRegions },
     skippedRegions,
   };
 }
@@ -2286,6 +2454,10 @@ export function parseIkiReceipt(lines: IkiLine[]): IkiParseResult {
     const t = footer.time.replace(/:/g, "");
     const cents = Math.round(footer.total * 100);
     footer.receiptNo = `${d}-${t}-${cents}-iki-receipt`;
+  }
+  // Keep receiptNos[] consistent with the canonical id on this path (no printed identifiers here).
+  if ((!footer.receiptNos || footer.receiptNos.length === 0) && footer.receiptNo) {
+    footer.receiptNos = [footer.receiptNo];
   }
 
   return { header, products, footer };
