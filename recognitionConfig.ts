@@ -144,6 +144,34 @@ export const RECOGNITION = {
     /** Min coverage of candidate long tokens by the query. @ref productMatcher.ts:193 */
     candidateCoverageGuard: 0.4,
     /**
+     * OCR space-heal: ML Kit splits a word across a space ("KIAULIENA" → "KIAUL
+     * IENA"), poisoning the token lane. When a query token doesn't match a candidate
+     * token alone, glue it with the next query token and accept the glued word when
+     * it matches a candidate token at/above this. Adjacent-pair only, single-token-
+     * failed only — can't fabricate coverage. @ref productMatcher.ts healQueryTokens
+     */
+    glueRescueThreshold: 0.85,
+    /**
+     * Anchored abbreviation bonus: a SHORT query token (receipt "R" for "riebumas",
+     * Lidl "sur." for "surimi", "ag." for "agurkų") that PREFIXES a candidate long
+     * token adds `abbrevBonus` (capped at `abbrevBonusCap`) — but ONLY when the two
+     * names already share a significant token (sharedSignificantToken), so an
+     * abbreviation can never originate a match. @ref productMatcher.ts
+     */
+    abbrevBonus: 0.05,
+    abbrevBonusCap: 0.1,
+    /**
+     * Token-set SUBSET lane: when the receipt name is a clean (order-independent)
+     * subset of a longer catalog name — every query long token covered — score it
+     * `subsetFullWeight` (auto-apply grade, within the catalog tiebreak margin of a
+     * 1.0 orphan). Partial coverage scales down; below `subsetMinCoverage` it
+     * contributes nothing. Gated behind a shared significant token. Fixes the
+     * whole-string char-lane failure on long catalog supersets without touching the
+     * char lane. @ref productMatcher.ts subsetCoverage
+     */
+    subsetFullWeight: 0.92,
+    subsetMinCoverage: 0.6,
+    /**
      * Distinguishing-noun disagreement penalty. Generic brand/packaging words
      * ("Fasuoti", "IKI", "ŪKIS") are shared across very different products, so a
      * candidate can clear coverage on those alone while the DISTINGUISHING noun
@@ -180,6 +208,14 @@ export const RECOGNITION = {
     slot1CrossChainMinScore: 0.6,
     /** Candidates per (chain,category) group fed to JS scoring. @ref slot1CandidateModel.ts:15 */
     maxCandidatesPerGroup: 25,
+  },
+
+  // ── Receipt-name vocabulary (Issue H — storeProductAliasModel.ts) ──
+  vocab: {
+    /** Distinct 'identical' voters needed to auto-promote a learned alias to
+     *  CANONICAL (used in global name matching). Admin can confirm earlier / reject.
+     *  @ref storeProductAliasModel.ts recordAliasVote */
+    canonicalDistinctUsers: 2,
   },
 
   // ── Resolver (souply-api/src/services/receiptLineResolver.ts, productModel.ts) ──
