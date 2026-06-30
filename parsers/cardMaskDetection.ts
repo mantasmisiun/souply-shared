@@ -106,7 +106,10 @@ const LOYALTY_CTX = /lojalum|mano\s+rimi|lidl\s*plus|mano\s+iki|\bikiuk|aciu\w*\
 // Captures the label + separators so the VALUE start is the match end. OCR mangles the middle of
 // the word (the 2nd n → r/m: "Kasinirkas", receipt-146 SIMKUTE), so anchor only on the reliable
 // "kasin…k" stem (kasin + ≤3 garbled chars + k) instead of a literal "kasinink".
-const CASHIER_LABEL = /kasin\w{0,3}k\w*\s*(nr\.?|nr)?\s*[:.\-–]?\s*/;
+// "[\w ]{0,4}" between the "kasin" stem and the "k": tolerates OCR garbles (kasin→kasinirk)
+// AND a SPACE where OCR split the word into two boxes ("Kasini nkas"), which left the cashier
+// name unmasked. The bounded length keeps it from running across unrelated words.
+const CASHIER_LABEL = /kasin[\w ]{0,4}k\w*\s*(nr\.?|nr)?\s*[:.\-–]?\s*/;
 // Loyalty card number printed in FULL (not PCI star-masked) — e.g. IKI's
 // "IKI KORTELĖS NR. 99110000000005068582". The label is a loyalty-card "NR".
 // "kor?el" (1 optional char between KOR and EL) tolerates the common OCR misread
