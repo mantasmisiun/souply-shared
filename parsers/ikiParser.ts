@@ -1854,7 +1854,11 @@ export function parseIkiColumnar(lines: IkiLine[], start: number, end: number, s
   // COMBO-SET discount: a BARE "RINKINYS" line ("set") is IKI's multi-buy/combo deal discount, not a
   // product — drop it. A REAL product always qualifies the word ("ŽALUMYNŲ RINKINYS", "STIKLINIŲ
   // RINKINYS …"), so only the standalone word is the combo line. (receipt-169: "RINKINYS -1,90".)
-  return out.filter((o) => stripDiacritics(o.p.name).replace(/[^A-Za-z]/g, '').toUpperCase() !== 'RINKINYS').map((o) => o.p);
+  // OCR-TOLERANT skeleton: the two "I" positions routinely read as T/1/L ("RINKTNYS", receipt-187).
+  // Anchored ^…$ on the letter-stripped name so a QUALIFIED product ("ŽALUMYNŲ RINKINYS" →
+  // "ZALUMYNURINKINYS") still survives — only the standalone combo word is dropped.
+  const RINKINYS_SKEL = /^R[IT1L]NK[IT1L]NYS$/;
+  return out.filter((o) => !RINKINYS_SKEL.test(stripDiacritics(o.p.name).replace(/[^A-Za-z]/g, '').toUpperCase())).map((o) => o.p);
 }
 
 function parseThermalProducts(lines: IkiLine[], start: number, end: number): IkiProduct[] {
