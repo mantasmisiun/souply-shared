@@ -541,12 +541,16 @@ const T_NEG_RE = /-\s?(\d{1,4}[.,]\s?\d{2})/;
 // mis-reads) AND the distinctive long word PLASTIKIN (no grocery product contains it),
 // so either surviving the OCR is enough. Kept TIGHT — these stems never appear in real
 // product names (e.g. "ŠAMPONAS" stays safe: PONAS needs ≤2 chars before it at a \b).
-const T_SKIP_NAME_RE = /KUPON|\b[A-Z]{0,2}PONAS\b|PIGIN|MAI[SŠ5]EL\s*[I1l][SŠ5]|PLAST[I1l]K[I1l]N|TA[SŠ]KA/i;
+// The bag stems tolerate the heavier mis-reads seen in the wild (receipt-195 "MAJSELIS
+// FLASTIKNIS"): the MAI→MAJ I→J swap (MA[I1lJ]) and the PLAST→FLAST P→F swap plus a dropped
+// second I in PLASTIKIN→FLASTIKN ([PF]LAST[I1l]K[I1l]?N). Still tight — no grocery product reads
+// as MA?SEL?S or [PF]LASTIK?N.
+const T_SKIP_NAME_RE = /KUPON|\b[A-Z]{0,2}PONAS\b|PIGIN|MA[I1lJ][SŠ5]EL\s*[I1l][SŠ5]|[PF]LAST[I1l]K[I1l]?N|TA[SŠ]KA/i;
 // The BAG subset of the skip stems (plastic carrier bag). A bag costs €0,01–0,10 and NEVER carries
 // its own negative, so a negative amount on a bag row is always a FOREIGN (mis-clustered) discount —
 // unlike a coupon/points skip ("KUPONAS -0,30", "IKI Taškais -0,05"), whose negative is its OWN.
 // Used to gate the discPending discount recovery so it can't steal a coupon/points amount.
-const T_BAG_RE = /MAI[SŠ5]EL\s*[I1l][SŠ5]|PLAST[I1l]K[I1l]N/i;
+const T_BAG_RE = /MA[I1lJ][SŠ5]EL\s*[I1l][SŠ5]|[PF]LAST[I1l]K[I1l]?N/i;
 // Bottle DEPOSIT / UŽSTATAS — handled SEPARATELY (folds into the product above's
 // band, no value), not hard-skipped. OCR rots the O→0 ("DEP0ZIAS").
 const T_DEPOSIT_RE = /DEP[O0]Z|U[ŽZ]STAT/i;
@@ -594,7 +598,10 @@ const T_DATE_RE = /(\d{4})[-.]{1,2}(\d{2})[-.]{1,2}(\d{2})/;
 // separator is tolerant [:.\-]; the SECOND stays a literal ":" so a date ("2026-06-20" → "26-06-20")
 // can never be misread as a time (it has no MM:SS colon).
 const T_TIME_RE = /(\d{2})[:.\-](\d{2}):(\d{2})/;
-const T_RECEIPTNO_RE = /Kvito\s+Nr?[.,]?\s*([0-9/]+)/i;   // OCR reads "Nr." / "Nr," / "N." (dropped r)
+// "Kvito" itself rots heavily on IKI thermal: the K→A and v→o/u/y swaps give "Koito"/"AVito"
+// (receipt-198) and "Kyito" (receipt-199), so the stem is [KA][vouy]ito. The mandatory "Nr"/"numer"
+// context (and the captured digits) keeps it from matching the other "Kvito …" lines (kodas/parašas).
+const T_RECEIPTNO_RE = /[KA][vouy]ito\s+Nr?[.,]?\s*([0-9/]+)/i;   // OCR reads "Nr." / "Nr," / "N." (dropped r)
 // Fallback receipt id when "Kvito Nr." is missing/unreadable: the shorter "Kvitas"
 // sequence number on the terminal line ("Term. 15027037 Kvitas 3157 Atsk 000").
 // Distinct from "Kvito" (no trailing "s"), so it can't match the primary line.
@@ -602,7 +609,7 @@ const T_KVITAS_RE = /\bKvitas[\s.:]*(\d{3,6})\b/i;
 // A THIRD IKI identifier — "Kvito numeris 104148" in the VMI footer block (the sequence number,
 // an INDEPENDENT OCR read of the tail of "Kvito Nr."). OCR splits "numeris" → "numer i s", so the
 // stem is tolerant. Captured for the receiptNos array + its own band; never the canonical id.
-const T_KVITONUM_RE = /Kvito\s+numer[a-z]*\s*i?\s*s?\s*[:.]?\s*([0-9/]{4,})/i;
+const T_KVITONUM_RE = /[KA][vouy]ito\s+numer[a-z]*\s*i?\s*s?\s*[:.]?\s*([0-9/]{4,})/i;
 // Canonical total line, amount on EITHER side of SUMA — OCR flips the order:
 // "SUMA 26,52 EUR" and "26,52 EUR SUMA" both seen. Requires EUR so the multi-
 // column VAT header ("…Suma su PVM Be PVM…") with no EUR can't false-match.
@@ -2535,8 +2542,11 @@ function parseIkiThermal(lines: IkiLine[]): IkiParseResult {
     // "Suma su PVM <amount>" — IKI's TOTAL-with-VAT line. The amount may sit before OR after the
     // keyword ("12,90 Mokestis Suma su PVM"). This is the authoritative printed total on receipts
     // with no clean "Mokėti suapvalinus" line (receipt-159: 12,90 only appears beside "Suma su PVM").
-    // First POSITIVE amount only — a stray rounding "-0,02" must never be the total.
-    if (total == null && /\bSuma\s+su\s+PVM\b/i.test(t)) {
+    // First POSITIVE amount only — a stray rounding "-0,02" must never be the total. P[VU]M
+    // tolerates the V→U mis-read ("Suma su PUM", receipt-199) — without it the total falls through
+    // to the fragile cash−change last resort, which a scrambled payment table reads wrong (199:
+    // Grynieji/Grąža mis-boxed as 10,66/2,24 → a phantom 8,42 total).
+    if (total == null && /\bSuma\s+su\s+P[VU]M\b/i.test(t)) {
       for (const mm of t.matchAll(/(-?)\s?(\d{1,4}[.,]\s?\d{2})/g)) {
         if (mm[1] !== '-') { total = parseNum(mm[2]); footerRegions.push(footBand(l, 'total', mm[2])); break; }
       }
