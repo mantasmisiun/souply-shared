@@ -216,6 +216,9 @@ export const RECOGNITION = {
      *  CANONICAL (used in global name matching). Admin can confirm earlier / reject.
      *  @ref storeProductAliasModel.ts recordAliasVote */
     canonicalDistinctUsers: 2,
+    /** Confidence nudge for a candidate in the L3 leaf a 'similarity' alias scoped to
+     *  (the orphan re-matching: L2 hard-scope + this L3 boost). @ref productMatcher.ts */
+    categoryScopeBoost: 0.07,
   },
 
   // ── Resolver (souply-api/src/services/receiptLineResolver.ts, productModel.ts) ──
