@@ -14,11 +14,16 @@
  * RULES FOR EDITING:
  *   - Only NUMERIC tunables live here. Regexes / patterns stay in their module
  *     (they are not "thresholds") — they are noted in comments where relevant.
- *   - Each leaf carries its origin `@ref file:line` + a one-line purpose so a
- *     future tuner knows what it does and where it used to be inlined.
- *   - These are TUNABLE DEFAULTS, not laws. The confidence caps/weights are
- *     first-pass estimates to be calibrated against real receipts once the
- *     band/veto metrics land — change them HERE, never re-inline a literal.
+ *   - Each leaf carries its origin `@ref file:line` + a one-line purpose. Line
+ *     numbers DRIFT — treat @refs as pointers to the symbol, not exact lines.
+ *   - WIRING STATUS (honesty note): the `match` / `resolve` / `price` / `bands` /
+ *     `queue` / `vocab` sections ARE imported and live. The `ocr` and `parse`
+ *     sections are currently DOCUMENTED MIRRORS — the live values are still
+ *     inlined in mlkitOcr/receiptOcrPipeline/parsers; editing them here does
+ *     NOTHING until those modules are wired to import this file. Keep the
+ *     mirrors in step when changing the inlined values.
+ *   - These are TUNABLE DEFAULTS, not laws — for the wired sections, change
+ *     them HERE, never re-inline a literal.
  *   - `matchThresholds.ts` (swipe-voting + basket substitution) is a DIFFERENT
  *     subsystem and intentionally stays separate; do not fold it in here.
  * ============================================================================
@@ -127,6 +132,15 @@ export const RECOGNITION = {
     tokenMatchThreshold: 0.75,
     /** charScore must reach this to contribute (substring false-positive guard). @ref productMatcher.ts:248 */
     charScoreFloor: 0.6,
+    /**
+     * OCR confusion-weighted char rescue only fires when the PLAIN char similarity already
+     * reaches this — i.e. the two names are a near-miss (a garble of the SAME name). Below
+     * it they're genuinely different (apples 0.58 vs potatoes on shared packaging tokens) and
+     * stay on the plain score, so cheap confusions (digit↔letter, ll↔ti) can't nudge an
+     * unrelated product over charScoreFloor. Above it a real garble (basmati 0.75) gets the
+     * weighted lift. Set between the false-positive band (~0.58) and the true-garble band
+     * (~0.75). @ref productMatcher.ts charSimilarity, ocrConfusions.ts */
+    ocrRescueMinSim: 0.65,
     /** Discount applied to the char lane so clean token matches win. @ref productMatcher.ts:248 */
     charScoreDiscount: 0.95,
     /** Early-bail when length ratio < this. @ref productMatcher.ts:99 */
@@ -202,6 +216,11 @@ export const RECOGNITION = {
     sizePenaltyCap: 0.45,
     /** Penalty when the unit FAMILY differs (g vs l). @ref productMatcher.ts:287 */
     unitFamilyPenalty: 0.2,
+    /** Penalty when the QUERY name carries a number the candidate lacks (both have numbers) —
+     *  a variant discriminator like the fat-% "9%" vs "7,7%"/"0,5%" that the token/char lanes
+     *  treat as a short token and tie on. Breaks the tie toward the value-matching variant
+     *  without killing it as a candidate. @ref productMatcher.ts numberMismatch */
+    numberMismatchPenalty: 0.18,
     /** Cross-chain swipe ANCHORS need ≥ this Round-1 name confidence. @ref slot1CandidateModel.ts:7 */
     slot1AnchorMinScore: 0.85,
     /** Min cross-chain name similarity to pair for a swipe. @ref slot1CandidateModel.ts:13 */
@@ -257,6 +276,10 @@ export const RECOGNITION = {
     priceCloseRel: 0.01,
     /** Skip a price write when < this × the rolling baseline average. @ref receiptSaveService.ts:55 */
     clearanceRatio: 0.5,
+    /** Receipt-observed promos are valid for THIS many days (promoEnd = receiptDate + N).
+     *  Without an end, getActivePromoPrices treats promoEnd NULL as an ETERNAL promo —
+     *  a one-week chain deal would discount comparisons forever. @ref receiptSaveService/priceService */
+    receiptPromoValidityDays: 7,
     /** Rolling window of verified non-fallback prices for the baseline. @ref receiptSaveService.ts:56 */
     baselineWindow: 5,
     /** Cap swipe candidates stored per line. @ref receiptSaveService.ts:21 */

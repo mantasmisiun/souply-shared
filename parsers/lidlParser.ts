@@ -651,6 +651,20 @@ export function parseLidlReceipt(
                 product.promoPrice =
                     Math.round((product.promoPrice / product.quantity) * 100) / 100;
             }
+        } else if (product.pricePerUnit === null && product.quantity > 1 && product.price > 0) {
+            // OCR dropped the unit-line's per-unit number ("<ppu> x <qty> vnt") but the
+            // qty survived: `price` here is still the LINE TOTAL, and emitting it as-is
+            // with quantity > 1 breaks the per-unit contract every other chain honors —
+            // the server would write the multi-buy TOTAL as the SP's reference price.
+            // Derive the unit price instead (total ÷ qty — same convention as IKI's
+            // multi-buy recovery). Holds for weighed lines too: total ÷ kg-qty = €/kg.
+            const unit = Math.round((product.price / product.quantity) * 100) / 100;
+            product.pricePerUnit = unit;
+            product.price = unit;
+            if (product.promoPrice !== null) {
+                product.promoPrice =
+                    Math.round((product.promoPrice / product.quantity) * 100) / 100;
+            }
         }
         products.push(product);
     }

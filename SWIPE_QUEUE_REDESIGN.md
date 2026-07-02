@@ -8,11 +8,14 @@ receipt always first, community work opt-in, same card + 3 swipes throughout.
 
 **Card B (receipt resolution):** one side = the line's matched product, other side = the
 line's OWN OCR text + a band-crop of the receipt. Swipes (unchanged gestures):
-- **identical** → confirm the line + mark price-verified.
-- **similar** → keep the match, leave price unverified, flag wrong-variant/size.
+- **identical** → confirm the line + mark price-verified (+ learns a vocabulary alias
+  when the matcher had struggled — see RECEIPT_VOCABULARY.md).
+- **similar** → same-category SUBSTITUTE: DEMOTES the line (not "keep the match") and
+  records a `similarity` alias (the L2 category link used for scoped re-matching).
 - **different** (`skirtingi`) → demote: re-point to a same-chain runner-up ≥ auto-apply
-  (0.85), else mint a **quarantined orphan** that keeps its price but is excluded from
-  comparison until it gains peers. (A garbled / price≤0 line still creates **no** SP.)
+  (0.85), else clear the line to OCR with a `userRejected` veto + record a `rejected`
+  alias (combo blacklisted). **NO-MINT:** no orphan SP is ever created — the line simply
+  stays unmatched. (Historical note: pre-P3 this minted a quarantined orphan.)
 
 **Mandatory post-scan flow:** at most **3** cards, always filled when related material
 exists: up to **2** Card-B (most needs-human items) + **1** cross-store card (the **most

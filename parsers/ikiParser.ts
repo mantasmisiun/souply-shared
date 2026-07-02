@@ -195,6 +195,25 @@ function cleanProductName(name: string): string {
     .trim();
 }
 
+// A per-unit multi-buy calc row ("N vnt. X P,PP EUR/ vr") can get COLUMN-MERGED into the
+// product's NAME row and interleaved by x ("Žaliosios 2 vnt. X cukinijos 1,49 EUR/ VI",
+// receipt-214/215): the price ends up NON-adjacent to "vnt X", so T_UNIT_CALC_RE (which needs
+// them adjacent) never fires — the calc pollutes the name AND the qty stays 1. Recover it from
+// the assembled name: pull the unit count and strip the two calc fragments, returning the clean
+// name. Requires BOTH a "N vnt" lead AND a "P,PP EUR/…" price so a plain "2 vnt" in a real name
+// can't trigger it; unitQty is returned only for a genuine multi-buy (≥2).
+function extractInterleavedMultibuy(name: string): { name: string; unitQty: number | null } {
+  const qtyM = name.match(/\b(\d{1,3})\s*vnt\b/i);
+  const priceM = /\d{1,4}[.,]\s?\d{2}\s*EUR\s*\/?\s*[A-Za-z0-9]{0,3}/i.test(name);
+  if (!qtyM || !priceM) return { name, unitQty: null };
+  const n = parseInt(qtyM[1], 10);
+  const cleaned = name
+    .replace(/\b\d{1,3}\s*vnt\.{0,2}\s*[xX×*]?\s*/i, ' ')                 // "2 vnt. X "
+    .replace(/\d{1,4}[.,]\s?\d{2}\s*EUR\s*\/?\s*[A-Za-z0-9]{0,3}/i, ' ')  // "1, 49 EUR/ VI"
+    .replace(/\s+/g, ' ').trim();
+  return { name: cleaned, unitQty: n >= 2 ? n : null };
+}
+
 // ───────── detection ─────────
 
 export function isIkiReceipt(lines: string[]): boolean {
@@ -510,7 +529,7 @@ const T_KG_QTY_RE = /\d[.,]\s?\d{3}\s*kg\b/i;
 // UNIT-quantity calc row "N vnt. X P,PP EUR/ Vr" (per-unit-priced multi-buy, "Vr" = vienetui) — the
 // kg analogue of a weighed calc. Without it the whole calc string is mistaken for a product NAME
 // and steals the real product's total. Group 1 = the unit count.
-const T_UNIT_CALC_RE = /\b(\d{1,4})\s*vnt\.{0,2}\s*[xX×*]?\s*\d{1,4}[.,]\s?\d{2}\s*EUR\s*\/?\s*(?:Vr|vnt|vie|vnet)/i;   // \.{0,2}: OCR doubles the period ("2 vnt.. X 1,49 EUR/ Vr")
+const T_UNIT_CALC_RE = /\b(\d{1,4})\s*vnt\.{0,2}\s*[xX×*]?\s*\d{1,4}[.,]\s?\d{2}\s*EUR\s*\/?\s*(?:[VU][rint1l]|vnt|vie|vnet)/i;   // \.{0,2}: OCR doubles the period ("2 vnt.. X 1,49 EUR/ Vr"); suffix "Vr" (vienetui) OCR-garbles to VI/V1/Vt/Ur (receipt-214)
 const T_PERKG_RE = new RegExp(`(\\d{1,4}[.,]\\s?\\d+)\\s*[:;.]?\\s*${T_EUR}`, 'i'); // €/kg = number before EUR (tolerate a stray ":" OCR adds, "3,4: EUR")
 // "NUOLAIDA" but OCR-tolerant: the middle letters are routinely mangled on
 // thermal photos — "NUOLA1DA" (I→1), "NUOLAI DA" (one space), "NUOLA I DA"
@@ -661,6 +680,61 @@ const leadingKg = (t: string): string | null => {
   const m = t.match(T_KG_LEAD_RE);
   return m ? m[1].trim() : null;
 };
+
+// ───────── combo-set discount ─────────
+// A BARE "RINKINYS" line ("set") is IKI's multi-buy / combo-deal discount, not a
+// product — drop it. A REAL product always qualifies the word ("ŽALUMYNŲ RINKINYS",
+// "STIKLINIŲ RINKINYS …"), so only the standalone word is the combo line. Anchored
+// ^…$ on the letter-only name so a qualified product survives.
+// OCR-tolerant skeleton: the two "I" routinely read as T/1/L ("RINKTNYS", receipt-187)
+// and the "Y" is dropped or read as T/1/V ("RINKTN)S" → "RINKTNS", receipt-206).
+const RINKINYS_SKEL = /^R[IT1L]NK[IT1L]N[YT1V]?S$/;
+function isIkiComboSetName(name: string): boolean {
+  return RINKINYS_SKEL.test(stripDiacritics(name).replace(/[^A-Za-z]/g, '').toUpperCase());
+}
+
+// ───────── header-junk guard (product-name protection) ─────────
+// When the header/product boundary detection fails — e.g. the "PVM mokėtojo kodas"
+// line OCR-garbles so NONE of the pStart fallbacks fire (pStart stays 0, receipt-206
+// where "kodas"→"kolas") — the IKI store line, the store address and the VAT-code line
+// fold into the FIRST product's NAME ("IKI L  Vilniaus g…  PVM…kodas …  VIRTA DEŠRA").
+// These tokens NEVER occur in a real IKI product name, so strip a LEADING run of them
+// defensively: belt-and-suspenders on top of pStart, so product 1 can't absorb the header.
+function isIkiHeaderNamePart(part: string, storeAddress?: string): boolean {
+  const t = part.trim();
+  if (!t) return false;
+  // VAT / company registration block — tokens that never appear in a product name.
+  if (/\bP[VY][MN]\b/i.test(t)) return true;                        // "PVM" (OCR PVN / PYM …)
+  if (/mok[eė]t/i.test(t)) return true;                            // "mokėtojo" (kodas line)
+  if (/\bLietuva\b/i.test(t)) return true;                         // "IKI Lietuva, UAB"
+  if (/(^|[^A-Za-z])[UJ]A[B8]([^A-Za-z]|$)/i.test(t)) return true; // UAB / JAB / A8 company suffix
+  // IKI store-name header line — NARROW so IKI store-brand PRODUCTS ("IKI Pienas")
+  // are never touched: only the bare store line "IKI L", "IKI - …", "IKI Lietuva".
+  if (/^\W*IK[I1L!]\s*(?:[-–—]|L\b|LIET)/i.test(t)) return true;
+  // The store address the header scan already extracted, matched fuzzily (the name's
+  // word-box text ≈ header.storeAddress) — covers the address line even when the VAT
+  // line after it was dropped so the sandwich rule below can't reach it.
+  if (storeAddress) {
+    const norm = (s: string) => foldForeignDiacritics(s).toLowerCase().replace(/[^a-z0-9]/g, '');
+    const a = norm(t), b = norm(storeAddress);
+    if (a.length >= 6 && b.length >= 6 && (a === b || a.startsWith(b) || b.startsWith(a))) return true;
+  }
+  return false;
+}
+// Drop a LEADING run of header lines from a product's accumulated name parts. Finds the
+// last strong header marker within the leading window (never the FINAL part — that's the
+// real product name) and slices everything up to and including it. The address line,
+// sandwiched between the IKI line and the VAT line, is carried out with them even when it
+// isn't itself a recognised marker. Inert on the happy path (product 1 has no header parts).
+function stripIkiLeadingHeaderParts(parts: string[], storeAddress?: string): string[] {
+  if (parts.length <= 1) return parts;
+  const window = Math.min(parts.length - 1, 6);
+  let cut = -1;
+  for (let i = 0; i < window; i++) {
+    if (isIkiHeaderNamePart(parts[i], storeAddress)) cut = i;
+  }
+  return cut < 0 ? parts : parts.slice(cut + 1);
+}
 
 interface ThermalTok { text: string; src: IkiLine; }
 
@@ -1196,7 +1270,7 @@ function tileByContent(items: Array<{ dt: number; db: number; region: Region }>,
   }
 }
 
-export function parseIkiColumnar(lines: IkiLine[], start: number, end: number, skipped?: Region[]): IkiProduct[] {
+export function parseIkiColumnar(lines: IkiLine[], start: number, end: number, skipped?: Region[], headerAddr?: string): IkiProduct[] {
   const words = ikiCollectWords(lines, start, end);
   if (words.length < 2) return [];
   const lineH = emedian(words.map((w) => w.yBottom - w.yTop).filter((h) => h > 0)) || 24;
@@ -1219,7 +1293,14 @@ export function parseIkiColumnar(lines: IkiLine[], start: number, end: number, s
   const flush = () => {
     const c = cur; cur = fresh();
     if (!c.top) return;
-    const name = c.nameParts.map((s) => s.trim()).filter(Boolean).join(' ');
+    let name = stripIkiLeadingHeaderParts(c.nameParts, headerAddr).map((s) => s.trim()).filter(Boolean).join(' ');
+    // Recover a column-merged multi-buy calc that interleaved into the name (clean name + qty).
+    // Only when a clean calc ROW didn't already set unitQty (that path never dirties the name).
+    if (c.unitQty == null) {
+      const mb = extractInterleavedMultibuy(name);
+      name = mb.name;
+      if (mb.unitQty != null) c.unitQty = mb.unitQty;
+    }
     if (c.total == null && !ikiStrongName(name)) return; // guarded recovery
     const lt = c.total ?? 0;
     // LINE-TEXT weight recovery: MLKit sometimes drops the weight row's word-boxes, leaving
@@ -1296,6 +1377,9 @@ export function parseIkiColumnar(lines: IkiLine[], start: number, end: number, s
   let prevRow: ERow | null = null;
   for (const r of rows) {
     const afterFusedDepositLabel = prevRow?.depositFollows === true;
+    // The BAG's own price sits on the row right after the "MAIŠELIS PLASTIKINIS" skip
+    // row — remember that so the fold below can drop it (see the bag-price fold).
+    const afterBagSkip = prevRow?.isSkip === true && T_BAG_RE.test(rowText(prevRow));
     prevRow = r;
     // The deposit's own bare PRICE ("0,10") lands on the row right after a fused
     // "discount + DEPOSIT-label" row (the label having ridden the discount above). It
@@ -1318,6 +1402,17 @@ export function parseIkiColumnar(lines: IkiLine[], start: number, end: number, s
       afterFusedDepositLabel && cur.top != null &&
       depositLike && !rowVatLettered && r.discount === 0 && !r.perKg && !ikiStrongName(r.leftText)
     ) { cur.rows.push({ ...r, isSkip: true, isDeposit: true }); continue; }
+    // The BAG's OWN price ("0,01 A") sits on the row right after the "MAIŠELIS PLASTIKINIS"
+    // skip row (whose fused loyalty discount already went to the product above). It arrives
+    // NAMELESS with a tiny positive total, so the boundary logic below would mint it as a
+    // phantom product that NAME RECOVERY then labels with the PRIOR product's name
+    // ("Žaliosios cukinijos 0,01", receipt-214). A bag is a CHARGE, not a product — drop the
+    // row. Guards: a real product after a bag carries a NAME (ikiStrongName) and effectively
+    // never costs ≤ €0,50 nameless, so this fold can't eat one; a discount/weight row is excluded.
+    if (
+      afterBagSkip && r.total != null && r.total > 0 && r.total <= 0.5 &&
+      r.discount === 0 && !r.perKg && !ikiStrongName(r.leftText)
+    ) { continue; }
     if (r.isSkip) {
       // A bottle DEPOSIT belongs to the product ABOVE — fold it into that product's
       // rows so the SAME band covers it, but DON'T flush and DON'T add its amount
@@ -1858,17 +1953,13 @@ export function parseIkiColumnar(lines: IkiLine[], start: number, end: number, s
     }
   }
 
-  // COMBO-SET discount: a BARE "RINKINYS" line ("set") is IKI's multi-buy/combo deal discount, not a
-  // product — drop it. A REAL product always qualifies the word ("ŽALUMYNŲ RINKINYS", "STIKLINIŲ
-  // RINKINYS …"), so only the standalone word is the combo line. (receipt-169: "RINKINYS -1,90".)
-  // OCR-TOLERANT skeleton: the two "I" positions routinely read as T/1/L ("RINKTNYS", receipt-187).
-  // Anchored ^…$ on the letter-stripped name so a QUALIFIED product ("ŽALUMYNŲ RINKINYS" →
-  // "ZALUMYNURINKINYS") still survives — only the standalone combo word is dropped.
-  const RINKINYS_SKEL = /^R[IT1L]NK[IT1L]NYS$/;
-  return out.filter((o) => !RINKINYS_SKEL.test(stripDiacritics(o.p.name).replace(/[^A-Za-z]/g, '').toUpperCase())).map((o) => o.p);
+  // COMBO-SET discount: drop a bare "RINKINYS" line (IKI's multi-buy/combo deal), see
+  // isIkiComboSetName. Qualified products ("ŽALUMYNŲ RINKINYS") survive — only the
+  // standalone combo word is dropped. (receipt-169 "RINKINYS -1,90", receipt-206 "RINKTN)S".)
+  return out.filter((o) => !isIkiComboSetName(o.p.name)).map((o) => o.p);
 }
 
-function parseThermalProducts(lines: IkiLine[], start: number, end: number): IkiProduct[] {
+function parseThermalProducts(lines: IkiLine[], start: number, end: number, headerAddr?: string): IkiProduct[] {
   // 1) Explode OCR-fused rows into atomic tokens.
   const toks: ThermalTok[] = [];
   for (let i = start; i < end; i++) for (const tk of explodeThermalLine(lines[i])) toks.push(tk);
@@ -1883,6 +1974,9 @@ function parseThermalProducts(lines: IkiLine[], start: number, end: number): Iki
   let i = 0;
   while (i < toks.length) {
     if (!isNameStart(toks[i].text)) { i++; continue; }
+    // Header-junk guard: a store / address / VAT-code line that leaked into the
+    // product zone (pStart failed) must never START a product (see parseIkiColumnar).
+    if (isIkiHeaderNamePart(toks[i].text, headerAddr)) { i++; continue; }
     const name = toks[i].text;
 
     // 2) Block = tokens from here until the NEXT product name (bounded). Coupon /
@@ -2029,7 +2123,7 @@ function parseThermalProducts(lines: IkiLine[], start: number, end: number): Iki
   // parseIkiThermal's unified pass, AFTER the skipped coupon/bag/points lines are
   // threaded in — so here each product keeps its TRUE content box (name-top +
   // price-row-bottom corners). The tiler turns those into seams.
-  return out;
+  return out.filter((p) => !isIkiComboSetName(p.name));
 }
 
 function parseIkiThermal(lines: IkiLine[]): IkiParseResult {
@@ -2330,11 +2424,15 @@ function parseIkiThermal(lines: IkiLine[]): IkiParseResult {
   let pEnd = lines.length;
   for (let i = pStart; i < lines.length; i++) {
     const endText = lines[i].text;
-    // A "Prekiautojo …" line ends the product list when confirmed by a trader number / "ID", OR when
-    // it's a bare LABEL ending in a colon ("Prekiauto:" — the merchant/payment block header, its ID
-    // OCR-cut). The colon distinguishes the label from the "Prekiautojo nuolaida" PROMO line (no
-    // colon), which must NOT truncate the products. (receipt-166 payment block.)
-    const isTrader = T_TRADER_LINE_RE.test(endText) && (T_TRADER_NUM_RE.test(endText) || T_TRADER_ID_RE.test(endText) || (/:\s*$/.test(endText) && !/nuolaid/i.test(endText)));
+    // A "Prekiautojo …" line ends the product list — the merchant / payment-block header. Match
+    // the WHITESPACE-STRIPPED text so an OCR split ("Pr ekiaut o", receipt-212) is still caught,
+    // and accept a BARE trader header even when its ID was OCR-dropped/cut ("Prekiauto:",
+    // receipt-166). The ONE exception is the "Prekiautojo nuolaida" loyalty-discount PROMO, which
+    // prints mid-products and must NOT truncate — excluded by the nuolaid guard; a trader number /
+    // uppercase "ID" still qualifies a line on its own.
+    const endCompact = endText.replace(/\s+/g, '');
+    const isTrader = T_TRADER_LINE_RE.test(endCompact) &&
+      (!/nuolaid/i.test(endCompact) || T_TRADER_NUM_RE.test(endText) || T_TRADER_ID_RE.test(endText));
     if (T_PRODUCTS_END_RE.test(endText) || isTrader) {
       pEnd = i;
       // The LAST product's NUOLAIDA discount can OCR-fuse onto this footer-boundary line
@@ -2363,10 +2461,10 @@ function parseIkiThermal(lines: IkiLine[]): IkiParseResult {
   // COLUMN ENGINE dispatch (flag-gated): use it when enough per-word data exists
   // AND it actually yields products; otherwise fall back to the legacy tokenizer.
   const engineProducts = USE_COLUMN_ENGINE && ikiHasWords(lines, pStart, pEnd)
-    ? parseIkiColumnar(lines, pStart, pEnd, skippedRegions)
+    ? parseIkiColumnar(lines, pStart, pEnd, skippedRegions, storeAddress)
     : null;
   const usedEngine = !!engineProducts && engineProducts.length > 0;
-  const products = usedEngine ? engineProducts! : parseThermalProducts(lines, pStart, pEnd);
+  const products = usedEngine ? engineProducts! : parseThermalProducts(lines, pStart, pEnd, storeAddress);
 
   // ── TOP-SECTION band walls (skew-aware) ──
   // Tile the header bands like the products: each band's BOTTOM edge is pinned to

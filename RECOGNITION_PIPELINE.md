@@ -36,20 +36,22 @@ to understand it and the place to tune it.
 4. **Endpoint + client** (`storeProductController.ts`, `receipt-process.tsx`) —
    same-chain then cross-chain fallback; client auto-applies the SP at
    `match.autoApplyThreshold` (0.85). Cross-chain has its own
-   `match.minConfidenceCrossChain` knob (currently == same-chain).
+   `match.minConfidenceCrossChain` knob (0.55 — deliberately ABOVE same-chain's 0.4
+   since 2026-06-27; a weak cross-chain name hit is far likelier wrong).
 5. **Round-2 price** (`priceRound2Matcher.ts`) — as-of-receipt-date chain price;
    **confirm** (priceVerified), **disambiguate** pack-size only when name-tied
    (`price.nameTieDelta`), or **reject/re-pick** when the regular price is extreme
    (`price.rejectLow/High`). Fail-open. `RECOGNITION.price.*`
-6. **Resolve** (`receiptLineResolver.ts`) — reuse same-chain SP (reject >30% amount
-   or weighable-form mismatch), cross-chain bootstrap (price/amount gates), or
-   dedup-create. **Weighable self-heal:** a STRONG (`resolve.weighableSelfHealMin­Confidence`)
+6. **Resolve** (`receiptLineResolver.ts`) — NO-MINT: reuse a same-chain SP (reject >30%
+   amount or weighable-form mismatch), or accept a cross-chain match by REUSING a
+   same-chain SP of that Product (price/amount gates) — otherwise the line stays
+   UNMATCHED (`matchedSpId` NULL, ReceiptItem observation only). The resolver never
+   creates StoreProducts or Products (the pre-P3 dedup-create/bootstrap-mint is gone). **Weighable self-heal:** a STRONG (`resolve.weighableSelfHealMin­Confidence`)
    by-weight line ↔ no-fixed-pack packaged SP flips that SP to weighable
    (`markStoreProductWeighable`, idempotent, packaged→weighable only) and reuses it
-   instead of duplicating — one real receipt corrects a mislabeled `fasuoti` SP. A fresh SP only **clusters under the alt-match's `Product`** when
-   that match's confidence ≥ `resolve.autoBaseProductThreshold` (else it borrows the
-   categoryId only and mints a fresh Product — apples@0.51 never file under potatoes).
-   `allowCreate=false` blocks a fresh SP on a price≤0 garbled line. `RECOGNITION.resolve.*`
+   instead of duplicating — one real receipt corrects a mislabeled `fasuoti` SP. `allowCreate=false` (price≤0 garbled line) restricts the resolver to REUSE-only —
+   no match ⇒ source `skipped_unpriced`; with a usable price, no match ⇒ `unmatched`.
+   `RECOGNITION.resolve.*`
 7. **Price persistence** (`receiptSaveService.ts`) — clearance skip, implausibility
    skip, dup no-op. `RECOGNITION.price.*`
 8. **Display** (Items tab) — driven by the unified **itemConfidence** band.
