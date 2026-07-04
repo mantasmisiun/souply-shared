@@ -1588,7 +1588,22 @@ function ikiClassifyRow(ws: EWord[], lines: IkiLine[]): ERow {
         discLeft = cand;
       }
     }
-    return { ...base, discount: dv, mergedTotal: posTotal, discLabel: dv === 0, leftText: discLeft };
+    // A kg-CALC trapped in a label row (receipt-327): the same-line union can interleave a
+    // product's "1,250 kg X 1,39 EUR/kg" calc with its own NUOLAIDA label, and the composite
+    // classifies here as a DISCOUNT row — the calc VALUES then vanish from the stream, the
+    // next strong name finds cur.perKg null, no boundary fires, and the neighbour's name is
+    // absorbed. Carry the calc on the discount row (both assembler discount paths and the
+    // generic section already adopt perKg/kgVal/weigh — the DZIOVINTOS SLYVOS precedent).
+    // Gated on a REAL 3-decimal kg qty + readable €/kg in THIS row's words, so a neighbour's
+    // stray "EUR/kg" fragment alone can never fabricate weigh data.
+    const trapKg = base.kgQty ? leadingKg(text) : null;
+    const trapPerKg = trapKg != null ? extractPerKg(text) : null;
+    // On a trapped-calc row a MINUS-LESS loose amount is the garbled line TOTAL ("B6 A" for
+    // "0,86 A", 8→B), not a minus-dropped discount — the row-solver recovers the exact total
+    // from kg × €/kg, so booking the crumb as a discount only poisons the promo (receipt-327).
+    if (trapKg != null && trapPerKg != null && dv > 0 && !d && !/-/.test(text)) dv = 0;
+    return { ...base, discount: dv, mergedTotal: posTotal, discLabel: dv === 0, leftText: discLeft,
+      ...(trapKg != null && trapPerKg != null ? { kgVal: parseNum(trapKg), perKg: trapPerKg, weigh: true } : {}) };
   }
   if (amt != null && amt > 0) return { ...base, total: amt, trailDisc, leftText: text.replace(amtRe, '').trim() };
   // ── SOUP-ROW RECONSTRUCTION (FIX C, receipt-271) ── Dense pitch + curvature can attach a
