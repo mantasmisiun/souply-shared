@@ -1019,6 +1019,7 @@ interface ERow {
   softTotal?: boolean;                                               // `total` was RECOVERED from the source line (no word box) — must not anchor a product on a name-CONTINUATION row (the boxless value can be an MLKit leak onto a wrapped name)
   depositFollows?: boolean;                                          // this DISCOUNT row's source line had a bottle-deposit LABEL fused onto it ("-0,33 A DEP0ZITAS") — the deposit's own bare price sits on the NEXT row and must be folded (skipped), not made a phantom product
   discLabel?: boolean;                                               // this row carried a "NUOLAIDA …" discount LABEL but its amount was elsewhere (band-merged calc row) — the product HAS a discount, recover its amount from a following mis-clustered row
+  nameWs?: EWord[];                                                  // the below-the-label words the fused NEXT-name was rebuilt from (receipt-317/335) — the assembler bands ONLY these with the new product; the label words stay with the closing one
   topY: number; botY: number; leftX: number; slope: number;
 }
 const T_TRAIL_AMT_RE = /(-?\d{1,4}[.,]\s?\d{2})\s*(?:[ABC]\s*){0,2}$/;  // a line's trailing amount (tolerates a stray doubled VAT letter, receipt-271)
@@ -1427,7 +1428,33 @@ function ikiClassifyRow(ws: EWord[], lines: IkiLine[]): ERow {
     // negative amount so the weighed product keeps its promo instead of silently dropping it.
     // (`tot` above already excluded it: a negative fails the `> 0` gate.)
     const wneg = text.match(T_NEG_RE);
-    const weighDisc = wneg ? parseNum(wneg[1]) : 0;
+    let weighDisc = wneg ? parseNum(wneg[1]) : 0;
+    // SHATTERED PAIR-SOUP on the calc tail (receipt-335): the right-column discount AND
+    // total can BOTH shatter into orphan heads + bare cents and interleave x-wise onto
+    // this row ("… EUR/ kg -0, 0, 08 48 A" = -0,08 discount + 0,48 total — bananai lost
+    // its promo). Reuse the receipt-271 pairing (an orphan head pairs with the next bare
+    // 2-digit token) on the tokens AFTER the €/kg marker; committed only in the
+    // unambiguous shape — every head consumed, no foreign tokens, ≤1 positive,
+    // ≤1 negative, a VAT letter present — and never over values the strict lanes read.
+    if ((tot == null || totSoft) && weighDisc === 0) {
+      const tailIdx = text.search(/E[UÜŪF]?R\s*\/\s*k?[gqa9]?/i);
+      const tail = tailIdx >= 0 ? text.slice(tailIdx).replace(/^E[UÜŪF]?R\s*\/\s*k?[gqa9]?\.?/i, '') : '';
+      const toks = tail.split(/\s+/).filter(Boolean);
+      const amounts: number[] = []; const heads: string[] = [];
+      let vat = 0; let bad = toks.length === 0;
+      for (const tk of toks) {
+        if (/^-?\d{1,4}[.,]\d{1,2}$/.test(tk)) { amounts.push(parseNum(tk)); continue; }
+        if (/^-?\d{1,4}[.,]$/.test(tk)) { if (heads.length >= 2) { bad = true; break; } heads.push(tk); continue; }
+        if (/^\d{2}$/.test(tk) && heads.length) { amounts.push(parseNum(heads.shift()!.replace(',', '.') + tk)); continue; }
+        if (/^[ABC]$/.test(tk)) { vat++; continue; }
+        bad = true; break;
+      }
+      const pos = amounts.filter((v) => v > 0), neg = amounts.filter((v) => v < 0);
+      if (!bad && heads.length === 0 && vat >= 1 && pos.length <= 1 && neg.length <= 1 && pos.length + neg.length >= 1) {
+        if (neg.length) weighDisc = Math.abs(neg[0]);
+        if (pos.length && (tot == null || totSoft)) { tot = pos[0]; totSoft = true; }
+      }
+    }
     return { ...base, perKg: extractPerKg(text) ?? srcPerKg, total: tot, totSoft, discount: weighDisc, leftText: lead ? lead[1].trim() : '', weigh: true, kgVal };
   }
   const tm = text.match(T_TRAIL_AMT_RE);
@@ -1569,7 +1596,7 @@ function ikiClassifyRow(ws: EWord[], lines: IkiLine[]): ERow {
     // printed rows below). The per-WORD below-the-label filter carries the safety for both:
     // same-row garble ("wuniuy", "ŠI CO", the "SI" of a garbled SU) sits LEVEL with the label
     // and is excluded positionally; a fused next-name is always the printed row BELOW.
-    if ((dv > 0 || amt == null) && !ikiNameText(discLeft)) {
+    {
       const isLabelWord = (s: string) => /^[SŠ$5][UŲÙÚÜIĮ1l]$/i.test(s) || T_DISCOUNT_RE.test(s) ||
         isKorteleWord(s) || hasKeyword(s, LEX.NUOLAIDA);
       const lWs = ws.filter((w) => isLabelWord(w.text.trim()));
@@ -1583,9 +1610,18 @@ function ikiClassifyRow(ws: EWord[], lines: IkiLine[]): ERow {
           yC(w) >= labelY + wordH * 0.35;
       });
       const cand = nWs.map((w) => w.text).join(' ').trim();
-      if (nWs.length && lWs.length && ikiStrongName(cand) && !isTSkip(cand) &&
-          nWs.some((w) => w.text.replace(/[^A-Za-zĄČĘĖĮŠŲŪŽąčęėįšųūž]/g, '').length >= 4)) {
-        discLeft = cand;
+      const candOk = nWs.length > 0 && lWs.length > 0 && ikiStrongName(cand) && !isTSkip(cand) &&
+        nWs.some((w) => w.text.replace(/[^A-Za-zĄČĘĖĮŠŲŪŽąčęėįšųūž]/g, '').length >= 4);
+      if ((dv > 0 || amt == null) && !ikiNameText(discLeft)) {
+        if (candOk) {
+          discLeft = cand;
+          base.nameWs = nWs;   // band split: only these words open the next product
+        }
+      } else if (candOk && ikiNameText(discLeft)) {
+        // The regex strip already recovered the name (label printed FIRST, no interleave —
+        // receipt-335 "NUOLAIDA FAS. NILINIU TILAPIJU FIL"), but the BAND still needs the
+        // geometry split: the label sub-row's words belong with the CLOSING product.
+        base.nameWs = nWs;
       }
     }
     // A kg-CALC trapped in a label row (receipt-327): the same-line union can interleave a
@@ -2328,6 +2364,26 @@ export function parseIkiColumnar(lines: IkiLine[], start: number, end: number, s
       if (isKorteleWord(rowText(r))) cur.discPendingCard = true;
       labelDonated = true;
     }
+    // BAND SPLIT for a fused label+next-name row (receipt-335): only the NAME sub-row's
+    // words may open the next product — the LABEL sub-row prints under the CLOSING product
+    // and its words band with it (the NUOLAIDA line was riding the next product's band).
+    // The label remainder is pushed as a value-less row so it contributes geometry only.
+    if (r.discount === 0 && r.nameWs?.length && r.nameWs.length < r.words.length && cur.top != null) {
+      const nameSet = new Set(r.nameWs);
+      const rest = r.words.filter((w) => !nameSet.has(w));
+      if (rest.length) {
+        cur.rows.push({
+          ...r, words: rest, leftText: '', discount: 0, total: null, perKg: null, kgVal: null,
+          totUnknown: false, totCands: null, discLabel: false, weigh: false, kgQty: false,
+          topY: Math.min(...rest.map((w) => w.yTop)), botY: Math.max(...rest.map((w) => w.yBottom)),
+          leftX: Math.min(...rest.map((w) => w.xLeft)),
+        });
+        r.words = r.nameWs;
+        r.topY = Math.min(...r.nameWs.map((w) => w.yTop));
+        r.botY = Math.max(...r.nameWs.map((w) => w.yBottom));
+        r.leftX = Math.min(...r.nameWs.map((w) => w.xLeft));
+      }
+    }
     // SELF-HEAL (user rule): an IKI product has AT MOST two A-prices — one total
     // and one discount. A 3rd A-price proves two products were merged, so the 3rd
     // one opens a new product. This catches over-absorption even when a fused
@@ -2364,8 +2420,12 @@ export function parseIkiColumnar(lines: IkiLine[], start: number, end: number, s
       // This keeps each product's BAND over only its own words (the name's box no
       // longer leaks onto the prior product, nor the price-only box onto the next).
       const amtX = Math.min(Infinity, ...r.words.filter((w) => /^-?[\d]/.test(w.text.trim())).map((w) => w.xLeft));
-      const nameWs = r.words.filter((w) => w.xRight <= amtX - 1);
-      const amtWs = r.words.filter((w) => w.xRight > amtX - 1);
+      // When classify rebuilt the next-name from the BELOW-label words (r.nameWs), those and
+      // only those open the new product — the label words band with the closing one alongside
+      // the amount (receipt-335: the NUOLAIDA line rode the next product's band).
+      const nameSet = r.nameWs?.length ? new Set(r.nameWs) : null;
+      const nameWs = nameSet ? r.words.filter((w) => nameSet.has(w)) : r.words.filter((w) => w.xRight <= amtX - 1);
+      const amtWs = nameSet ? r.words.filter((w) => !nameSet.has(w)) : r.words.filter((w) => w.xRight > amtX - 1);
       const mkRow = (ws: EWord[]): ERow => ({
         ...r, words: ws.length ? ws : r.words,
         topY: Math.min(...(ws.length ? ws : r.words).map((w) => w.yTop)),
