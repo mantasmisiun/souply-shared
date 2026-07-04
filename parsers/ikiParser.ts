@@ -1624,6 +1624,15 @@ function ikiClassifyRow(ws: EWord[], lines: IkiLine[]): ERow {
         base.nameWs = nWs;
       }
     }
+    // LABEL-ROW RESIDUE SANITIZE (receipt-363): what remains after the label strip can be a
+    // CALC FRAGMENT from a band-merge ("IDA 39 EUR/ ka" — the tail of a destroyed
+    // "1,250 kg X 1,39 EUR/kg"), and it passed the name guards, gluing "39 EUR/ ka" into the
+    // next product's name. A €/kg marker or the absence of any ≥4-letter word disqualifies
+    // the residue as a name.
+    if (discLeft && (/E[UÜŪF]?R\s*\//i.test(discLeft) ||
+        !discLeft.split(/\s+/).some((t) => t.replace(/[^A-Za-zĄČĘĖĮŠŲŪŽąčęėįšųūž]/g, '').length >= 4))) {
+      discLeft = '';
+    }
     // A kg-CALC trapped in a label row (receipt-327): the same-line union can interleave a
     // product's "1,250 kg X 1,39 EUR/kg" calc with its own NUOLAIDA label, and the composite
     // classifies here as a DISCOUNT row — the calc VALUES then vanish from the stream, the
@@ -2472,6 +2481,13 @@ export function parseIkiColumnar(lines: IkiLine[], start: number, end: number, s
     // means the old one is done (prevents POMIDORAI absorbing RAUDONOSIOS).
     if ((strong || rTotal != null || r.totUnknown === true) && (cur.total != null || cur.totUnknown)) flush();
     else if (strong && cur.perKg != null) flush();
+    // LABEL-ROW BOUNDARY (receipt-363): a NUOLAIDA label prints at the END of its product's
+    // block, so a strong name arriving right after a discount/label row is a NEW product —
+    // even when the open product's total AND calc were both OCR-destroyed (kopūstai lost
+    // "1,250 kg X 1,39" entirely; without this the next product's name was absorbed). A
+    // wrapped name is never split by a label, so this can't cut a two-row name in half.
+    else if (strong && cur.top != null && cur.rows.length > 0 &&
+             (cur.rows[cur.rows.length - 1].discount > 0 || cur.rows[cur.rows.length - 1].discLabel === true)) flush();
     // TWIN PURCHASE (receipt-307): two consecutive IDENTICAL strong names are two UNITS of
     // the same item, never a wrapped name — IKI wraps long names, but a wrap never repeats
     // the WHOLE name. The open twin reached here totalless only because OCR destroyed its
