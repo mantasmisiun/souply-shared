@@ -639,7 +639,7 @@ const T_WEIGHT_LOOSE_RE = new RegExp(`\\bkg\\b\\s*[xXyY×*].*${T_EUR}`, 'i'); //
 // A weighed QUANTITY token ("0,470 kg", "2,090 kg") — 3-decimal kg. Survives even
 // when OCR drops the "X €/kg" tail (so the EUR-based weight test above misses it).
 // Every weighed IKI item prints exactly ONE, so a SECOND one = a new product.
-const T_KG_QTY_RE = /\d[.,]\s?\d{3}\s*[-–—·.]?\s*kg\b/i; // interpunct-tolerant (see T_KG_LEAD_RE)
+const T_KG_QTY_RE = /\d\s?[.,]\s?\d{3}\s*[-–—·.]?\s*kg\b/i; // interpunct-tolerant (see T_KG_LEAD_RE); \s? BEFORE the separator too ("1 ,250 kg", receipt-326)
 // UNIT-quantity calc row "N vnt. X P,PP EUR/ Vr" (per-unit-priced multi-buy, "Vr" = vienetui) — the
 // kg analogue of a weighed calc. Without it the whole calc string is mistaken for a product NAME
 // and steals the real product's total. Group 1 = the unit count.
@@ -823,7 +823,7 @@ export const extractPerKg = (t: string): number | null => {
 // IKI prints an interpunct between the quantity and the unit ("0, 245 · kg") which OCR
 // reads as a stray -/./· token — tolerate ONE such junk char so the quantity still binds
 // to its kg (receipt-242 paprikos: "0.245 - kg" lost the amount entirely).
-const T_KG_LEAD_RE = /(\d{1,4}(?:[.,]\s?\d+)?)\s*[-–—·.]?\s*k[gqa9]\b/i;
+const T_KG_LEAD_RE = /(\d{1,4}(?:\s?[.,]\s?\d+)?)\s*[-–—·.]?\s*k[gqa9]\b/i;
 const leadingKg = (t: string): string | null => {
   const m = t.match(T_KG_LEAD_RE);
   return m ? m[1].trim() : null;
@@ -1227,7 +1227,11 @@ function ikiClusterRows(words: EWord[], lineH: number, medSlope: number): EWord[
     // union the pair and ikiClassifyRow would then type the WHOLE merged row as a
     // deposit skip — silently deleting the product. Deposit amounts are handled by
     // the deposit-targeted re-home in ikiBuildRows instead.
-    return T_KG_QTY_RE.test(t) || T_UNIT_CALC_RE.test(t) ||
+    // Leading "<count> vnt." — a unit-calc FRAGMENT whose "EUR/ Vr" tail was carved off
+    // into the amount partition ("2 vnt. X 1,49"): T_UNIT_CALC_RE needs the EUR tail, but
+    // a row STARTING with a count can never stand alone; left unmerged it mints a phantom
+    // product and the real product loses its calc (receipt-324 Žaliosios cukinijos).
+    return T_KG_QTY_RE.test(t) || T_UNIT_CALC_RE.test(t) || /^\d{1,4}\s*vnt\.{0,2}\b/i.test(t) ||
       /E[UÜŪ]R\s*\//i.test(t) || /NUOL[A4]|[SŠ]U\s+K[O0]RT[EF][LI1]/i.test(t);
   };
   // Precompute per-ORIGINAL-row flags and forbid a just-merged row from unioning
@@ -1245,6 +1249,9 @@ function ikiClusterRows(words: EWord[], lineH: number, medSlope: number): EWord[
   for (let i = rows.length - 1; i > 0; i--) {
     if (merged.has(i) || merged.has(i - 1)) continue;
     const above = new Set(rows[i - 1].map((w) => w.line));
+    if (process.env.IKI_DEBUG_UNION && rows[i].some((w) => above.has(w.line))) {
+      console.error(`[UNION?] "${rows[i - 1].map((w) => w.text).join(' ')}" + "${rows[i].map((w) => w.text).join(' ')}" helpers=${helperFlag[i - 1]}/${helperFlag[i]}`);
+    }
     if (rows[i].some((w) => above.has(w.line)) && (helperFlag[i - 1] || helperFlag[i])) {
       rows[i - 1] = rows[i - 1].concat(rows[i]);
       rows.splice(i, 1);
@@ -1483,7 +1490,18 @@ function ikiClassifyRow(ws: EWord[], lines: IkiLine[]): ERow {
     // recover a word-dropped discount amount from the source line ("NUOLAIDA" word
     // survived, "-0,30 A" did not — but it's still in the line text)
     const d = text.match(T_NEG_RE) ?? firstSrc.match(T_NEG_RE);
-    const dv = d ? parseNum(d[1]) : (amt != null ? Math.abs(amt) : 0);
+    let dv = d ? parseNum(d[1]) : (amt != null ? Math.abs(amt) : 0);
+    // SHATTERED NEGATIVE (receipt-326): the amount broke into an orphan HEAD ("-0,") and a
+    // bare 2-digit CENTS token, x-scrambled on the label row ("NUOLAIDA SU KORTELE 25 A -0,").
+    // Pair them — a discount label row with a lone minus-head plus exactly one bare 2-digit
+    // token is that row's own amount, nothing else prints there.
+    if (dv === 0) {
+      const head = text.match(/-\s?(\d{0,4})[.,](?!\s?\d)/);
+      const centsToks = text.match(/(?:^|\s)(\d{2})(?=\s|$)/g);
+      if (head && centsToks && centsToks.length === 1) {
+        dv = parseNum(`${head[1] || '0'}.${centsToks[0].trim()}`);
+      }
+    }
     // MERGED ROW: when overlapping OCR boxes glue a product's OWN positive total onto its discount
     // row ("NUOLAIDA SU KORTELE -0,50 1,99 A A"), the discount-only return would LOSE the 1,99 and
     // the product vanishes (receipt-154 SUNOKE). Recover a positive VAT-lettered amount in the WORDS
@@ -1518,6 +1536,18 @@ function ikiClassifyRow(ws: EWord[], lines: IkiLine[]): ERow {
     // onto a neighbour). Flag discLabel so the assembler arms discPending and recovers the amount from
     // a following BAG row (receipt-162 Žaliosios cukinijos: the -1,80 rode the MAIŠELIS row).
     let discLeft = text.replace(amtRe, '').replace(T_DISCOUNT_RE, '').trim();
+    // LABEL GARBLE TOO STRONG FOR EVERY DETECTOR (receipt-320): "NUQLATNA SU KO E" — 3 edits
+    // from "nuolaida" (keyword budget is 2), no D for the regex skeleton, and "KO E" has no
+    // KORT shape for the kortelė test. The residue then passes ikiNameText and PREPENDS itself
+    // to the next product's name. Structural tell: a "NU… SU <crumbs>" lead where the remainder
+    // after the SU has NO word with ≥4 letters — a genuine fused next-name always has one
+    // (receipt-99 "NUOLAIDA RAUDONOSIOS PAPRIKOS"). Drop the whole residue as label rot.
+    {
+      const gl = discLeft.match(/^N[UV]\S{0,8}\s+[SŠ$5][UŲ]\b\s*(.*)$/i);
+      if (gl && !gl[1].split(/\s+/).some((t) => t.replace(/[^A-Za-zĄČĘĖĮŠŲŪŽąčęėįšųūž]/g, '').length >= 4)) {
+        discLeft = '';
+      }
+    }
     // INTERLEAVED UNION ROW (receipt-317): the same-line union in ikiClusterRows can merge the
     // "NUOLAIDA SU KORTELE" label with the NEXT product's NAME (both printed rows inside one
     // Vision line), and the x-sort INTERLEAVES them ("Fasuoti NUÓLAIDA obuoliai SU KORTELL IKI
@@ -1534,21 +1564,27 @@ function ikiClassifyRow(ws: EWord[], lines: IkiLine[]): ERow {
     //       so two 2-letter crumbs pass it),
     //   (c) the candidate's words sit CLEARLY BELOW the label words (≥ a third of the word
     //       height) — same-row garble sits level with the label and is rejected.
-    if (dv > 0 && !ikiNameText(discLeft)) {
-      const isLabelWord = (s: string) => /^[SŠ$5][UŲÙÚÜ]$/i.test(s) || T_DISCOUNT_RE.test(s) ||
+    // Fires for a row with a REAL discount amount (dv > 0) OR a pure LABEL row with no amount
+    // at all (amt == null — receipt-326: "NUOLAINA SI KORTFLE" + the next name, the -0,25
+    // printed rows below). The per-WORD below-the-label filter carries the safety for both:
+    // same-row garble ("wuniuy", "ŠI CO", the "SI" of a garbled SU) sits LEVEL with the label
+    // and is excluded positionally; a fused next-name is always the printed row BELOW.
+    if ((dv > 0 || amt == null) && !ikiNameText(discLeft)) {
+      const isLabelWord = (s: string) => /^[SŠ$5][UŲÙÚÜIĮ1l]$/i.test(s) || T_DISCOUNT_RE.test(s) ||
         isKorteleWord(s) || hasKeyword(s, LEX.NUOLAIDA);
       const lWs = ws.filter((w) => isLabelWord(w.text.trim()));
+      const yC = (w: EWord) => (w.yTop + w.yBottom) / 2;
+      const wordH = emedian(ws.map((w) => w.yBottom - w.yTop));
+      const labelY = lWs.length ? emedian(lWs.map(yC)) : Infinity;
       const nWs = ws.filter((w) => {
         const s = w.text.trim();
         return !/\d/.test(s) && !isLabelWord(s) &&
-          s.replace(/[^A-Za-zĄČĘĖĮŠŲŪŽąčęėįšųūž]/g, '').length >= 2;
+          s.replace(/[^A-Za-zĄČĘĖĮŠŲŪŽąčęėįšųūž]/g, '').length >= 2 &&
+          yC(w) >= labelY + wordH * 0.35;
       });
-      const yC = (w: EWord) => (w.yTop + w.yBottom) / 2;
-      const wordH = emedian(ws.map((w) => w.yBottom - w.yTop));
       const cand = nWs.map((w) => w.text).join(' ').trim();
       if (nWs.length && lWs.length && ikiStrongName(cand) && !isTSkip(cand) &&
-          nWs.some((w) => w.text.replace(/[^A-Za-zĄČĘĖĮŠŲŪŽąčęėįšųūž]/g, '').length >= 4) &&
-          emedian(nWs.map(yC)) >= emedian(lWs.map(yC)) + wordH * 0.35) {
+          nWs.some((w) => w.text.replace(/[^A-Za-zĄČĘĖĮŠŲŪŽąčęėįšųūž]/g, '').length >= 4)) {
         discLeft = cand;
       }
     }
@@ -1598,6 +1634,20 @@ function ikiClassifyRow(ws: EWord[], lines: IkiLine[]): ERow {
       // the garbled amount text must NOT ride into the product name
       const leftText = text.slice(0, um.index! + um[1].length).trim();
       return { ...base, totUnknown: true, totCands: cands, trailDisc, leftText };
+    }
+  }
+  // SHATTERED-DECIMAL total (receipt-326): the amount's comma AND VAT letter are destroyed,
+  // leaving TWO bare digit words after the name ("BILLA BIO LINU SEMENU ALI 3 49" for
+  // "… 3,49 A"). A name never ends in an int + 2-digit pair, so read it as an UNKNOWN total
+  // with a single candidate (3,49) and known cents — recon corroborates before it commits.
+  // Without this the product is totalless, the boundary at the NEXT name never fires, and
+  // two products fuse into one band.
+  {
+    const sd = text.match(/^(.{8,}?[A-Za-zĄČĘĖĮŠŲŪŽąčęėįšųūž])\s+(\d{1,4})\s+(\d{2})\s*$/);
+    if (sd && amt == null && trailDisc === 0 && trailTotal === 0 &&
+        ikiStrongName(sd[1]) && !isTDiscount(text) && !isTDiscount(firstSrc)) {
+      const cand = Number(sd[2]) + Number(sd[3]) / 100;
+      return { ...base, totUnknown: true, totCands: cand > 0 ? [round2(cand)] : null, unkCents: Number(sd[3]), leftText: sd[1].trim() };
     }
   }
   // HEADLESS BARE-CENTS total (receipt-308): the OCR drops the amount's integer+comma,
@@ -1759,7 +1809,35 @@ function ikiBuildRows(words: EWord[], lineH: number, splitH: number, medSlope: n
       }
     }
     const aLines = linesOf(amt);
-    let host = hosts.find((h) => [...aLines].some((ln) => h.lines.has(ln)));   // (1) MLKit grouped them
+    // (1) OCR grouped them into one source line. "Same source line" is no longer "same printed
+    // row": a Vision line glues 2-3 PRINTED ROWS into one (receipt-318: name + kg-calc + a
+    // smeared amount), so SEVERAL hosts share the amount's line and first-match binds it to the
+    // TOP-MOST (the NAME row, a full pitch away) instead of its true row right beside it —
+    // turning the name row into a fake discount row and cascading mis-attribution. Tie-break
+    // SEMANTICALLY, not by plain distance (a pure nearest-Y flip broke pinned 152/172, where
+    // the top-most host IS correct): an amount fragment carrying the "EUR/" €-per-kg tail
+    // belongs with a CALC row — one with a leading kg quantity OR a leading "<count> vnt."
+    // unit count (receipt-324's shape) — never a name row; prefer the nearest such host.
+    // Everything else keeps first-match.
+    const sameLine = hosts.filter((h) => [...aLines].some((ln) => h.lines.has(ln)));
+    let host: { ws: EWord[]; lines: Set<number> } | undefined = sameLine[0];
+    if (sameLine.length > 1) {
+      const aNs = amt.map(normOf);
+      const rowMates = sameLine.filter((h) =>
+        h.ws.some((hw) => aNs.some((an) => Math.abs(normOf(hw) - an) < splitH * 0.5)));
+      if (rowMates.length >= 1) host = rowMates[0];
+    }
+    if (sameLine.length > 1 && /e[uü]?r\s*\//i.test(amt.map((w) => w.text).join(' '))) {
+      const calcish = (h: { ws: EWord[] }) => {
+        const t = [...h.ws].sort((a, b) => a.xLeft - b.xLeft).map((w) => w.text).join(' ');
+        return leadingKg(t) != null || /^\d{1,4}\s*vnt\.{0,2}\b/i.test(t);
+      };
+      const calcHosts = sameLine.filter(calcish);
+      if (calcHosts.length) {
+        const aN = normA(amt);
+        host = calcHosts.reduce((b, h) => (Math.abs(norm(h.ws) - aN) < Math.abs(norm(b.ws) - aN) ? h : b), calcHosts[0]);
+      }
+    }
     // LEADING-DISCOUNT GUARD: MLKit fuses a product's "-X,XX A" discount onto the NEXT product's
     // NAME line ("-0,60 A KETO LENGVAI…"), so rule (1) binds the discount to that next product — but
     // the discount sits a full line ABOVE the name (it belongs to the row above). When the same-line
@@ -1990,6 +2068,29 @@ export function parseIkiColumnar(lines: IkiLine[], start: number, end: number, s
           // exactly or the equation wins (even a 1-cent drift on a RISKY lane is a miss).
           if (process.env.IKI_DEBUG) console.log(`[SOLVER] overruled soft total ${c.total} → ${expectTot} (${c.kgVal} kg × ${c.perKg} €/kg)`);
           c.total = expectTot;
+        } else if (!c.totSoft && Math.abs(c.total - expectTot) > 0.02) {
+          // STRICT-TRIPLE CONTRADICTION → QTY repair (receipt-326): all three read strict but
+          // kg × €/kg ≠ total by far more than rounding ("0,175 kg X 2,49 … 1,18 A": 0,44 vs
+          // 1,18). The total and €/kg agree with each other under a DIFFERENT quantity — if a
+          // 3-decimal qty consistent with them (round2(q × €/kg) = total) sits ONE OCR-digit
+          // from the read ("0,475" vs "0,175", the classic 1↔4), the read qty is the garble:
+          // adopt the solved one. A strict TOTAL is still never rewritten; anything further
+          // than one digit stays a receipt-level flag (Phase 2), not a silent fix.
+          const q0 = c.total / c.perKg;
+          const readStr = c.kgVal.toFixed(3).replace('.', '');
+          for (let m = Math.max(1, Math.round((q0 - 0.005) * 1000)); m <= Math.round((q0 + 0.005) * 1000); m++) {
+            const q = m / 1000;
+            if (round2(q * c.perKg) !== c.total) continue;
+            const qs = q.toFixed(3).replace('.', '');
+            if (qs.length !== readStr.length) continue;
+            let diff = 0;
+            for (let i = 0; i < qs.length; i++) if (qs[i] !== readStr[i]) diff++;
+            if (diff <= 1) {
+              if (process.env.IKI_DEBUG) console.log(`[SOLVER] repaired qty ${c.kgVal} → ${q} (${q} kg × ${c.perKg} €/kg = ${c.total})`);
+              c.kgVal = q;
+              break;
+            }
+          }
         }
       }
     }
@@ -2200,6 +2301,18 @@ export function parseIkiColumnar(lines: IkiLine[], start: number, end: number, s
     const softCont = r.softTotal === true && cur.top != null && cur.total == null && cur.nameParts.length >= 1;
     const rTotal = softCont ? null : r.total;                              // effective total for assembly
     const carriesAmt = rTotal != null || r.discount > 0 || r.totUnknown === true; // an A-terminated price (incl. unreadable)
+    // An amount-less LABEL row whose leftText is the NEXT product's name (receipt-326
+    // "NUOLAINA SI KORTFLE" fused with "RAUDONOSIOS PAPRIKOS"): the LABEL belongs to the
+    // product being CLOSED (IKI prints the discount under its own product) while the name
+    // opens the next. Arm discPending on the OPEN product before the boundary below flushes
+    // it — otherwise the pending label rides the NEW product and the sutaupėte savings pin
+    // lands the previous product's discount on its neighbour.
+    let labelDonated = false;
+    if (r.discLabel && strong && cur.top != null) {
+      cur.discPending = true;
+      if (isKorteleWord(rowText(r))) cur.discPendingCard = true;
+      labelDonated = true;
+    }
     // SELF-HEAL (user rule): an IKI product has AT MOST two A-prices — one total
     // and one discount. A 3rd A-price proves two products were merged, so the 3rd
     // one opens a new product. This catches over-absorption even when a fused
@@ -2309,7 +2422,7 @@ export function parseIkiColumnar(lines: IkiLine[], start: number, end: number, s
     else if (r.totUnknown === true && cur.total == null && !cur.totUnknown) {
       cur.totUnknown = true; cur.totCands = r.totCands ?? null; cur.unkCents = r.unkCents ?? null; cur.price = r; cur.aCount++;
     }
-    if (r.discLabel) {
+    if (r.discLabel && !labelDonated) {
       cur.discPending = true;   // calc row carried a NUOLAIDA label w/o amount → recover it from a later row
       // card-flavored label ("… SU KORTELE") — feeds the sutaupėte savings equation
       if (isKorteleWord(rowText(r))) cur.discPendingCard = true;
@@ -3434,7 +3547,13 @@ function parseIkiThermal(lines: IkiLine[]): IkiParseResult {
   // after the LAST amount-bearing line — nothing below it can be a product, whatever the
   // walls missed. (+3 margin: a trailing discount row / deposit label / wrapped name.)
   {
-    const amtLineRe = /\d{1,4}[.,]\s?\d{2}\s*(?:[ABC]\s*)*$|\d{1,4}[.,]\s?\d{2}\s*[ABC]\b/;
+    // Amount-bearing also when the amount itself is GARBLED (receipt-326: the last items'
+    // rows read ", 86 A" — headless cents — and "…1,39 EUR/ kg" — a per-kg calc with no
+    // trailing total; both failed the strict shapes, lastAmt landed 4 rows early and the
+    // guard cut the final discount row out of the zone). Headless "[.,]NN A" and an
+    // "EUR/" per-kg marker count; the keyword walls above still bound the zone, this
+    // guard only ever SHRINKS it.
+    const amtLineRe = /\d{1,4}[.,]\s?\d{2}\s*(?:[ABC]\s*)*$|\d{1,4}[.,]\s?\d{2}\s*[ABC]\b|[.,]\s?\d{2}\s*[ABC]\b|E[UÜŪF]?R\s*\//i;
     let lastAmt = -1;
     for (let i = pStart; i < pEnd; i++) {
       if (amtLineRe.test(lines[i].text)) lastAmt = i;
@@ -3780,6 +3899,34 @@ function parseIkiThermal(lines: IkiLine[]): IkiParseResult {
       // whose amount was glyph-shredded), else on the Grynieji line the value came from.
       const anchor = mokLineNoAmt ?? grynLine;
       if (anchor) footerRegions.push(footBand(anchor, 'total', String(total)));
+    }
+  }
+  // VAT-IDENTITY recovery (receipt-326): the Mokėti amount AND the "Suma su PVM" header row were
+  // both destroyed AND the cash lane above could not fire, but the VAT-breakdown row survived ("A 21,00 % 5,37 7, 10 1,23"). The row is
+  // SELF-VALIDATING: total × 21/121 = the printed VAT to the cent (7,10 → 1,23 ✓), so scan any
+  // 21%-marked line for an amount pair (T, V) with round2(T·0.21/1.21) = V and adopt T. A random
+  // pair almost never satisfies the identity, and the %-guard keeps the rate itself out.
+  if (total == null) {
+    for (const l of lines) {
+      if (!/21[.,]\s?00\s*%|\b21\s*%/.test(l.text)) continue;
+      const vals: { v: number; s: string }[] = [];
+      for (const m of l.text.matchAll(/(\d{1,4}[.,]\s?\d{2})/g)) {
+        const after = l.text.slice((m.index ?? 0) + m[0].length, (m.index ?? 0) + m[0].length + 3);
+        if (after.includes('%')) continue;
+        vals.push({ v: parseNum(m[1]), s: m[1] });
+      }
+      for (const t of vals) {
+        if (total != null) break;
+        for (const v of vals) {
+          if (t === v || t.v <= v.v) continue;
+          if (Math.abs(round2((t.v * 0.21) / 1.21) - v.v) <= 0.005) {
+            total = t.v;
+            footerRegions.push(footBand(l, 'total', t.s));
+            break;
+          }
+        }
+      }
+      if (total != null) break;
     }
   }
   // Date + time bands: one combined 'dateTime' band when they share a line,
