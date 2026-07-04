@@ -3316,6 +3316,13 @@ function parseIkiThermal(lines: IkiLine[]): IkiParseResult {
     // company suffix so the company line empties out and the scan moves to the real address line below
     // (else "iKI Lietuva, A8" itself is taken as the address — receipt-170).
     let stripped = lines[i].text.replace(/^.*?Lietuva,?\s*U?A[B8]?\s*/i, '').trim();
+    // REVERSED company order ("UAB IKI Lietuva, Vilniaus g. 220-1, Siauliai", receipt-313):
+    // the strip above only consumes a "…Lietuva, UAB" SUFFIX — with UAB leading, nothing
+    // strips and the "Lietuva" reject below vetoes the fused line (address invisible, no
+    // band). Strip a LEADING "UAB … Lietuva," block too.
+    if (stripped === lines[i].text.trim()) {
+      stripped = lines[i].text.replace(/^\s*U?A[B8]\b[^,]{0,20}?Lietuva[,.]?\s*/i, '').trim();
+    }
     // The address is often OCR-fused onto the PVM/company-code line ("…Šiauliai Pyw
     // mokttoo kodas I101027210", receipt 117). Cut that trailing "PVM…kodas <code>"
     // run so the address survives instead of being rejected for containing "kodas".
@@ -3870,7 +3877,13 @@ function parseIkiThermal(lines: IkiLine[]): IkiParseResult {
       const cands: number[] | null = u._unk.cands;
       // Bare-cents corroboration: a headless "59" pins the solved total's cents.
       const centsOk = u._unk.cents == null || Math.round(solvedTot * 100) % 100 === u._unk.cents;
-      const fits = solvedTot > 0 && reconDelta > 0 && centsOk &&
+      // SEGMENTATION GUARD (receipt-313): an unknown whose NAME carries embedded amount
+      // tokens ("MAGIJA … 0,65 84 A A") is a MIS-SEGMENTED group, not one product — the
+      // solve would absorb a swallowed neighbour's money and falsely reconcile (masking
+      // the error from the user AND from the Phase-5 ensemble, which trusts `reconciled`).
+      // Leave it flagged; the ensemble/second opinion owns structure, arithmetic owns values.
+      const nameClean = !/\d[.,]\s?\d{2}|\s\d{2,}\s+[ABC](?:\s|$)/.test(u.name ?? '');
+      const fits = solvedTot > 0 && reconDelta > 0 && centsOk && nameClean &&
         (cands == null || cands.some((cv: number) => Math.abs(cv - solvedTot) <= 0.005));
       if (fits) {
         const qty = u.quantity && u.quantity > 0 ? u.quantity : 1;
@@ -3896,7 +3909,8 @@ function parseIkiThermal(lines: IkiLine[]): IkiParseResult {
       // per×N re-sums to the delta within one display-rounding cent. Wrong-name or
       // wrong-cents mixes fall through to the honest flag.
       const norm2 = (v: string) => foldForeignDiacritics(v).toLowerCase().replace(/[^a-z0-9]/g, '');
-      const sameName = unknowns.length >= 2 && unknowns.every((u) => u._unk && norm2(u.name) === norm2(unknowns[0].name));
+      const cleanNames = unknowns.every((u) => !/\d[.,]\s?\d{2}|\s\d{2,}\s+[ABC](?:\s|$)/.test(u.name ?? ''));
+      const sameName = cleanNames && unknowns.length >= 2 && unknowns.every((u) => u._unk && norm2(u.name) === norm2(unknowns[0].name));
       const per = round2(reconDelta / unknowns.length);
       const eachFits = sameName && per > 0 && reconDelta > 0 && unknowns.every((u) => {
         const centsOk = u._unk.cents == null || Math.round(per * 100) % 100 === u._unk.cents;
