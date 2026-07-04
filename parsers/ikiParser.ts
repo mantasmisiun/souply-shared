@@ -1517,7 +1517,42 @@ function ikiClassifyRow(ws: EWord[], lines: IkiLine[]): ERow {
     // dv===0 ⇒ a "NUOLAIDA" label whose amount didn't land in this row's text (dropped or band-merged
     // onto a neighbour). Flag discLabel so the assembler arms discPending and recovers the amount from
     // a following BAG row (receipt-162 Žaliosios cukinijos: the -1,80 rode the MAIŠELIS row).
-    return { ...base, discount: dv, mergedTotal: posTotal, discLabel: dv === 0, leftText: text.replace(amtRe, '').replace(T_DISCOUNT_RE, '').trim() };
+    let discLeft = text.replace(amtRe, '').replace(T_DISCOUNT_RE, '').trim();
+    // INTERLEAVED UNION ROW (receipt-317): the same-line union in ikiClusterRows can merge the
+    // "NUOLAIDA SU KORTELE" label with the NEXT product's NAME (both printed rows inside one
+    // Vision line), and the x-sort INTERLEAVES them ("Fasuoti NUÓLAIDA obuoliai SU KORTELL IKI
+    // ÜKIS -0,23"). The regex strip above then leaves label residue in leftText, ikiNameText
+    // rejects it, and the next product goes nameless ("?"). Rebuild from the WORDS: drop
+    // amount-shaped / short / label words; adopt what remains ONLY when it is a STRONG name
+    // whose words sit at/BELOW the label words — a fused next-name is always the printed row
+    // UNDER its neighbour's label. Fires only when the plain strip yielded no usable name.
+    // Three guards keep this from minting phantoms out of label GARBLE (the trailer rot
+    // "wuniuy uU KURTELA", receipt-234, or same-row crumbs "ŠI CO", receipt-152):
+    //   (a) dv > 0 — the row carries a REAL discount amount (the fused shape always does;
+    //       a bare garbled label has nothing to anchor it),
+    //   (b) the candidate has a ≥4-letter WORD (ikiStrongName counts letters ACROSS words,
+    //       so two 2-letter crumbs pass it),
+    //   (c) the candidate's words sit CLEARLY BELOW the label words (≥ a third of the word
+    //       height) — same-row garble sits level with the label and is rejected.
+    if (dv > 0 && !ikiNameText(discLeft)) {
+      const isLabelWord = (s: string) => /^[SŠ$5][UŲÙÚÜ]$/i.test(s) || T_DISCOUNT_RE.test(s) ||
+        isKorteleWord(s) || hasKeyword(s, LEX.NUOLAIDA);
+      const lWs = ws.filter((w) => isLabelWord(w.text.trim()));
+      const nWs = ws.filter((w) => {
+        const s = w.text.trim();
+        return !/\d/.test(s) && !isLabelWord(s) &&
+          s.replace(/[^A-Za-zĄČĘĖĮŠŲŪŽąčęėįšųūž]/g, '').length >= 2;
+      });
+      const yC = (w: EWord) => (w.yTop + w.yBottom) / 2;
+      const wordH = emedian(ws.map((w) => w.yBottom - w.yTop));
+      const cand = nWs.map((w) => w.text).join(' ').trim();
+      if (nWs.length && lWs.length && ikiStrongName(cand) && !isTSkip(cand) &&
+          nWs.some((w) => w.text.replace(/[^A-Za-zĄČĘĖĮŠŲŪŽąčęėįšųūž]/g, '').length >= 4) &&
+          emedian(nWs.map(yC)) >= emedian(lWs.map(yC)) + wordH * 0.35) {
+        discLeft = cand;
+      }
+    }
+    return { ...base, discount: dv, mergedTotal: posTotal, discLabel: dv === 0, leftText: discLeft };
   }
   if (amt != null && amt > 0) return { ...base, total: amt, trailDisc, leftText: text.replace(amtRe, '').trim() };
   // ── SOUP-ROW RECONSTRUCTION (FIX C, receipt-271) ── Dense pitch + curvature can attach a
@@ -1798,6 +1833,9 @@ function ikiBuildRows(words: EWord[], lineH: number, splitH: number, medSlope: n
   const rows = [...hosts.map((h) => h.ws), ...standalone];
   rows.sort((a, b) => norm(a) - norm(b));
   for (const r of rows) r.sort((a, b) => a.xLeft - b.xLeft);
+  if (process.env.IKI_DEBUG_ROWS) {
+    for (const r of rows) console.error(`[ROW] norm=${norm(r).toFixed(0)} "${r.map((w) => w.text).join(' ')}"`);
+  }
   return rows;
 }
 
