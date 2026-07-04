@@ -284,6 +284,42 @@ export const RECOGNITION = {
     baselineWindow: 5,
     /** Cap swipe candidates stored per line. @ref receiptSaveService.ts:21 */
     maxCandidatesPerLine: 5,
+
+    // ── Round-2.5 price-scoped RESCUE FISHING (priceRound2Matcher.fishPriceScopedCandidates) ──
+    // For a line still UNLINKED after Rounds 1+2: fish same-chain SPs whose REGULAR price
+    // matches the line's printed regular (€/kg for weighed), then re-score names WITHIN that
+    // small price-vetted pool at a relaxed token floor. The result is never auto-linked — it
+    // feeds altMatches so the proposed-card swipe can ask the user (confirm once → vocabulary
+    // alias learns it forever). Receipt-237 salmon: the correct SP's genitive-inflected name
+    // scored 0 at the strict floor but ~0.5 relaxed; its regular 16.99 was shared by only 9
+    // SPs chain-wide — price narrows the pool enough that the relaxed floor is safe.
+    /** Regular-price date window around the receipt date, BOTH directions (scrapes are weekly;
+     *  SPs get minted/renamed continuously, so a just-minted SP's first price may postdate an
+     *  older receipt). */
+    fishWindowDays: 60,
+    /** Cap on the price-vetted pool per line (safety against ultra-common price points). */
+    fishPoolMax: 150,
+    /** ABSOLUTE tolerance for the fishing price anchor. Deliberately tighter than the
+     *  Round-2 confirm tolerance (1% rel): regulars print to the cent, and at common price
+     *  points a relative band floods the pool with unrelated products. */
+    fishPriceTolAbs: 0.02,
+    /** Relaxed per-token Levenshtein floor used ONLY within the price-vetted pool. */
+    fishTokenMatchThreshold: 0.6,
+    /** Minimum relaxed name score for a fished candidate to enter altMatches. */
+    fishMinNameScore: 0.45,
+    /** Ranking bonus for price-anchored candidates when ordering altMatches / picking the
+     *  proposed card (never used for auto-linking). */
+    fishPriceBonus: 0.2,
+    /** Max fished candidates appended per line. */
+    fishMaxPerLine: 2,
+    /** SELECTIVITY gate: skip fishing when the price+date range matches more Price rows
+     *  than this — a super-common price point (1.99: 500k+ rows) carries no identity
+     *  signal AND its pool query is the expensive kind (12s unhinted, receipt-238 save
+     *  hang). Checked with a bounded index-range count (~30-90ms). */
+    fishSelectivityMaxRows: 150_000,
+    /** Hard TIME BUDGET for the whole fishing pass per receipt — fishing runs inside the
+     *  save request; once exceeded, remaining lines are skipped (fail-open). */
+    fishTimeBudgetMs: 2500,
   },
 
   // ── Unified per-item confidence score (NEW — computed in priceRound2Matcher) ──

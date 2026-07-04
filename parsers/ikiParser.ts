@@ -115,6 +115,18 @@ export interface IkiFooter {
   receiptNo: string;             // CANONICAL id (= receiptNos[0]) — backwards-compatible single value
   receiptNos: string[];          // every distinct receipt identifier on the footer (canonical first)
   totalSavings: number | null;
+  /** POSITIVE magnitude of IKI's bare-"RINKINYS" combo/set-deal discounts (the dropped
+   *  rows' negatives, e.g. 1.90 for "RINKINYS -1,90"), null when none. A receipt-LEVEL
+   *  adjustment: the paid total is Σproducts − comboDiscount. Deliberately NOT distributed
+   *  onto products (which product(s) form the bundle is unknown — distributing would poison
+   *  per-product reference prices). Additive field — old consumers ignore it. */
+  comboDiscount: number | null;
+  /** Phase-2 receipt reconciliation: true = Σ line-paids + dropped charges − combo equals the
+   *  printed total to the cent (prices corroborated); false = the books don't balance or an
+   *  unknown couldn't be pinned (honest flag); undefined = not checked (legacy engine /
+   *  fallback total). Additive optional fields — old consumers ignore them. */
+  reconciled?: boolean;
+  reconDelta?: number;
   rawText: string;
   region: Region;
   lineRegions: LabeledRegion[];
@@ -128,6 +140,99 @@ export interface IkiParseResult {
    *  distinct (grey) bands in the photo view but never counted as products. */
   skippedRegions?: LabeledRegion[];
 }
+
+// ── LITHUANIAN RECEIPT KEYWORD LEXICON (Phase 3, shared/ROBUST_PARSING_PLAN.md) ──
+// ONE fuzzy matcher for receipt label words instead of a skeleton regex per keyword per
+// garble: FOLD (lowercase → de-diacritic → confusion-glyph map → strip non-letters,
+// spaces included) → banded edit-distance SUBSTRING match with a per-keyword budget →
+// per-keyword REJECT guards (KORIANDRAS is not KORTELĖ). A new garble is either inside
+// the budget already (zero code) or a one-line data entry. Inlined here (not a module)
+// because shared parsers are single-file by convention — Metro/jest resolve value
+// imports differently than the api's nodenext tsc; extract once both are configured.
+// Exported for tests and for the other chain parsers when they migrate.
+
+export interface LexKeyword {
+  word: string;
+  /** max edit distance; default ceil(len/4) capped at 3 */
+  budget?: number;
+  rejects?: string[];
+}
+
+const GLYPH_LEX_FOLD: Record<string, string> = {
+  '0': 'o', '1': 'i', '|': 'i', '!': 'i', 'l': 'i', 'í': 'i', 'ì': 'i',
+  '5': 's', '$': 's', '8': 'b', '6': 'b', '2': 'z', '7': 'z', '9': 'g', '4': 'a',
+  '3': 'e', '€': 'e', '(': 'c', '{': 'c', '[': 'c',
+};
+
+export function foldLex(s: string): string {
+  let out = '';
+  const lowered = s.toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '');
+  for (const ch of lowered) {
+    const mapped = GLYPH_LEX_FOLD[ch] ?? ch;
+    if (/[a-z]/.test(mapped)) out += mapped;
+  }
+  return out;
+}
+
+/** Approximate-substring edit distance (free start/end in `text`), banded at maxDist. */
+export function substringEditDistance(pattern: string, text: string, maxDist: number): number {
+  const m = pattern.length, n = text.length;
+  if (m === 0) return 0;
+  if (n === 0) return m > maxDist ? Infinity : m;
+  let prev = new Array<number>(n + 1).fill(0);
+  for (let i = 1; i <= m; i++) {
+    const cur = new Array<number>(n + 1);
+    cur[0] = i;
+    let rowMin = cur[0];
+    for (let j = 1; j <= n; j++) {
+      const sub = prev[j - 1] + (pattern[i - 1] === text[j - 1] ? 0 : 1);
+      cur[j] = Math.min(sub, prev[j] + 1, cur[j - 1] + 1);
+      if (cur[j] < rowMin) rowMin = cur[j];
+    }
+    if (rowMin > maxDist) return Infinity;
+    prev = cur;
+  }
+  let best = Infinity;
+  for (let j = 0; j <= n; j++) if (prev[j] < best) best = prev[j];
+  return best <= maxDist ? best : Infinity;
+}
+
+const lexBudget = (len: number) => Math.min(3, Math.ceil(len / 4));
+
+/** Best in-budget occurrence distance of `kw` in the line (0 = printed cleanly), or
+ *  null when absent / better explained by a reject word. */
+export function keywordDistance(lineText: string, kw: LexKeyword): number | null {
+  const folded = foldLex(lineText);
+  if (!folded) return null;
+  const pat = foldLex(kw.word);
+  const budget = kw.budget ?? lexBudget(pat.length);
+  const d = substringEditDistance(pat, folded, budget);
+  if (d === Infinity) return null;
+  for (const rej of kw.rejects ?? []) {
+    const rd = substringEditDistance(foldLex(rej), folded, budget);
+    if (rd < d) return null;
+  }
+  return d;
+}
+
+export function hasKeyword(lineText: string, kw: LexKeyword): boolean {
+  return keywordDistance(lineText, kw) != null;
+}
+
+export const LEX = {
+  /** the savings line ("sutaupete", "sutaupëje", split forms) */
+  SUTAUPETE: { word: 'sutaupete', rejects: ['suteikta'] } as LexKeyword,
+  /** the trader-id products-end wall ("Pr ekiaut o", "Prckiautojo") */
+  PREKIAUTOJO: { word: 'prekiautojo' } as LexKeyword,
+  /** loyalty-card word ("KORTFLE", "KOR(ELĖS", "KURTELA") — not yet consumed, staged */
+  KORTELE: { word: 'kortele', budget: 2, rejects: ['koriandras', 'kornai', 'kartele'] } as LexKeyword,
+  /** discount label ("NUOLATDA", "HUOLA!DA", "UOLAINA") — not yet consumed, staged.
+   *  NOTE for migration: "nuolat" (the adverb, marketing footer lines) can NOT be a
+   *  substring reject — it is a PREFIX of nuolaida and would veto real garbles. The
+   *  discrimination is contextual (discount rows carry amounts; marketing lines are in
+   *  the trailer) and belongs to the consumer's gates, exactly like the old skeleton's. */
+  NUOLAIDA: { word: 'nuolaida', budget: 2 } as LexKeyword,
+} as const;
 
 // ───────── regexes ─────────
 
@@ -191,6 +296,10 @@ function cleanProductName(name: string): string {
     // (DZIOVINTOS SLYVOS). "EUR/" is only ever a price-calc marker, never part of a product name,
     // so strip the remnant. (Bare "kg"/"vnt" without the "EUR/" lead are left — a name may hold "1 kg".)
     .replace(/\s*EUR\s*\/?\s*(?:kg|vr|yr|vnt|vie|vnet)\b/gi, "")
+    // a column-merge can leave an already-consumed DISCOUNT token mid-name ("DVARO … RIEBUM
+    // -0,84 2,79 A" → total stripped, "-0,84" stranded — receipt-275). A product name never
+    // contains a negative decimal; drop it (and its VAT letter, when glued right after).
+    .replace(/(^|\s)-\s?\d{1,4}[.,]\s?\d{2}(\s+[ABC])?(?=\s|$)/g, " ")
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -498,6 +607,7 @@ function parseFooter(lines: IkiLine[]): IkiFooter {
     receiptNo: "",
     receiptNos: [],
     totalSavings,
+    comboDiscount: null,
     rawText: lines.map((l) => l.text).join("\n"),
     region: regionOf(lines),
     lineRegions,
@@ -520,12 +630,16 @@ const T_BARE_NEG_RE = /^-\s?\d{1,4}[.,]\s?\d{2}\s*[ABC]?\s*$/;        // "-7, 48
 // "3,49 FUR/kg"). Without this, a weighed row's €/kg slot is unrecognised and the
 // whole item silently drops to a unit price / leaks the weight line into the name
 // (receipt-96 POMIDORAI, receipt-105 salmon).
-const T_EUR = '[EÉĖÈÊF][UÜŪ][RŘ]';
+// "EUR" with the U DROPPED reads "ER/" (receipt-268 agurkai: "2,99 ER/ kg" — the weight
+// row went unrecognized and the product never closed, swallowing the next one). The
+// U-less alternative requires the following slash, so a stray "er" inside a word can
+// never qualify as the currency marker.
+const T_EUR = '(?:[EÉĖÈÊF][UÜŪ][RŘ]|[EÉĖÈÊF][RŘ]\\s*/)';
 const T_WEIGHT_LOOSE_RE = new RegExp(`\\bkg\\b\\s*[xXyY×*].*${T_EUR}`, 'i'); // any "… kg X … EUR/kg" row (OCR reads the × as X/Y/*)
 // A weighed QUANTITY token ("0,470 kg", "2,090 kg") — 3-decimal kg. Survives even
 // when OCR drops the "X €/kg" tail (so the EUR-based weight test above misses it).
 // Every weighed IKI item prints exactly ONE, so a SECOND one = a new product.
-const T_KG_QTY_RE = /\d[.,]\s?\d{3}\s*kg\b/i;
+const T_KG_QTY_RE = /\d[.,]\s?\d{3}\s*[-–—·.]?\s*kg\b/i; // interpunct-tolerant (see T_KG_LEAD_RE)
 // UNIT-quantity calc row "N vnt. X P,PP EUR/ Vr" (per-unit-priced multi-buy, "Vr" = vienetui) — the
 // kg analogue of a weighed calc. Without it the whole calc string is mistaken for a product NAME
 // and steals the real product's total. Group 1 = the unit count.
@@ -546,6 +660,13 @@ const T_PERKG_RE = new RegExp(`(\\d{1,4}[.,]\\s?\\d+)\\s*[:;.]?\\s*${T_EUR}`, 'i
 // survives). The 6-char "NUOLAI" skeleton (N-U-O-L-A-I, OCR-tolerant) is distinctive enough on its
 // own — no grocery product name starts that way. (receipt-166.)
 const T_DISCOUNT_RE = /N?[UV][OCQD0][LI1].{0,4}D[A4]|N[UV][OCQD0][LI1][A4Ą][I1lLÌ]\w*/i;
+// OCR-tolerant "kortelė" (loyalty card) word skeleton. The trailing "EL" garbles hard: E
+// reads as F ("KORTFLE" → the card-discount label leaked into a product name, receipt-219),
+// L as I/1, O as 0. Shared by every card-discount-label detector (ikiLabelTail, T_DISC_NAME_RE,
+// the card-number products-end marker) so a garbled label word can't be mistaken for a name.
+// Kept specific enough (requires K-O/U-R-T then E/F then L/I) to never hit KORNAI/KORIANDRAS/KORTAS.
+// O also reads as U on smudged prints ("KURTELA", receipt-234) — JOGURTĖLIS stays safe (G≠K).
+const T_KORTELE_RE = /K[O0U]RT[EF][LI1]/i;
 const T_NEG_RE = /-\s?(\d{1,4}[.,]\s?\d{2})/;
 // coupons, plastic bags, points lines. These words are heavily OCR-garbled on
 // photos: the coupon "KU" can drop entirely ("xKUPONAS" → "JPONAS"/"PONAS"), and
@@ -571,21 +692,25 @@ const T_SKIP_NAME_RE = /KUPON|\b[A-Z]{0,2}PONAS\b|PIGIN|MA[I1lJ][SŠ5]EL\s*[I1l]
 // Used to gate the discPending discount recovery so it can't steal a coupon/points amount.
 const T_BAG_RE = /MA[I1lJ][SŠ5]EL\s*[I1l][SŠ5]|[PF]LAST[I1l]K[I1l]?N/i;
 // Bottle DEPOSIT / UŽSTATAS — handled SEPARATELY (folds into the product above's
-// band, no value), not hard-skipped. OCR rots the O→0 ("DEP0ZIAS").
-const T_DEPOSIT_RE = /DEP[O0]Z|U[ŽZ]STAT/i;
+// band, no value), not hard-skipped. OCR rots the O→0 ("DEP0ZIAS") AND — because IKI
+// actually prints "DEPOŽITAS" with a Lithuanian ž — the char after DEP[O0] is routinely
+// Ž/ž, not a plain Z ("DEPOŽ1TAS", receipt-228). Without the [ZŽž] class the label slips
+// through and, when a mis-clustered price+VAT-letter rides on its line, the `!hadVat`
+// fallback can't catch it either → the deposit mints a phantom product.
+const T_DEPOSIT_RE = /DEP[O0][ZŽž]|U[ŽZ]STAT/i;
 // Deposit REFUND / RETURN ("UŽSTATO GRĄŽINIMAS", "Išimta (Užstatas)"): a genuinely
 // NEGATIVE deposit ledger line (returning empties), NOT a loyalty discount. Must NOT be
 // reinterpreted as a fused product discount — its negative amount is the refund itself.
 const T_DEPOSIT_REFUND_RE = /GR[ĄA][ŽZ2]IN|I[ŠS]IMT/i;
-const T_LEAD_DISC_RE = /^(-\s?\d{1,4}[.,]\s?\d{2})\s*[ABC]?\s+(\S.*)$/;        // "-0,72 A RAUDONOSIOS PAPRIKOS"
+const T_LEAD_DISC_RE = /^(?:[SŠ]U\s+)?(-\s?\d{1,4}[.,]\s?\d{2})\s*[ABC]?\s+(\S.*)$/;   // "-0,72 A RAUDONOSIOS PAPRIKOS" (optional stray "SU " shed from the label row above, receipt-272)
 // OCR can garble the fused discount amount so T_LEAD_DISC_RE misses it: it drops the decimal
 // comma ("-000" for "-0,00") or reads the cents as digit-shaped letters ("-0,CO"). Fall back to
 // a leading minus + a SHORT (≤5) digit-ish blob + a MANDATORY VAT letter [ABC] (the only reliable
 // discount/name separator once the amount is malformed) + the trailing name. The mandatory letter
 // + the downstream name guards (isNameStart/!isTSkip/!ikiLabelTail) keep this from over-splitting.
-const T_LEAD_DISC_GARBLED_RE = /^(-\s?[\dOoSsCcIl][\dOoSsCcIl.,\s]{0,4})\s*[ABC]\s+(\S.*)$/;  // "-000 A RAUDONOSIOS PAPRIKOS"
+const T_LEAD_DISC_GARBLED_RE = /^(?:[SŠ]U\s+)?(-\s?[\dOoSsCcIl][\dOoSsCcIl.,\s]{0,4})\s*[ABC]\s+(\S.*)$/;  // "-000 A RAUDONOSIOS PAPRIKOS"
 const T_LEAD_PRICE_RE = /^(\d{1,4}[.,]\s?\d{2})\s*[ABC]?\s*-?\s*(\S.*)$/;      // "18,15 A- 1,068 kg X 16,99 EUR/kg"
-const T_DISC_NAME_RE = /^(NUOL.{0,4}D[A4](?:\s+SU\s+KORTELE)?)\s+(.+)$/i;      // "NUOLAIDA 2A RAUDONOS IOS PAPRIKOS" (label fused w/ next name)
+const T_DISC_NAME_RE = /^(NUOL.{0,4}D[A4](?:\s+[SŠ]U\s+K[O0]RT[EF][LI1]\w*)?)\s+(.+)$/i;  // "NUOLAIDA SU KORTELE RAUDONOS IOS PAPRIKOS" (label fused w/ next name; kortelė via T_KORTELE_RE skeleton)
 const T_TRAIL_PRICE_RE = /^(.*?[A-Za-zĄČĘĖĮŠŲŪŽąčęėįšųūž].*?)\s+(\d{1,4}[.,]\s?\d{2})\s*[ABC]?\s*$/; // "NAME 1,99 A"
 // "<NAME1> <price> A <NAME2>" — two products fused on ONE OCR row, separated by a
 // line-total's VAT-class token. e.g. "LYDYTAS TEPAWAS RIS 99 A LIETUW1SKI POMIDORAI"
@@ -600,13 +725,25 @@ const T_MID_PRICE_NAME_RE = /^(.+?)\s+(\d{1,4}(?:[.,]\s?\d{0,2})?)\s*([ABC])\s+(
 // trailer gets parsed as phantom products (receipt-148). `KORTEL…\s+NR` is the card-NUMBER label,
 // distinct from the "… SU KORTELE" discount line (no "NR" after it). \S* tolerates the Ė/dropped
 // diacritic ("KORTELĖS"/"KORTELES").
-const T_PRODUCTS_END_RE = /^\s*Par\s?davimas\b|MASTERCARD|^\s*SUMA\b|Mok[eė]ti\b|KOR\w?EL\S*\s+NR|s[aą]skait\S*fakt/i;
+// card-NUMBER label "KORTELĖS NR" — the `\s+NR` anchor makes this specific, so it keeps the
+// LOOSER `KOR\w?` tolerance (the T reads as I: "KORIELĖS", receipt-219) and only ADDS the E→F
+// garble ([EF]) that T_KORTELE_RE handles for the discount label. Do NOT tighten to require T
+// here or the products-end marker misses "KORIELĖS NR" and the card line leaks as a phantom.
+// "Data YYYY-…" / "Laikas HH:…" (the VMI trailer's date/time line) is a BACKSTOP wall: it only
+// prints after the products, so even when the "Prekiautojo ID" line garbles past both trader
+// stems (receipt-234) the zone still ends here instead of eating the whole payment trailer.
+const T_PRODUCTS_END_RE = /^\s*Par\s?davimas\b|MASTERCARD|^\s*SUMA\b|Mok[eė]ti\b|KOR.?[EF][LI1]\S*\s+N[RA]\b|s[aą]ska[il1]t\S*fakt|\bDat[a4]\s*\d{4}\s*[-.]|\bLa[i1]kas\s*\d{1,2}\s*[:.]/i;   // KOR.? — the T reads as '(' too (r268); NR reads as NA (r272); saskait's i reads as l (r272)
 // "Prekiautojo ID <number>" (trader-id line) ends the product section. The "Prekia…"
 // seller stem alone is too loose ("Prekiautojo nuolaida" — a promo — would truncate the
 // product list). Confirm it with EITHER the trader number (6+ digits) OR an "ID"/"1D"
 // token whose D is UPPERCASE (case-sensitive — the OCR keeps "ID"/"g1D" capitalised, but
 // the lowercase "id" buried in "nuolaida"/"idejos" stays excluded). I→1 tolerant.
 const T_TRADER_LINE_RE = /Prekia\w{0,8}/i;
+// Garble-tolerant trader stem: the "e" itself rots on smudged prints ("Prckiautojo", e→c,
+// receipt-234 — the missed boundary let the whole trailer assemble into a phantom product).
+// One wildcard char (or none) between "Pr" and the distinctive "kiaut" run. Unlike the strict
+// stem this NEVER qualifies alone — the caller must confirm with the trader number / "ID".
+const T_TRADER_GARBLED_RE = /Pr.?kiaut/i;
 const T_TRADER_NUM_RE = /\d{6,}/;
 const T_TRADER_ID_RE = /[I1]D/; // case-SENSITIVE: uppercase D only
 // Separators are [-.]{1,2}: IKI prints "YYYY-MM-DD" but OCR sometimes DOUBLES a hyphen
@@ -616,7 +753,10 @@ const T_DATE_RE = /(\d{4})[-.]{1,2}(\d{2})[-.]{1,2}(\d{2})/;
 // HH:MM:SS, but OCR can turn the FIRST colon into a hyphen/dot ("12-20:35" for 12:20:35). The first
 // separator is tolerant [:.\-]; the SECOND stays a literal ":" so a date ("2026-06-20" → "26-06-20")
 // can never be misread as a time (it has no MM:SS colon).
-const T_TIME_RE = /(\d{2})[:.\-](\d{2}):(\d{2})/;
+// HH:MM:SS. The LAST separator stays a literal ':' so a date ("2026-05-19", '-'/'.' seps)
+// can never be mis-read as a time. `\s*` around the separators tolerates OCR inserting a
+// space after a colon ("19:36: 13" → time lost before, receipt-221).
+const T_TIME_RE = /(\d{2})[:.\-]\s*(\d{2})\s*:\s*(\d{2})/;
 // "Kvito" itself rots heavily on IKI thermal: the K→A and v→o/u/y swaps give "Koito"/"AVito"
 // (receipt-198) and "Kyito" (receipt-199), so the stem is [KA][vouy]ito. The mandatory "Nr"/"numer"
 // context (and the captured digits) keeps it from matching the other "Kvito …" lines (kodas/parašas).
@@ -647,7 +787,12 @@ const isTSkip = (t: string) => T_SKIP_NAME_RE.test(t);
 // Strip combining diacritics so OCR-garbled accents on the discount label (e.g. the
 // horned/accented O in "NUỚL") still match the plain "NUOLAIDA" skeleton.
 const stripDiacritics = (s: string) => s.normalize('NFD').replace(/[̀-ͯ]/g, '');
-const isTDiscount = (t: string) => T_DISCOUNT_RE.test(stripDiacritics(t)) || T_BARE_NEG_RE.test(t.trim());
+const isTDiscount = (t: string) =>
+  T_DISCOUNT_RE.test(stripDiacritics(t)) || T_BARE_NEG_RE.test(t.trim())
+  // Lexicon fallback (Phase 3): any in-budget garble of "nuolaida" the skeleton lanes
+  // missed. Fallback-only — the legacy lanes short-circuit, so the hot path and every
+  // pinned behavior are unchanged; the lexicon only ADDS coverage for new garbles.
+  || hasKeyword(t, LEX.NUOLAIDA);
 // Only a real product NAME can start a product — never a price / weight /
 // discount / coupon-bag-points marker / digit-only noise. Requires ≥2 letters
 // so OCR crumbs like a lone "A" (the leftover of a mangled points line) never
@@ -675,7 +820,10 @@ export const extractPerKg = (t: string): number | null => {
 // "0 kg", where the real quantity is the decimal fragment on the preceding line.
 // "kg" is routinely mis-OCR'd as "ka"/"kq"/"k9" on the quantity unit ("0,720 ka X
 // … EUR/ kg"), so tolerate those reads when capturing the leading kg quantity.
-const T_KG_LEAD_RE = /(\d{1,4}(?:[.,]\s?\d+)?)\s*k[gqa9]\b/i;
+// IKI prints an interpunct between the quantity and the unit ("0, 245 · kg") which OCR
+// reads as a stray -/./· token — tolerate ONE such junk char so the quantity still binds
+// to its kg (receipt-242 paprikos: "0.245 - kg" lost the amount entirely).
+const T_KG_LEAD_RE = /(\d{1,4}(?:[.,]\s?\d+)?)\s*[-–—·.]?\s*k[gqa9]\b/i;
 const leadingKg = (t: string): string | null => {
   const m = t.match(T_KG_LEAD_RE);
   return m ? m[1].trim() : null;
@@ -686,11 +834,17 @@ const leadingKg = (t: string): string | null => {
 // product — drop it. A REAL product always qualifies the word ("ŽALUMYNŲ RINKINYS",
 // "STIKLINIŲ RINKINYS …"), so only the standalone word is the combo line. Anchored
 // ^…$ on the letter-only name so a qualified product survives.
-// OCR-tolerant skeleton: the two "I" routinely read as T/1/L ("RINKTNYS", receipt-187)
-// and the "Y" is dropped or read as T/1/V ("RINKTN)S" → "RINKTNS", receipt-206).
-const RINKINYS_SKEL = /^R[IT1L]NK[IT1L]N[YT1V]?S$/;
-function isIkiComboSetName(name: string): boolean {
-  return RINKINYS_SKEL.test(stripDiacritics(name).replace(/[^A-Za-z]/g, '').toUpperCase());
+// OCR-tolerant skeleton: the two "I" routinely read as T/1/L ("RINKTNYS", receipt-187),
+// the "Y" is dropped or read as T/1/V ("RINKTN)S" → "RINKTNS", receipt-206), and the whole
+// "NY" pair can drop out ("RINKINYS" → "RINKI:.S" → letters "RINKIS", receipt-209) — so the
+// SECOND N is optional too. Still anchored ^…$ on the letter-only name, so a qualified
+// product ("ŽALUMYNŲ RINKINYS") never collapses to the bare skeleton and survives.
+const RINKINYS_SKEL = /^R[IT1L]NK[IT1L]N?[YT1V]?S$/;
+export function isIkiComboSetName(name: string): boolean {
+  // Keep DIGITS as well as letters: the skeleton's [IT1L] intentionally accepts a digit '1'
+  // for an OCR'd "I", but stripping digits here made that alternative dead code (a
+  // "R1NK1NYS" read slipped through). Strip only punctuation/whitespace.
+  return RINKINYS_SKEL.test(stripDiacritics(name).replace(/[^A-Za-z0-9]/g, '').toUpperCase());
 }
 
 // ───────── header-junk guard (product-name protection) ─────────
@@ -792,8 +946,8 @@ function explodeThermalLine(line: IkiLine): ThermalTok[] {
     // Guard: a bare "NUOLAIDA SU KORTELE" backtracks to tail="SU KORTELE" — that
     // is the label's own continuation, NOT a product name. Reject label tails so
     // only a genuine fused product name (e.g. "RAUDONOS IOS PAPRIKOS") splits off.
-    // Tolerate OCR garbles: "ŠU" (Š for S) and "KORTELt"/"KORTELĖ" (KORTEL + any).
-    const isLabelTail = /^([SŠ]U\b|KORTEL)/i.test(tail);
+    // Tolerate OCR garbles: "ŠU" (Š for S) and "KORTELt"/"KORTELĖ"/"KORTFLE" (T_KORTELE_RE skeleton).
+    const isLabelTail = /^[SŠ]U\b/i.test(tail) || T_KORTELE_RE.test(tail) || hasKeyword(tail, LEX.KORTELE);
     if (tail && tailLetters >= 3 && !isLabelTail && !isTSkip(tail) && !T_DISCOUNT_RE.test(tail)) {
       const discPart = t.slice(0, t.length - tail.length).trim();
       const { top, bottom } = splitLineVert(line);
@@ -840,6 +994,19 @@ interface EWord { text: string; xLeft: number; xRight: number; yTop: number; yBo
 interface ERow {
   words: EWord[]; leftText: string;
   total: number | null; perKg: number | null; discount: number; isSkip: boolean;
+  /** total came from a FALLBACK lane (source-single / headless / glyph-garbled / bare-digit)
+   *  rather than the strict read — the row solver may overrule it with kg × €/kg. */
+  totSoft?: boolean;
+  /** PRICE-SHAPED but UNREADABLE trailing amount ("3, 4: A" — a glyph no map can resolve):
+   *  the row still CLOSES its product (it IS a total row), value unknown. Receipt-level
+   *  reconciliation (Phase 2) pins it from Σ paid = printed total. */
+  totUnknown?: boolean;
+  /** Candidate values for the unknown total (decimal-glyph expansion); null = unconstrained. */
+  totCands?: number[] | null;
+  /** A discount that belongs to THIS row's OWN product (soup-row reconstruction: name +
+   *  total + discount all on one attached row) — unlike trailDisc, which the assembler
+   *  attributes to the previously-open product. */
+  selfDisc?: number;
   trailDisc: number;                                                  // trailing text-only discount on a NAME row that belongs to the PREVIOUS product (OCR fused the prior product's discount onto this name with no word box)
   isDeposit: boolean;                                                 // bottle deposit — folds into the product above's band, no value
   kgQty: boolean;                                                     // row bears a weighed-quantity token
@@ -852,7 +1019,7 @@ interface ERow {
   discLabel?: boolean;                                               // this row carried a "NUOLAIDA …" discount LABEL but its amount was elsewhere (band-merged calc row) — the product HAS a discount, recover its amount from a following mis-clustered row
   topY: number; botY: number; leftX: number; slope: number;
 }
-const T_TRAIL_AMT_RE = /(-?\d{1,4}[.,]\s?\d{2})\s*[ABC]?\s*$/;       // a line's trailing amount
+const T_TRAIL_AMT_RE = /(-?\d{1,4}[.,]\s?\d{2})\s*(?:[ABC]\s*){0,2}$/;  // a line's trailing amount (tolerates a stray doubled VAT letter, receipt-271)
 // A price the OCR mangled — the decimal/euros were dropped but the trailing VAT
 // letter (A/B/C) still marks "this is a price". "48 A" was "-7,48 A"; "49 A" was
 // "1,49 A". The VAT letter is REQUIRED here (that's the real signal), so plain
@@ -868,6 +1035,25 @@ function matchVatAmt(text: string): number | null {
   else { const d = tok.replace(/\D/g, ''); if (!d) return null; v = parseInt(d, 10) / 100; } // bare digits → cents
   return neg ? -v : v;
 }
+// Trailing amount whose DECIMAL digits rotted into confusable GLYPHS ("3, 4y A" — the
+// printed 9 read as y; receipt-242's flaxseed oil never closed and swallowed the next
+// product into its name). The shape is anchored hard — REAL-digit integer + decimal
+// separator + the VAT letter + end-of-row — so only the two decimal characters may be
+// confusion glyphs, each mapped to its canonical digit. A real digit passes through
+// unmapped, and any glyph outside the map rejects the whole match.
+const T_AMT_GARBLED_RE = /(-?\d{1,4})[.,]\s?([\dOoIlSsBgqyZz]{2})\s*[ABC]\s*$/;
+const GLYPH_DIGIT: Record<string, string> = {
+  O: '0', o: '0', I: '1', l: '1', Z: '2', z: '2', S: '5', s: '5', B: '8', g: '9', q: '9', y: '9',
+};
+function matchGarbledVatAmt(text: string): number | null {
+  const m = text.match(T_AMT_GARBLED_RE);
+  if (!m) return null;
+  const dec = [...m[2]].map((c) => GLYPH_DIGIT[c] ?? c).join('');
+  if (!/^\d{2}$/.test(dec)) return null;
+  const neg = m[1].startsWith('-');
+  const v = Math.abs(parseNum(`${m[1]}.${dec}`));
+  return Number.isFinite(v) ? (neg ? -v : v) : null;
+}
 const emedian = (xs: number[]): number => {
   if (!xs.length) return 0;
   const s = [...xs].sort((a, b) => a - b);
@@ -881,14 +1067,80 @@ function ikiHasWords(lines: IkiLine[], start: number, end: number): boolean {
   return n > 0 && withWords / n >= 0.6;
 }
 
+// Robust per-line slope from the line's OWN words: median of ADJACENT-pair slopes,
+// skipping pairs separated by a large x-gap. The gap cap is the whole point — a line
+// that GLUES the name column to the price column ("DEPOZI TAS 0, 10") has one huge
+// cross-column pair whose "slope" is the OCR column SHEAR, not the paper tilt;
+// leftmost-vs-rightmost measurement (both the old refSamples here and mlkitOcr's
+// corner synthesis) read that shear as tilt and poisoned every de-skew downstream
+// (receipt-232: scrambled clustering + bands pivoting up on the device while the
+// corner-less offline parse of the same words was clean). Adjacent intra-column
+// pairs survive the cap; the cross-gap pair is excluded; the median does the rest.
+// Returns null when no valid pair exists.
+export function robustLineSlope(
+  words: { xLeft: number; xRight: number; yTop: number; yBottom?: number }[] | undefined,
+): number | null {
+  if (!words || words.length < 2) return null;
+  const ws = [...words].sort((a, b) => a.xLeft - b.xLeft);
+  // Split into gap-free RUNS (a run never crosses the column gap), then measure the
+  // slope END-TO-END over the LONGEST run — a long baseline averages out per-word box
+  // noise. Two rejection rules, each guarding a distinct poison:
+  //   • the cross-column pair (huge gap) never joins a run → shear can't register;
+  //   • a run SHORTER than MIN_SPAN yields null — a micro-baseline like "1,69"→"A"
+  //     (dx≈76, ±3px box noise) would fabricate ±0.04 "tilt" out of pure noise and
+  //     drag the global median (the second poisoning mode found on receipt-232).
+  const MIN_SPAN = 180;
+  const gapCap = Math.max(120, ((ws[ws.length - 1].xRight - ws[0].xLeft) || 1) * 0.25);
+  const runs: (typeof ws)[] = [];
+  let run: typeof ws = [ws[0]];
+  for (let i = 1; i < ws.length; i++) {
+    if (ws[i].xLeft - ws[i - 1].xRight > gapCap) { runs.push(run); run = []; }
+    run.push(ws[i]);
+  }
+  runs.push(run);
+  const cy = (w: (typeof ws)[number]) => (w.yBottom != null ? (w.yTop + w.yBottom) / 2 : w.yTop);
+  const cx = (w: (typeof ws)[number]) => (w.xLeft + w.xRight) / 2;
+  let best: (typeof ws) | null = null;
+  for (const r of runs) {
+    if (r.length < 2) continue;
+    if (!best || cx(r[r.length - 1]) - cx(r[0]) > cx(best[best.length - 1]) - cx(best[0])) best = r;
+  }
+  if (!best) return null;
+  const dx = cx(best[best.length - 1]) - cx(best[0]);
+  if (dx < MIN_SPAN) return null;
+  const slope = (cy(best[best.length - 1]) - cy(best[0])) / dx;
+  return Math.max(-0.08, Math.min(0.08, slope));
+}
+
 // Flatten every word in the product section. Each word carries its source line's
 // tilt (the local receipt slope) — we ignore MLKit's line GROUPING, not its tilt.
 function ikiCollectWords(lines: IkiLine[], start: number, end: number): EWord[] {
+  // CORNER-GATED slope assignment. When a line carries NO corner data (stored
+  // fixtures, old dumps) the slope stays exactly what it always was — the corner
+  // formula collapses to 0 — so battle-tested cornerless behavior is untouched.
+  // When corners ARE present (on-device), they are NEVER trusted for word-bearing
+  // lines: mlkitOcr synthesizes them from element pairs, which carry the column
+  // shear on glued lines and micro-pair noise on short ones — the poison that
+  // scrambled receipt-232's clustering. Instead: word-derived long-baseline slope
+  // (robustLineSlope), and lines too short to measure inherit the MEDIAN of the
+  // measured lines. Word-less lines keep the (capped) corner value — nothing
+  // better exists there.
+  const hasCorners = (l: IkiLine) => l.yLeftTop != null || l.yRightTop != null;
+  const measured = new Map<number, number>();
+  for (let i = start; i < end; i++) {
+    if (!hasCorners(lines[i])) continue;
+    const s = robustLineSlope(lines[i].words);
+    if (s != null) measured.set(i, s);
+  }
+  const inherited = measured.size ? emedian([...measured.values()]) : 0;
   const out: EWord[] = [];
   for (let i = start; i < end; i++) {
     const l = lines[i];
     const w = (l.xRight - l.xLeft) || 1;
-    const slope = ((l.yRightTop ?? l.yTop) - (l.yLeftTop ?? l.yTop)) / w;
+    const cornerSlope = Math.max(-0.08, Math.min(0.08, ((l.yRightTop ?? l.yTop) - (l.yLeftTop ?? l.yTop)) / w));
+    const slope = !hasCorners(l)
+      ? cornerSlope /* = 0 without corners — legacy behavior byte-for-byte */
+      : (measured.get(i) ?? (l.words && l.words.length ? inherited : cornerSlope));
     if (l.words && l.words.length) {
       for (const wd of l.words) {
         if (!wd.text.trim()) continue;
@@ -901,8 +1153,53 @@ function ikiCollectWords(lines: IkiLine[], start: number, end: number): EWord[] 
   return out;
 }
 
+// True ROW PITCH measured from the words themselves. The median box HEIGHT (the lineH
+// fallback) OVERESTIMATES the line pitch when MLKit pads its boxes downward — receipt-228:
+// ~48px boxes on a ~38px printed pitch, every name box bleeding into the next line's
+// glyphs on a perfectly clean image. Every clustering/attachment threshold derives from
+// lineH, so an inflated lineH makes them wider than the real between-row gap and adjacent
+// printed lines CHAIN-MERGE into one interleaved row ("BAJORISKIŲ TICHE NATŪRALUS
+// MAISTINĖ NEGAZUOTA ACTO"). Estimate the pitch from the DATA in two stages: (1) group
+// the sorted de-skewed word centers into LEVELS, splitting where the consecutive gap
+// clears the same-row jitter floor (0.35 × boxH — column tilt offsets + multi-word
+// spread); (2) pitch = median diff between consecutive LEVEL MEDIANS. A raw
+// consecutive-gap median would measure the BOUNDARY gap (pitch minus the within-row
+// spread, ~24px on 228) and shrink the attach radius until true prices orphan — the
+// level-median diff measures the actual center-to-center pitch (~38px). Needs ≥3
+// levels (2 diffs — a single diff could be a section break, not a pitch); returns null
+// when the zone is too sparse to measure.
+function ikiEstimateRowPitch(words: EWord[], boxH: number, medSlope: number): number | null {
+  if (words.length < 4) return null;
+  const centers = words
+    .map((w) => (w.yTop + w.yBottom) / 2 - medSlope * ((w.xLeft + w.xRight) / 2))
+    .sort((a, b) => a - b);
+  const levels: number[][] = [];
+  let cur: number[] = [centers[0]];
+  for (let i = 1; i < centers.length; i++) {
+    if (centers[i] - centers[i - 1] >= boxH * 0.35) { levels.push(cur); cur = []; }
+    cur.push(centers[i]);
+  }
+  levels.push(cur);
+  if (levels.length < 3) return null;
+  const mids = levels.map((l) => emedian(l));
+  const diffs: number[] = [];
+  for (let i = 1; i < mids.length; i++) diffs.push(mids[i] - mids[i - 1]);
+  return emedian(diffs);
+}
+
 // Curve-normalized row clustering: de-bend by the median slope, group words whose
-// normalized Y is within ~½ a line-height (= median word height).
+// normalized Y is within ~½ a line-height, then RE-UNION rows that share an MLKit
+// source line. The two failure modes this balances (receipt-228 vs 161):
+//   • MLKit pads word boxes downward (228: ~48px boxes on a ~38px pitch), so a
+//     box-height threshold chain-merges TWO SEPARATE printed name lines into one
+//     interleaved row ("BAJORISKIŲ TICHE NATŪRALUS MAISTINĖ NEGAZUOTA ACTO"). The
+//     split threshold therefore uses min(boxH, measured pitch) — see splitH.
+//   • But some printed pairs legitimately sit at SUB-pitch spacing and the fold
+//     logic depends on them clustering together (161: a unit-calc row + its
+//     NUOLAIDA label, 24px apart on a 32px pitch). Those pairs invariably arrive
+//     GLUED IN ONE MLKit LINE — MLKit already judged them one visual unit — so
+//     after the fine split, rows sharing a source line are re-united. 228's
+//     poison merge was across two DIFFERENT source lines, so it stays split.
 function ikiClusterRows(words: EWord[], lineH: number, medSlope: number): EWord[][] {
   const norm = (w: EWord) => (w.yTop + w.yBottom) / 2 - medSlope * ((w.xLeft + w.xRight) / 2);
   const sorted = [...words].sort((a, b) => norm(a) - norm(b));
@@ -914,6 +1211,45 @@ function ikiClusterRows(words: EWord[], lineH: number, medSlope: number): EWord[
     cur.push(w); sum += n;
   }
   if (cur.length) rows.push(cur);
+  // Same-source-line union (adjacent rows only — rows are y-sorted, and a glued
+  // MLKit line only ever spans neighbouring printed rows). GATED on a HELPER row:
+  // a load-bearing sub-pitch merge always involves a calc/label/deposit row that
+  // cannot stand alone (161: unit-calc + its NUOLAIDA label). When BOTH rows are
+  // name/price-shaped, the glue is two REAL products fused by MLKit and the split
+  // must stand (receipt-170: two KETO loaves in one MLKit line).
+  const helperish = (ws: EWord[]) => {
+    const t = ws.map((w) => w.text).join(' ');
+    // Card label only in DISCOUNT contexts ("NUOL…", "…SU KORTELE") — a bare KORT
+    // skeleton would also catch a real DOVANŲ KORTELĖ (gift card) product row.
+    // NO deposit stem here: a DEPOZITAS word glued onto a product's NAME line would
+    // union the pair and ikiClassifyRow would then type the WHOLE merged row as a
+    // deposit skip — silently deleting the product. Deposit amounts are handled by
+    // the deposit-targeted re-home in ikiBuildRows instead.
+    return T_KG_QTY_RE.test(t) || T_UNIT_CALC_RE.test(t) ||
+      /E[UÜŪ]R\s*\//i.test(t) || /NUOL[A4]|[SŠ]U\s+K[O0]RT[EF][LI1]/i.test(t);
+  };
+  // Precompute per-ORIGINAL-row flags and forbid a just-merged row from unioning
+  // again: re-evaluating helperish on CONCATENATED text would let an absorbed
+  // helper's markers license a second merge that fuses two REAL name+price rows —
+  // defeating the exact receipt-170 invariant the gate protects.
+  // (A vertical distance gate on the union — 0.9·splitH — was tried and REVERTED: on a
+  // scrambled receipt (211) splitH is the measured LOW pitch, so the gate blocked a
+  // load-bearing helper union and the next product's name fused into its neighbour.
+  // The helper + shared-line + adjacency + no-chaining conditions bound the union
+  // tightly enough; re-add a distance gate only with a real fixture in hand, scaled to
+  // lineH not splitH.)
+  const helperFlag = rows.map((r) => helperish(r));
+  const merged = new Set<number>();
+  for (let i = rows.length - 1; i > 0; i--) {
+    if (merged.has(i) || merged.has(i - 1)) continue;
+    const above = new Set(rows[i - 1].map((w) => w.line));
+    if (rows[i].some((w) => above.has(w.line)) && (helperFlag[i - 1] || helperFlag[i])) {
+      rows[i - 1] = rows[i - 1].concat(rows[i]);
+      rows.splice(i, 1);
+      helperFlag.splice(i, 1);
+      merged.add(i - 1);
+    }
+  }
   for (const r of rows) r.sort((a, b) => a.xLeft - b.xLeft);
   return rows;
 }
@@ -965,9 +1301,19 @@ function ikiClassifyRow(ws: EWord[], lines: IkiLine[]): ERow {
     const dn = text.match(T_NEG_RE) ?? firstSrc.match(T_NEG_RE);
     return { ...base, depositFollows: true, discount: dn ? parseNum(dn[1]) : 0, leftText: '' };
   }
+  // COMBO-SET vs DEPOSIT (receipt-278): MLKit can glue the NEXT printed row's deposit
+  // LABEL onto a combo-discount line ("RINKINYS -1,90 A DEPOZITAS" — one source line,
+  // two printed rows), and the source-line deposit test below would swallow the whole
+  // rebuilt row ("RINKINYS -1,90 A") as a value-less deposit skip — the -1,90 vanished
+  // and the set was priced in full. The row's OWN words are the truth: a bare combo
+  // word ahead of a trailing negative is unambiguously the combo-discount row — let it
+  // reach the trailing-amount lanes, where the assembler's combo interception routes
+  // the value to footer.comboDiscount.
+  const negIdx = text.search(/-\s?\d/);
+  const comboNegRow = negIdx > 0 && !T_DEPOSIT_RE.test(text) && isIkiComboSetName(text.slice(0, negIdx));
   // DEPOSIT (folds into the product above's band, no value). The no-VAT extra catches
   // deposits too garbled for the strict name: a real product total always ends in A/B/C.
-  if (!fusedDepositLabel && (T_DEPOSIT_RE.test(text) || T_DEPOSIT_RE.test(firstSrc) || (depositHint && !hadVat))) {
+  if (!fusedDepositLabel && !comboNegRow && (T_DEPOSIT_RE.test(text) || T_DEPOSIT_RE.test(firstSrc) || (depositHint && !hadVat))) {
     return { ...base, isSkip: true, isDeposit: true, leftText: text };
   }
   // (a) Carry the deposit-follows signal on the (about-to-be-built) discount row so the
@@ -979,7 +1325,10 @@ function ikiClassifyRow(ws: EWord[], lines: IkiLine[]): ERow {
     // down onto the bag). Surface the leading negative so the assembler can apply it to the open
     // product (gated on discPending — see below). The bag's OWN price (0,01) is positive, untouched.
     const sneg = text.match(T_NEG_RE) ?? firstSrc.match(T_NEG_RE);
-    return { ...base, isSkip: true, leftText: text, discount: sneg ? parseNum(sneg[1]) : 0 };
+    // The skip's own positive charge ("MAISELIS … 0,01 A", "IKI Taškais 0,01 A") is part of
+    // the PRINTED TOTAL — capture it so receipt reconciliation can balance the books.
+    const spos = text.match(/(^|[^-\d])(\d{1,4}[.,]\s?\d{2})\s*[ABC]\s*$/);
+    return { ...base, isSkip: true, leftText: text, discount: sneg ? parseNum(sneg[1]) : 0, total: spos ? parseNum(spos[2]) : null };
   }
   // UNIT-quantity calc row "N vnt. X P,PP EUR/ Vr" — a CALC, not a NAME. Strip to a nameless row
   // (keep a leading fused name if any) + carry the printed unit count, so it folds into the product
@@ -1000,7 +1349,8 @@ function ikiClassifyRow(ws: EWord[], lines: IkiLine[]): ERow {
   // ka X 3.ga EUR/kg"), losing the weight. The €/kg is then recovered at assembly
   // from total ÷ qty. (receipt-111 POMIDORAI.)
   const hasLeadingKgQty = /^\d{1,4}[.,]\s?\d{3}\b/.test(text);
-  const hasPerKgMarker = /eur\s*\/?\s*k[ga]/i.test(text) || /eur\s*\/?\s*k[ga]/i.test(firstSrc);
+  const hasPerKgMarker = /e[uü]?r\s*\/\s*k[ga]/i.test(text) || /e[uü]?r\s*\/\s*k[ga]/i.test(firstSrc)
+    || /eur\s*k[ga]/i.test(text) || /eur\s*k[ga]/i.test(firstSrc);
   // WEIGHT row — straight from the words, OR RECOVERED when OCR shattered the
   // "kg X … EUR" tokens (only the leading kg-quantity survived as a word, the "kg"
   // itself even mis-read — salmon "1,068 KORTELL X 16.99 EUR/ kg" kept only "1,068")
@@ -1030,7 +1380,30 @@ function ikiClassifyRow(ws: EWord[], lines: IkiLine[]): ERow {
       const vatAmts = firstSrc.match(/\d{1,4}[.,]\s?\d{2}\s*[ABC]\b/g);
       if (vatAmts && vatAmts.length === 1) tm = firstSrc.match(T_TRAIL_AMT_RE);
     }
-    const tot = tm && parseNum(tm[1]) > 0 ? parseNum(tm[1]) : null;
+    let tot = tm && parseNum(tm[1]) > 0 ? parseNum(tm[1]) : null;
+    // Strict word-box read = trusted; every lane below is a RISKY read the row solver
+    // (see flush) may overrule when the locked kg × €/kg arithmetic contradicts it.
+    let totSoft = !tmText && tot != null;
+    // HEADLESS total: a sub-1€ total prints "0,86" but OCR can drop the integer
+    // (".86 A" / ", 86 A", receipt-242 paprikos) — losing the total kills the weighed
+    // qty→promo recovery. The [.,] lead + VAT letter + end-of-row anchor the shape;
+    // the (^|[^\d,.]) guard keeps it off the tail of a complete amount.
+    if (tot == null) {
+      const hm = text.match(/(?:^|[^\d,.])[.,]\s?(\d{2})\s*[ABC]\s*$/);
+      if (hm) { tot = parseInt(hm[1], 10) / 100; totSoft = true; }
+    }
+    // Glyph-rotted decimals ("3, 4y A") — same lane as the unit-product rows.
+    if (tot == null) {
+      const gv = matchGarbledVatAmt(text);
+      if (gv != null && gv > 0) { tot = gv; totSoft = true; }
+    }
+    // Bare digits + VAT letter ("86 A" — BOTH separator and integer dropped from "0,86",
+    // receipt-268 paprikos): the unit rows' cents lane, reused. The [ABC]+end-of-row
+    // anchor keeps it off the €/kg (never VAT-lettered).
+    if (tot == null) {
+      const bv = matchVatAmt(text);
+      if (bv != null && bv > 0) { tot = bv; totSoft = true; }
+    }
     // Keep the printed kg quantity ("0,720") so a garbled €/kg ("3,9a EUR" → unreadable)
     // can be recovered at assembly from total ÷ qty (the total may sit on a separate OCR
     // row). A bare "0 kg" (OCR dropped the decimals) → null: dividing by it can't recover
@@ -1044,7 +1417,7 @@ function ikiClassifyRow(ws: EWord[], lines: IkiLine[]): ERow {
     // (`tot` above already excluded it: a negative fails the `> 0` gate.)
     const wneg = text.match(T_NEG_RE);
     const weighDisc = wneg ? parseNum(wneg[1]) : 0;
-    return { ...base, perKg: extractPerKg(text) ?? srcPerKg, total: tot, discount: weighDisc, leftText: lead ? lead[1].trim() : '', weigh: true, kgVal };
+    return { ...base, perKg: extractPerKg(text) ?? srcPerKg, total: tot, totSoft, discount: weighDisc, leftText: lead ? lead[1].trim() : '', weigh: true, kgVal };
   }
   const tm = text.match(T_TRAIL_AMT_RE);
   let amt = tm ? parseNum(tm[1]) : null;
@@ -1053,6 +1426,10 @@ function ikiClassifyRow(ws: EWord[], lines: IkiLine[]): ERow {
   if (amt == null) {
     const lv = matchVatAmt(text);                     // OCR dropped the decimal but kept the VAT letter
     if (lv != null) { amt = lv; amtRe = T_AMT_VAT_RE; }
+  }
+  if (amt == null) {
+    const gv = matchGarbledVatAmt(text);              // decimal digits rotted into glyphs ("3, 4y A")
+    if (gv != null) { amt = gv; amtRe = T_AMT_GARBLED_RE; }
   }
   // TRAILING text-only discount fused onto THIS name's line — IKI prints a product's
   // discount UNDER it, but OCR can glue the "-X,XX" onto the NEXT product's name line
@@ -1092,7 +1469,12 @@ function ikiClassifyRow(ws: EWord[], lines: IkiLine[]): ERow {
   // MLKit mis-group on a tilted receipt). Discounts always print a minus; a positive
   // decimal is never a discount. (A decimal-LESS loose amount like "48 A" stays a
   // discount on a NUOLAIDA line — there the minus was just dropped by OCR.)
-  if (cleanDecimal && amt! > 0) return { ...base, total: amt, trailDisc, leftText: text.replace(amtRe, '').trim() };
+  // …but NOT when the row is a DISCOUNT row that ALSO carries a negative (receipt-154
+  // "NUOLAIDA SU KORTELE -0,50 1,99 A A") — that shape must reach the discount branch
+  // below, which takes the -0,50 as the discount and the 1,99 as mergedTotal. The
+  // doubled-VAT tolerance in T_TRAIL would otherwise early-return it as a plain total
+  // and silently drop the discount.
+  if (cleanDecimal && amt! > 0 && !(isTDiscount(text) && T_NEG_RE.test(text))) return { ...base, total: amt, trailDisc, leftText: text.replace(amtRe, '').trim() };
   if (isTDiscount(text) || (amt != null && amt < 0)) {
     // recover a word-dropped discount amount from the source line ("NUOLAIDA" word
     // survived, "-0,30 A" did not — but it's still in the line text)
@@ -1134,6 +1516,51 @@ function ikiClassifyRow(ws: EWord[], lines: IkiLine[]): ERow {
     return { ...base, discount: dv, mergedTotal: posTotal, discLabel: dv === 0, leftText: text.replace(amtRe, '').replace(T_DISCOUNT_RE, '').trim() };
   }
   if (amt != null && amt > 0) return { ...base, total: amt, trailDisc, leftText: text.replace(amtRe, '').trim() };
+  // ── SOUP-ROW RECONSTRUCTION (FIX C, receipt-271) ── Dense pitch + curvature can attach a
+  // product's total AND its discount to the NAME row, x-interleaving the amount tokens into
+  // soup no trailing lane can read ("LAVAZ7A … MALTA -4, 9,99 50 A A" = 9,99 total + -4,50
+  // discount, tokens shuffled). Reconstruct from the word multiset: complete decimals stand
+  // alone; an orphan head ("-4,") pairs with the nearest following bare 2-digit token ("50").
+  // Commit ONLY the unambiguous shape — exactly ONE positive + ONE negative, everything
+  // paired, a VAT letter present, a real name on the left, and paid = pos − neg ≥ 0. The
+  // row then carries its OWN total + discount (selfDisc, not trailDisc — it must not leak
+  // to the previous product). Receipt reconciliation corroborates downstream.
+  if (!/EUR\s*\/|\bvnt\b|\bkg\b/i.test(text)) {
+    const toks = text.split(/\s+/).filter(Boolean);
+    const amounts: number[] = [];
+    const heads: string[] = [];
+    let vatSeen = 0; let bad = false;
+    const nameToks: string[] = [];
+    for (const t of toks) {
+      if (/^-?\d{1,4}[.,]\d{1,2}$/.test(t)) { amounts.push(parseNum(t)); continue; }
+      if (/^-?\d{1,4}[.,]$/.test(t)) { if (heads.length >= 2) { bad = true; break; } heads.push(t); continue; }
+      if (/^\d{2}$/.test(t) && heads.length) { amounts.push(parseNum(heads.shift()! + t)); continue; }
+      if (/^[ABC]$/.test(t)) { vatSeen++; continue; }
+      nameToks.push(t);
+    }
+    const pos = amounts.filter((v) => v > 0);
+    const neg = amounts.filter((v) => v < 0);
+    const soupName = nameToks.join(' ');
+    if (!bad && heads.length === 0 && pos.length === 1 && neg.length === 1 && vatSeen >= 1 &&
+        pos[0] + neg[0] >= -0.005 && ikiStrongName(soupName) && !isTDiscount(soupName)) {
+      return { ...base, total: pos[0], selfDisc: Math.abs(neg[0]), leftText: soupName };
+    }
+  }
+  // PRICE-SHAPED but UNREADABLE decimals ("3, 4: A" — ':' resolves to no digit): every value
+  // lane failed, but the SHAPE (real-digit integer + separator + 2 decimal slots + VAT letter
+  // + end-of-row) proves this IS the product's total row. Close the product with an UNKNOWN
+  // total + candidate expansions — receipt reconciliation (Phase 2) pins the value from
+  // Σ paid = printed total. The old behavior absorbed the garbled amount into the NAME and
+  // merged two products (receipt-269 oil "3, 4: A").
+  {
+    const um = text.match(/(^|[^-\d])(\d{1,4})[.,]\s?([^\s]{2})\s*[ABC]\s*$/);
+    if (um && /[^\d]/.test(um[3]) && !isTDiscount(text) && !isTDiscount(firstSrc)) {
+      const cands = expandUnknownDecimals(um[2], um[3]);
+      // the garbled amount text must NOT ride into the product name
+      const leftText = text.slice(0, um.index! + um[1].length).trim();
+      return { ...base, totUnknown: true, totCands: cands, trailDisc, leftText };
+    }
+  }
   // Name-only fallthrough — but recover a word-boxless positive total from the source line
   // so the name anchors its OWN product instead of letting the next product's total merge in.
   // Flagged `softTotal` so the assembler can refuse it when this row is only CONTINUING a
@@ -1142,9 +1569,28 @@ function ikiClassifyRow(ws: EWord[], lines: IkiLine[]): ERow {
   return { ...base, leftText: text, trailDisc };
 }
 
+// Candidate values for a price whose DECIMAL glyphs are partly unreadable: digits pass
+// through, mapped confusion glyphs resolve, anything else becomes a wildcard digit.
+// Two wildcards → null (unconstrained: 100 candidates say nothing).
+function expandUnknownDecimals(intPart: string, dec: string): number[] | null {
+  const sets: string[][] = [];
+  let wildcards = 0;
+  for (const ch of dec) {
+    if (/\d/.test(ch)) sets.push([ch]);
+    else if (GLYPH_DIGIT[ch]) sets.push([GLYPH_DIGIT[ch]]);
+    else { wildcards++; sets.push(['0', '1', '2', '3', '4', '5', '6', '7', '8', '9']); }
+  }
+  if (wildcards >= 2) return null;
+  let combos = [''];
+  for (const set of sets) combos = combos.flatMap((c) => set.map((d) => c + d));
+  return combos.map((d) => parseFloat(`${intPart}.${d}`)).filter((v) => Number.isFinite(v) && v > 0);
+}
+
 // "SU KORTELĖ" discount-label tails (OCR-garbled: "SU K HT", "ŠU KORTEL.") must
 // NEVER be mistaken for a product name — they create phantom products.
-const ikiLabelTail = (s: string) => /^[SŠ]U\b/i.test(s.trim()) || /KORTEL/i.test(s);
+// Card-word predicate: skeleton first, lexicon fallback (Phase 3 — additive coverage).
+const isKorteleWord = (s: string) => T_KORTELE_RE.test(s) || hasKeyword(s, LEX.KORTELE);
+const ikiLabelTail = (s: string) => /^[SŠ]U\b/i.test(s.trim()) || isKorteleWord(s);
 // Text usable as (part of) a product name: real letters, not a label tail, not a
 // NUOLAIDA discount label (so "NUOLAIDA ŠU" left of a fused total isn't a name).
 const ikiNameText = (s: string) => !ikiLabelTail(s) && !isTDiscount(s) && /[A-Za-zĄČĘĖĮŠŲŪŽąčęėįšųūž]{2}/.test(s);
@@ -1172,14 +1618,95 @@ const ikiColumnSplit = (words: EWord[], X0: number, X1: number): number => {
 //   2) else by curve-normalized Y proximity — handles the case where MLKit split a
 //      physical row into a separate left line and right line (receipt-47 scramble).
 //   3) else the amount stands as its own row (a price whose name was lost upstream).
-function ikiBuildRows(words: EWord[], lineH: number, medSlope: number, xMid: number): EWord[][] {
+// `splitH` bounds only the ROW-SPLIT threshold (the chain-merge fix: min(boxH, measured
+// pitch)); `lineH` (the raw box height) keeps scaling the ATTACH radius and the re-home
+// guards — those radii must stay generous or multi-row weighed/unit-calc folding loses
+// its discount/calc rows (receipts 150/154/161 regressed when the pitch shrank them).
+function ikiBuildRows(words: EWord[], lineH: number, splitH: number, medSlope: number, xMid: number): EWord[][] {
   const left: EWord[] = [], right: EWord[] = [];
   for (const w of words) ((w.xLeft + w.xRight) / 2 < xMid ? left : right).push(w);
-  const norm = (ws: EWord[]) => emedian(ws.map((w) => (w.yTop + w.yBottom) / 2 - medSlope * ((w.xLeft + w.xRight) / 2)));
+  const normOf = (w: EWord) => (w.yTop + w.yBottom) / 2 - medSlope * ((w.xLeft + w.xRight) / 2);
+  const norm = (ws: EWord[]) => emedian(ws.map(normOf));
+  // ── CROSS-COLUMN OFFSET CORRECTION (receipt-275) ── The de-skew above assumes ONE
+  // linear slope across the receipt width, but on a curled/perspective-warped photo the
+  // left-column baselines tilt (~+0.05) while the price column does NOT continue that
+  // line (name→price pairwise slope ≈ 0) — extrapolating medSlope over the ~500px column
+  // gap then displaces every price norm by up to a full lineH, so true totals miss the
+  // 0.6·lineH attach radius, go STANDALONE, and the whole assembly shifts one row
+  // (275/272: Lavazza took grietinė's 2,79 + its band; the real 9,99 became a "?"
+  // phantom — and reconciliation can NOT flag it, since swapped prices still sum right).
+  // The receipt itself measures the model error: MLKit lines GLUED across both columns
+  // hold a same-printed-row left/right pair, whose norm residual (left − right) is the
+  // exact offset the linear model gets wrong at the price column. Sample only shapes
+  // that are same-row BY PRINT FORMAT: a discount LABEL with its amount, or a strong
+  // NAME with a positive VAT-lettered non-deposit total. A NAME glued to a NEGATIVE is
+  // the classic cross-row fusion (the leading-discount shape, receipt-170) and a bare
+  // deposit glued to a name rides the row below (receipt-228) — both excluded (on 275
+  // they'd poison the median by +pitch: samples 50–60 vs true 20–29). The correction
+  // only engages past a 0.25·lineH DEADBAND (box noise is ±6px — well-modeled receipts
+  // stay byte-identical) and is capped at 0.9·lineH; it shifts ONLY the cross-column
+  // attach comparison — within-column clustering and row order are untouched.
+  const glued = new Map<number, { l: EWord[]; r: EWord[] }>();
+  for (const w of words) {
+    let e = glued.get(w.line);
+    if (!e) glued.set(w.line, (e = { l: [], r: [] }));
+    ((w.xLeft + w.xRight) / 2 < xMid ? e.l : e.r).push(w);
+  }
+  const corrSamples: number[] = [];
+  for (const { l, r } of glued.values()) {
+    if (!l.length || !r.length) continue;
+    const lText = l.map((w) => w.text).join(' ');
+    const rText = r.map((w) => w.text).join(' ');
+    const m = rText.match(/(\d{1,4})[.,]\s?(\d{2})/);
+    if (!m) continue;
+    const rNeg = /-\s?\d/.test(rText);
+    const rVat = r.some((w) => /[ABC]$/i.test(w.text.trim()));
+    const rDeposit = Number(m[1]) === 0 && Number(m[2]) > 0 && Number(m[2]) <= 30 && Number(m[2]) % 10 === 0;
+    if (!(isTDiscount(lText) || (ikiStrongName(lText) && !rNeg && rVat && !rDeposit))) continue;
+    // Each side must be a TIGHT single-row group: MLKit also glues TWO printed rows into
+    // one line (receipt-161: the unit-calc row + its NUOLAIDA label below), and a bimodal
+    // side's median lands between the rows — fabricating an offset that isn't there.
+    const lNorms = l.map(normOf), rNorms = r.map(normOf);
+    if (Math.max(...lNorms) - Math.min(...lNorms) > lineH * 0.5) continue;
+    if (Math.max(...rNorms) - Math.min(...rNorms) > lineH * 0.5) continue;
+    corrSamples.push(emedian(lNorms) - emedian(rNorms));
+  }
+  let colCorr = 0;
+  if (corrSamples.length >= 2) {
+    const med = emedian(corrSamples);
+    if (Math.abs(med) > lineH * 0.25) colCorr = Math.max(-0.9 * lineH, Math.min(0.9 * lineH, med));
+  }
+  if (process.env.IKI_DEBUG) {
+    console.error(`[COLCORR] samples=[${corrSamples.map((s) => s.toFixed(1)).join(', ')}] colCorr=${colCorr.toFixed(1)} lineH=${lineH.toFixed(1)}`);
+  }
+  const normA = (ws: EWord[]) => norm(ws) + colCorr;
   const linesOf = (ws: EWord[]) => new Set(ws.map((w) => w.line));
-  const hosts = ikiClusterRows(left, lineH, medSlope).map((ws) => ({ ws, lines: linesOf(ws) }));
+  const hosts = ikiClusterRows(left, splitH, medSlope).map((ws) => ({ ws, lines: linesOf(ws) }));
   const standalone: EWord[][] = [];
-  for (const amt of ikiClusterRows(right, lineH, medSlope)) {
+  for (let amt of ikiClusterRows(right, splitH, medSlope)) {
+    // MONGREL SPLIT (receipt-275): xMid sits clamp-floored generously left, so a long
+    // name's TAIL ("LAVAZZA … ORO MALTA") crosses into the price partition and can
+    // cluster with the NEIGHBOUR row's amount. Rule (1) would then attach that amount
+    // to the tail's name row — scrambling both the price and the discount. Split ONLY
+    // the semantically-certain shape: the cluster is NEGATIVE and its digit words'
+    // own source line maps to a DISCOUNT-LABEL host (on IKI a negative printed on a
+    // label line belongs to that label, full stop) while the tail votes elsewhere.
+    // Tails go home to their own line's host (completing the name); the amount stays
+    // a cluster and proceeds to the label through the normal flow. Anything wider was
+    // tried and REVERTED — generic tail re-routing broke the pinned dense-pitch
+    // mongrel rides (161's unit-calc recovery, 172/242 fragment columns).
+    const LT_ALPHA_RE = /^[A-Za-zĄČĘĖĮŠŲŪŽąčęėįšųūž]{3,}$/;
+    const digitWords = amt.filter((w) => /\d/.test(w.text));
+    const tailWords = amt.filter((w) => LT_ALPHA_RE.test(w.text.trim()));
+    if (digitWords.length && tailWords.length && digitWords.some((w) => /-\s?\d/.test(w.text))) {
+      const digitHost = hosts.find((h) => [...linesOf(digitWords)].some((ln) => h.lines.has(ln)));
+      const tailHost = hosts.find((h) => [...linesOf(tailWords)].some((ln) => h.lines.has(ln)));
+      if (digitHost && tailHost && digitHost !== tailHost &&
+          isTDiscount(digitHost.ws.map((w) => w.text).join(' '))) {
+        tailHost.ws.push(...tailWords);
+        amt = amt.filter((w) => !tailWords.includes(w));
+      }
+    }
     const aLines = linesOf(amt);
     let host = hosts.find((h) => [...aLines].some((ln) => h.lines.has(ln)));   // (1) MLKit grouped them
     // LEADING-DISCOUNT GUARD: MLKit fuses a product's "-X,XX A" discount onto the NEXT product's
@@ -1192,10 +1719,62 @@ function ikiBuildRows(words: EWord[], lineH: number, medSlope: number, xMid: num
     // it left on the bag row; re-homing it there would break that — receipt-161 Žaliosios cukinijos).
     const isNegAmt = amt.some((w) => /^-/.test(w.text.trim()));
     const hostText = host ? host.ws.map((w) => w.text).join(' ') : '';
-    if (host && isNegAmt && !isTSkip(hostText) && norm(host.ws) > norm(amt) + lineH * 0.5) host = undefined;
+    if (host && isNegAmt && !isTSkip(hostText) && norm(host.ws) > normA(amt) + lineH * 0.5) host = undefined;
+    // POSITIVE twin of the leading-discount guard, DEPOSIT-TARGETED: MLKit also glues a
+    // bare bottle-deposit amount onto the NEXT printed line's NAME ("0,10 TICHĖ NATŪRALUS…",
+    // receipt-228 — the deposit's 0,10 rode on the water's name line), so rule (1) binds it
+    // a full line below where it belongs. Signature of that case: the amount is positive
+    // with NO VAT-class letter (every real product total ends in A/B/C; deposits never do)
+    // and a DEPOSIT-labeled row exists nearby. Re-home it onto the nearest deposit row —
+    // never onto an arbitrary nearest row: under a sheared/curved column (receipt-169 —
+    // the price column rides a full line below the names) nearest-Y picks the WRONG name
+    // row, while the deposit row is the semantically-certain owner of a bare no-VAT amount.
+    // Three gates keep this from stealing a REAL total whose VAT letter merely got
+    // dropped/garbled: (a) VAT scan over ALL amount words (the letter is often its own
+    // token or fused into the number, "0,10A"); (b) the amount must be an actual DEPOSIT
+    // DENOMINATION (0,10/0,20/0,30 — the assembler's own depositLike rule); (c) never
+    // target a deposit-REFUND row (its negative is the refund itself, not a home for a
+    // stray positive).
+    const amtText = amt.map((w) => w.text).join(' ');
+    const amtHasVat = amt.some((w) => /[ABC]$/i.test(w.text.trim()));
+    const amtM = amtText.match(/(\d{1,4})[.,]\s?(\d{2})/);
+    const amtDepositLike = amtM != null && Number(amtM[1]) === 0 &&
+      Number(amtM[2]) > 0 && Number(amtM[2]) <= 30 && Number(amtM[2]) % 10 === 0;
+    if (host && !isNegAmt && !amtHasVat && amtDepositLike && !T_DEPOSIT_RE.test(hostText) &&
+        norm(host.ws) > normA(amt) + lineH * 0.5) {
+      const aN = normA(amt);
+      let dep: typeof host | undefined; let depD = lineH * 1.2;
+      for (const h of hosts) {
+        if (h === host) continue;
+        const ht = h.ws.map((w) => w.text).join(' ');
+        if (!T_DEPOSIT_RE.test(ht) || T_DEPOSIT_REFUND_RE.test(ht)) continue;
+        const d = Math.abs(norm(h.ws) - aN);
+        if (d < depD) { depD = d; dep = h; }
+      }
+      if (dep) host = dep;
+    }
     if (!host) {                                                               // (2) nearest by tilt-corrected Y
-      const aN = norm(amt); let bestD = lineH * 0.6;
-      for (const h of hosts) { const d = Math.abs(norm(h.ws) - aN); if (d < bestD) { bestD = d; host = h; } }
+      // FIX B (receipt-271): a POSITIVE VAT-lettered amount is a product TOTAL — its home
+      // is a NAME/calc row, never a bare "NUOLAIDA…" label (labels only own negatives on
+      // IKI). Under dense pitch + curvature the label row can sit marginally nearer in
+      // normalized Y than the true name row (grietinė's 2,79: label at 10px, DVARO at
+      // 26px) — so label rows are eligible only when NO non-label host is in radius.
+      // Negative / non-VAT amounts keep the plain nearest-Y rule.
+      const aN = normA(amt);
+      const posVat = !isNegAmt && amtHasVat && /\d/.test(amtText);
+      let bestD = lineH * 0.6; let bestLabelD = lineH * 0.6;
+      let bestLabel: { ws: EWord[]; lines: Set<number> } | undefined;
+      for (const h of hosts) {
+        const d = Math.abs(norm(h.ws) - aN);
+        if (posVat && isTDiscount(h.ws.map((w) => w.text).join(' '))) {
+          if (d < bestLabelD) { bestLabelD = d; bestLabel = h; }
+        } else if (d < bestD) { bestD = d; host = h; }
+      }
+      host = host ?? bestLabel;
+    }
+    if (process.env.IKI_DEBUG) {
+      const txt = amt.map((w) => w.text).join(' ');
+      console.error(`[ATTACH] amt "${txt}" norm=${normA(amt).toFixed(1)} -> host="${host ? host.ws.map((w)=>w.text).join(' ').slice(0,40) : 'STANDALONE'}" hostNorm=${host ? norm(host.ws).toFixed(1) : '-'}`);
     }
     if (host) host.ws.push(...amt);
     else standalone.push(amt);                                                 // (3) price with no name
@@ -1270,7 +1849,7 @@ function tileByContent(items: Array<{ dt: number; db: number; region: Region }>,
   }
 }
 
-export function parseIkiColumnar(lines: IkiLine[], start: number, end: number, skipped?: Region[], headerAddr?: string): IkiProduct[] {
+export function parseIkiColumnar(lines: IkiLine[], start: number, end: number, skipped?: Region[], headerAddr?: string, combo?: { amount: number }, recon?: { adjust: number }): IkiProduct[] {
   const words = ikiCollectWords(lines, start, end);
   if (words.length < 2) return [];
   const lineH = emedian(words.map((w) => w.yBottom - w.yTop).filter((h) => h > 0)) || 24;
@@ -1278,16 +1857,30 @@ export function parseIkiColumnar(lines: IkiLine[], start: number, end: number, s
   const X0 = Math.min(...words.map((w) => w.xLeft));
   const X1 = Math.max(...words.map((w) => w.xRight));
   const Xmid = ikiColumnSplit(words, X0, X1);
-  const rows = ikiBuildRows(words, lineH, medSlope, Xmid).map((ws) => ikiClassifyRow(ws, lines));
+  // splitH = min(box height, measured row pitch), used ONLY for the row-split threshold:
+  // identical to lineH unless the boxes are provably padded past the real pitch
+  // (receipt-228, where inflated boxes chain-merged adjacent printed lines). The attach/
+  // fold radii keep the generous lineH — see ikiBuildRows.
+  // TUNING GRAVEYARD (both variants traded real fleet receipts — don't re-try blind):
+  //   • LEFT-column-only estimate (to dodge cross-column stagger) shifted row formation
+  //     on receipts 211/227 → lost products/promos.
+  //   • A 0.65·lineH FLOOR (to guard a theoretical tilt-collapse where the stagger lands
+  //     in the level band) re-merged receipt-211's genuinely sub-0.65·lineH rows — on a
+  //     scrambled receipt the LOW measured pitch is CORRECT, the rows really are that
+  //     close. The collapse scenario needs on-device tilt (stored fixtures all have
+  //     medSlope=0), so guard it there if it ever materialises.
+  const pitch = ikiEstimateRowPitch(words, lineH, medSlope);
+  const splitH = pitch != null ? Math.min(lineH, pitch) : lineH;
+  const rows = ikiBuildRows(words, lineH, splitH, medSlope, Xmid).map((ws) => ikiClassifyRow(ws, lines));
 
   // ── assemble: accumulate a product's rows until the NEXT product starts. The
   //    positive `X,XX A` total anchors a product; a discount FOLLOWS its total in
   //    IKI, so it attaches to the current product (not the next). A name fused onto
   //    a weight/total/discount row is recovered: on a discount row that name starts
   //    the NEXT product. Guarded recovery for a trailing name with no total. ──
-  interface Cur { nameParts: string[]; perKg: number | null; total: number | null; discount: number; top: ERow | null; price: ERow | null; rows: ERow[]; aCount: number; kgRows: number; weighRows: number; kgVal: number | null; unitQty: number | null; discPending: boolean; }
+  interface Cur { nameParts: string[]; perKg: number | null; total: number | null; totSoft: boolean; totUnknown: boolean; totCands: number[] | null; discount: number; top: ERow | null; price: ERow | null; rows: ERow[]; aCount: number; kgRows: number; weighRows: number; kgVal: number | null; unitQty: number | null; discPending: boolean; discPendingCard: boolean; }
   const out: { p: IkiProduct; top: ERow; price: ERow | null; rows: ERow[] }[] = [];
-  const fresh = (): Cur => ({ nameParts: [], perKg: null, total: null, discount: 0, top: null, price: null, rows: [], aCount: 0, kgRows: 0, weighRows: 0, kgVal: null, unitQty: null, discPending: false });
+  const fresh = (): Cur => ({ nameParts: [], perKg: null, total: null, totSoft: false, totUnknown: false, totCands: null, discount: 0, top: null, price: null, rows: [], aCount: 0, kgRows: 0, weighRows: 0, kgVal: null, unitQty: null, discPending: false, discPendingCard: false });
   const rowText = (r: ERow) => r.words.map((w) => w.text).join(' ').replace(/\s+/g, ' ').trim();
   let cur = fresh();
   const flush = () => {
@@ -1301,8 +1894,8 @@ export function parseIkiColumnar(lines: IkiLine[], start: number, end: number, s
       name = mb.name;
       if (mb.unitQty != null) c.unitQty = mb.unitQty;
     }
-    if (c.total == null && !ikiStrongName(name)) return; // guarded recovery
-    const lt = c.total ?? 0;
+    // (guarded recovery + the lt snapshot moved BELOW the row solver — the solver can
+    // recover/correct c.total, and both must see the SOLVED value, not the raw read.)
     // LINE-TEXT weight recovery: MLKit sometimes drops the weight row's word-boxes, leaving
     // only the product NAME boxed on a fused "NAME … X,XXX kg X … EUR/kg" line — the column
     // engine (word-box based) then never sees the weight and the item drops to a unit price
@@ -1320,6 +1913,34 @@ export function parseIkiColumnar(lines: IkiLine[], start: number, end: number, s
         if (c.kgVal != null) break;
       }
     }
+    // ── ROW SOLVER (Phase 1, shared/ROBUST_PARSING_PLAN.md) ──
+    // A weighed IKI line is an arithmetic identity: printed total = round2(kg × €/kg).
+    // The parser has long recovered the other two directions (€/kg = total ÷ kg below;
+    // qty = total ÷ €/kg in the quantity fallback) — this adds the third and uses it to
+    // outrank risky reads:
+    //  • RECOVER: both kg and €/kg are strict reads but the total was unreadable
+    //    ("0, 7? A", a dropped total) → the total IS kg × €/kg. No glyph knowledge needed.
+    //  • OVERRULE: the total came from a fallback lane (headless/bare/garbled — totSoft)
+    //    and CONTRADICTS the locked arithmetic → the equation wins over the risky read
+    //    (a foreign amount that drifted onto the calc row can no longer become the total).
+    // A strict-read total is NEVER overruled here — a printed-vs-computed mismatch on
+    // trusted reads is a receipt-level flag (Phase 2), not a silent rewrite.
+    if (c.kgVal != null && c.kgVal > 0 && c.perKg != null && c.perKg > 0 && (c.weighRows >= 1 || c.kgRows >= 1)) {
+      const expectTot = round2(c.kgVal * c.perKg);
+      if (expectTot > 0) {
+        if (c.total == null) {
+          c.total = expectTot;
+          if (process.env.IKI_DEBUG) console.log(`[SOLVER] recovered total ${expectTot} = ${c.kgVal} kg × ${c.perKg} €/kg (was unreadable)`);
+        } else if (c.totSoft && Math.abs(c.total - expectTot) > 0.005) {
+          // exact-to-the-cent identity: a soft read either matches round2(kg × €/kg)
+          // exactly or the equation wins (even a 1-cent drift on a RISKY lane is a miss).
+          if (process.env.IKI_DEBUG) console.log(`[SOLVER] overruled soft total ${c.total} → ${expectTot} (${c.kgVal} kg × ${c.perKg} €/kg)`);
+          c.total = expectTot;
+        }
+      }
+    }
+    if (c.total == null && !c.totUnknown && !ikiStrongName(name)) return; // guarded recovery (an unknown-total row still anchors)
+    const lt = c.total ?? 0;
     // RECOVER a garbled €/kg: the printed €/kg was unreadable ("3,9a EUR" → null) but we
     // have the line total and the printed kg quantity, so €/kg = total ÷ qty
     // (2,87 ÷ 0,720 = 3,99). Keeps the item WEIGHED with a real €/kg instead of a unit
@@ -1355,9 +1976,23 @@ export function parseIkiColumnar(lines: IkiLine[], start: number, end: number, s
     // was mis-attributed. Drop the promo rather than surface a negative "promo price". The penny
     // line itself is handled by the nameless-penny guard / region recovery.
     const validDisc = c.discount > 0 && paid >= 0;
+    // Internal reconciliation markers (STRIPPED before the parse result leaves the parser):
+    // _paid = what this line contributed to the printed total; null = unknown (unreadable
+    // total). _unk carries the unknown-total candidates + discount for the receipt solver.
+    // card-flavored discount? ("… SU KORTELE" rows) — feeds the sutaupėte equation
+    const cardLabeled = c.rows.some((r) => (r.discount > 0 || r.discLabel) && isKorteleWord(rowText(r)));
+    const marks: any = {
+      _paid: c.total == null ? null : round2(lt - c.discount),
+      ...(c.total == null && c.totUnknown ? { _unk: { cands: c.totCands, discount: c.discount } } : {}),
+      ...(c.discount > 0 && cardLabeled ? { _cardDisc: c.discount } : {}),
+      // a discount is KNOWN TO EXIST (its label printed) but the amount never surfaced —
+      // the savings equation can pin it (kopūstai "HUOLA!DA KORTFLE" with no amount).
+      ...(c.discPending && c.discount === 0 && c.total != null ? { _unkDisc: { card: c.discPendingCard, lineTotal: lt } } : {}),
+    };
     out.push({
       top: c.top, price: c.price, rows: c.rows.slice(),
       p: {
+        ...marks,
         name: cleanProductName(name || '?'),
         price: unitPrice,
         promoPrice: weighedNoPpu ? null : (validDisc && quantity > 0 ? round2(paid / quantity) : null),
@@ -1401,7 +2036,11 @@ export function parseIkiColumnar(lines: IkiLine[], start: number, end: number, s
     if (
       afterFusedDepositLabel && cur.top != null &&
       depositLike && !rowVatLettered && r.discount === 0 && !r.perKg && !ikiStrongName(r.leftText)
-    ) { cur.rows.push({ ...r, isSkip: true, isDeposit: true }); continue; }
+    ) {
+      // deposit charge is part of the printed total — book it for reconciliation
+      if (recon && r.total != null) recon.adjust = round2(recon.adjust + r.total);
+      cur.rows.push({ ...r, isSkip: true, isDeposit: true }); continue;
+    }
     // The BAG's OWN price ("0,01 A") sits on the row right after the "MAIŠELIS PLASTIKINIS"
     // skip row (whose fused loyalty discount already went to the product above). It arrives
     // NAMELESS with a tiny positive total, so the boundary logic below would mint it as a
@@ -1412,12 +2051,31 @@ export function parseIkiColumnar(lines: IkiLine[], start: number, end: number, s
     if (
       afterBagSkip && r.total != null && r.total > 0 && r.total <= 0.5 &&
       r.discount === 0 && !r.perKg && !ikiStrongName(r.leftText)
-    ) { continue; }
+    ) {
+      // the bag's own charge is part of the printed total — book it for reconciliation
+      if (recon) recon.adjust = round2(recon.adjust + r.total);
+      continue;
+    }
     if (r.isSkip) {
       // A bottle DEPOSIT belongs to the product ABOVE — fold it into that product's
       // rows so the SAME band covers it, but DON'T flush and DON'T add its amount
-      // (it's a charge, not a product; total was never set on a skip row anyway).
-      if (r.isDeposit && cur.top != null) { cur.rows.push(r); continue; }
+      // to the product (it's a charge, not a product). The charge itself IS part of
+      // the printed total though — book a deposit-denomination amount riding the
+      // row's own text ("DEPOZITAS 0, 10") into recon.adjust, or reconciliation
+      // runs short by every deposit (receipt-278: 2×0,10). Refund rows are excluded
+      // (their negative is the refund itself, not a charge).
+      if (r.isDeposit && cur.top != null) {
+        if (recon) {
+          const dtxt = rowText(r);
+          const dm = dtxt.match(/(\d{1,4}[.,]\s?\d{2})/);
+          const dv = dm ? parseNum(dm[1]) : 0;
+          const dc = Math.round(dv * 100);
+          if (dc > 0 && dc <= 30 && dc % 10 === 0 && !/-\s*\d/.test(dtxt) && !T_DEPOSIT_REFUND_RE.test(dtxt)) {
+            recon.adjust = round2(recon.adjust + dv);
+          }
+        }
+        cur.rows.push(r); continue;
+      }
       // RECOVER a mis-clustered discount AMOUNT that band-merged onto this skip row: ONLY when the
       // open product flagged discPending (its calc row carried a "NUOLAIDA" label but no amount —
       // so a discount is KNOWN to exist), it has no discount yet, the negative fits its total, AND
@@ -1425,15 +2083,20 @@ export function parseIkiColumnar(lines: IkiLine[], start: number, end: number, s
       // coupon/points skip ("KUPONAS -0,30", "IKI Taškais -0,05") owns its negative and must NOT be
       // stolen (the bag gate is what keeps that promise). (receipt-161 Žaliosios cukinijos: -1,80
       // rode the MAIŠELIS bag row.)
+      let skipDiscStolen = false;
       if (cur.discPending && cur.discount === 0 && r.discount > 0 && cur.total != null &&
           r.discount <= cur.total && T_BAG_RE.test(rowText(r))) {
-        cur.discount += r.discount; cur.discPending = false;
+        cur.discount += r.discount; cur.discPending = false; skipDiscStolen = true;
       }
+      // The skip's own charge (+) / own negative (−) are part of the printed total —
+      // book them so receipt reconciliation can balance (IKI Taškais +0,01/−0,05,
+      // coupon negatives, bag charges that ride the skip row itself).
+      if (recon) recon.adjust = round2(recon.adjust + (r.total ?? 0) - (skipDiscStolen ? 0 : r.discount));
       // Any OTHER skip (coupon/bag/points) CLOSES the current product: it's the
       // trailer section, so a trailing points amount (e.g. "IKI Taškais -0,05 A",
       // whose skip word didn't survive into the row's words) can't attach to the
       // last real product as a phantom discount.
-      if (cur.total != null) flush();
+      if (cur.total != null || cur.totUnknown) flush();
       continue;
     }
     // AGGREGATE/LOYALTY savings-line guard (receipt 119): the receipt's "sutaupėte 2,50
@@ -1482,7 +2145,7 @@ export function parseIkiColumnar(lines: IkiLine[], start: number, end: number, s
     // through as a name continuation; the product's REAL total arrives on a later row.
     const softCont = r.softTotal === true && cur.top != null && cur.total == null && cur.nameParts.length >= 1;
     const rTotal = softCont ? null : r.total;                              // effective total for assembly
-    const carriesAmt = rTotal != null || r.discount > 0;                   // an A-terminated price
+    const carriesAmt = rTotal != null || r.discount > 0 || r.totUnknown === true; // an A-terminated price (incl. unreadable)
     // SELF-HEAL (user rule): an IKI product has AT MOST two A-prices — one total
     // and one discount. A 3rd A-price proves two products were merged, so the 3rd
     // one opens a new product. This catches over-absorption even when a fused
@@ -1494,6 +2157,23 @@ export function parseIkiColumnar(lines: IkiLine[], start: number, end: number, s
     // case with no other anchor). Stops one band covering two weighed products
     // (POMIDORAI 0,720 kg fusing RAUDONOSIOS 0,470 kg into a single box).
     if (r.kgQty && cur.kgRows >= 1) flush();
+    // COMBO-SET row ("RINKINYS -1,90"): the discount is IKI's multi-buy DEAL amount —
+    // a RECEIPT-level adjustment (→ footer.comboDiscount), NOT the open product's promo,
+    // and the bare combo word must never open a product. Intercept BEFORE the discount
+    // branches below would attribute the -1,90 to the open product (where a net-negative
+    // guard silently discards it — receipt-229's "IKI most expensive" bug). The row stays
+    // visible as a grey skip band.
+    if (r.discount > 0 && isIkiComboSetName(r.leftText || '')) {
+      if (combo) combo.amount = round2(combo.amount + r.discount);
+      if (skipped && r.words.length) {
+        skipped.push({
+          xLeft: Math.min(...r.words.map((w) => w.xLeft)),
+          xRight: Math.max(...r.words.map((w) => w.xRight)),
+          yTop: r.topY, yBottom: r.botY, kind: 'skipped',
+        } as LabeledRegion);
+      }
+      continue;
+    }
     // A discount row whose LEFT side is the next product's name → the discount
     // belongs to the current product; the name opens the NEXT one.
     if (r.discount > 0 && strong) {
@@ -1533,7 +2213,13 @@ export function parseIkiColumnar(lines: IkiLine[], start: number, end: number, s
       // (receipt-154 SUNOKE: its 1,99 rode on the discount row). NOT for a weighed product: its
       // total comes from its kg-calc, and a weighed NEIGHBOUR's total can leak into this discount
       // row, minting a phantom with a foreign discount (receipt-105 paprikos).
-      if (r.mergedTotal != null && cur.total == null && cur.perKg == null && cur.kgVal == null && cur.weighRows === 0) {
+      // FIX A (receipt-271 price theft): donation requires a REAL discount amount on the
+      // row (dv > 0 — the receipt-154 shape "NUOLAIDA … -0,50 1,99 A"). A BARE label
+      // (dv = 0) glued with a positive is almost always the NEXT product's price that
+      // MLKit sheared onto the label line — donating it steals the neighbour's price
+      // (Lavazza took grietinė's 2,79). The bare-label positive is left for the attach/
+      // reconciliation layers to place correctly.
+      if (r.mergedTotal != null && r.discount > 0 && cur.total == null && cur.perKg == null && cur.kgVal == null && cur.weighRows === 0) {
         cur.total = r.mergedTotal; cur.price = r; cur.aCount++;
       }
       continue;
@@ -1542,12 +2228,20 @@ export function parseIkiColumnar(lines: IkiLine[], start: number, end: number, s
     // ALSO ends the current product when it already has a weight (perKg) even with
     // NO total — IKI dropped the total on this scan, but a new named product still
     // means the old one is done (prevents POMIDORAI absorbing RAUDONOSIOS).
-    if ((strong || rTotal != null) && cur.total != null) flush();
+    if ((strong || rTotal != null || r.totUnknown === true) && (cur.total != null || cur.totUnknown)) flush();
     else if (strong && cur.perKg != null) flush();
     if (name) cur.nameParts.push(name);
     if (r.perKg != null) cur.perKg = r.perKg;
-    if (rTotal != null) { cur.total = rTotal; cur.price = r; cur.aCount++; }
-    if (r.discLabel) cur.discPending = true;   // calc row carried a NUOLAIDA label w/o amount → recover it from a later row
+    if (rTotal != null) { cur.total = rTotal; cur.totSoft = r.totSoft === true; cur.price = r; cur.aCount++; }
+    if (rTotal != null && r.selfDisc != null && r.selfDisc > 0) { cur.discount += r.selfDisc; cur.aCount++; }
+    else if (r.totUnknown === true && cur.total == null && !cur.totUnknown) {
+      cur.totUnknown = true; cur.totCands = r.totCands ?? null; cur.price = r; cur.aCount++;
+    }
+    if (r.discLabel) {
+      cur.discPending = true;   // calc row carried a NUOLAIDA label w/o amount → recover it from a later row
+      // card-flavored label ("… SU KORTELE") — feeds the sutaupėte savings equation
+      if (isKorteleWord(rowText(r))) cur.discPendingCard = true;
+    }
     if (r.kgQty) cur.kgRows++;
     if (r.weigh) cur.weighRows++;
     if (r.kgVal != null && cur.kgVal == null) cur.kgVal = r.kgVal;
@@ -1601,6 +2295,7 @@ export function parseIkiColumnar(lines: IkiLine[], start: number, end: number, s
     const paid = round2(P.price - x.price);
     if (paid < 0) continue;
     P.promoPrice = paid;
+    (P as any)._paid = paid; // the fold changed what this line contributed to the total
     const xr = x.region, pr = P.region;                                  // grow P's band over the folded discount line
     if (xr && pr) { pr.yBottom = Math.max(pr.yBottom, xr.yBottom); pr.xRight = Math.max(pr.xRight, xr.xRight); pr.xLeft = Math.min(pr.xLeft, xr.xLeft); }
     out[i - 1].rows.push(...out[i].rows);
@@ -1956,10 +2651,28 @@ export function parseIkiColumnar(lines: IkiLine[], start: number, end: number, s
   // COMBO-SET discount: drop a bare "RINKINYS" line (IKI's multi-buy/combo deal), see
   // isIkiComboSetName. Qualified products ("ŽALUMYNŲ RINKINYS") survive — only the
   // standalone combo word is dropped. (receipt-169 "RINKINYS -1,90", receipt-206 "RINKTN)S".)
-  return out.filter((o) => !isIkiComboSetName(o.p.name)).map((o) => o.p);
+  // The dropped row's NEGATIVE is real money off the paid total — capture its magnitude
+  // into the combo accumulator (→ footer.comboDiscount) instead of discarding it, and keep
+  // the row visible as a grey skip band. (receipt-229: "RINKINYS -1,90" — without this the
+  // total over-counts by 1.90 and the store comparison flags IKI as most expensive.)
+  return out.filter((o) => {
+    if (!isIkiComboSetName(o.p.name)) return true;
+    if (combo) {
+      // Distinct amounts only: a row's rawLines carry both the source line and the merged
+      // row text, so the same "-1,90" can appear twice — one combo row has ONE deal amount.
+      const seen = new Set<number>();
+      for (const rl of o.p.rawLines ?? []) {
+        const m = rl.match(T_NEG_RE);
+        if (m) seen.add(parseNum(m[1]));
+      }
+      for (const v of seen) combo.amount = round2(combo.amount + v);
+      if (skipped && o.p.region) skipped.push({ ...o.p.region, kind: 'skipped' } as LabeledRegion);
+    }
+    return false;
+  }).map((o) => o.p);
 }
 
-function parseThermalProducts(lines: IkiLine[], start: number, end: number, headerAddr?: string): IkiProduct[] {
+function parseThermalProducts(lines: IkiLine[], start: number, end: number, headerAddr?: string, combo?: { amount: number; regions: Region[] }): IkiProduct[] {
   // 1) Explode OCR-fused rows into atomic tokens.
   const toks: ThermalTok[] = [];
   for (let i = start; i < end; i++) for (const tk of explodeThermalLine(lines[i])) toks.push(tk);
@@ -2123,10 +2836,98 @@ function parseThermalProducts(lines: IkiLine[], start: number, end: number, head
   // parseIkiThermal's unified pass, AFTER the skipped coupon/bag/points lines are
   // threaded in — so here each product keeps its TRUE content box (name-top +
   // price-row-bottom corners). The tiler turns those into seams.
-  return out.filter((p) => !isIkiComboSetName(p.name));
+  // Dropped bare-RINKINYS combo rows: capture the deal's negative into the combo
+  // accumulator (→ footer.comboDiscount) + surface the row as a grey skip band —
+  // see the identical columnar-path capture in parseIkiColumnar.
+  return out.filter((p) => {
+    if (!isIkiComboSetName(p.name)) return true;
+    if (combo) {
+      const seen = new Set<number>();
+      for (const rl of p.rawLines ?? []) {
+        const m = rl.match(T_NEG_RE);
+        if (m) seen.add(parseNum(m[1]));
+      }
+      for (const v of seen) combo.amount = round2(combo.amount + v);
+      if (p.region) combo.regions.push(p.region);
+    }
+    return false;
+  });
+}
+
+// ── MLKit GHOST-LINE filter ──
+// A photographed row can be read TWICE: besides the true per-row lines, MLKit sometimes emits
+// an extra DIAGONAL line cutting across two printed rows and re-reading their glyphs
+// (receipt-236: "ATLAITINES LAan EUR/ k9" stitched from the salmon NAME row + its CALC row —
+// the row clusterer then merged the ghost into both real rows and the product name interleaved
+// the two reads: "ATLAITINES ATLAT INES LAŠISOS LAan 99 BE EUR/ EUR/ GAL k9 kg"). A ghost is
+// dropped only when TWO independent signals agree:
+//   1. BASELINE-INCOHERENT — its words don't sit on one printed row: the spread of word-centre
+//      residuals against the line's OWN baseline (corner-interpolated, so a legitimately tilted
+//      row self-absorbs its slope) exceeds ~half a word height. A real row's words share a
+//      baseline within a few px; the receipt-236 ghost stepped a full row height (48px) across
+//      its span while its corners were FLAT.
+//   2. REDUNDANT — EVERY word's box is substantially re-covered by words of baseline-COHERENT
+//      lines (min coverage ≥ 0.35, mean ≥ 0.5): dropping the line loses no glyphs that aren't
+//      already read elsewhere. Coverage never counts other incoherent candidates, so two
+//      diagonal artifacts can't justify each other.
+// Lines without word boxes neither contribute coverage nor get dropped (fail-open — legacy
+// dumps and price-only fragments are untouched).
+function dropGhostLines(lines: IkiLine[]): IkiLine[] {
+  if (!lines.some((l) => (l.words?.length ?? 0) >= 2)) return lines;
+  // Residual spread of word centres vs the line's own (corner-tilted) mid-baseline.
+  const baselineSpread = (l: IkiLine): number => {
+    const ws = l.words!;
+    const span = (l.xRight - l.xLeft) || 1;
+    const midAt = (x: number) => {
+      const f = (x - l.xLeft) / span;
+      const top = (l.yLeftTop ?? l.yTop) + ((l.yRightTop ?? l.yTop) - (l.yLeftTop ?? l.yTop)) * f;
+      const bot = (l.yLeftBottom ?? l.yBottom) + ((l.yRightBottom ?? l.yBottom) - (l.yLeftBottom ?? l.yBottom)) * f;
+      return (top + bot) / 2;
+    };
+    let lo = Infinity, hi = -Infinity;
+    for (const w of ws) {
+      const r = (w.yTop + w.yBottom) / 2 - midAt((w.xLeft + w.xRight) / 2);
+      if (r < lo) lo = r;
+      if (r > hi) hi = r;
+    }
+    return hi - lo;
+  };
+  const medianWordH = (l: IkiLine): number => {
+    const hs = l.words!.map((w) => w.yBottom - w.yTop).sort((a, b) => a - b);
+    return hs[Math.floor(hs.length / 2)] || 1;
+  };
+  const incoherent = new Set<number>();
+  for (let i = 0; i < lines.length; i++) {
+    const ws = lines[i].words;
+    if (!ws || ws.length < 2) continue;
+    if (baselineSpread(lines[i]) > 0.55 * medianWordH(lines[i])) incoherent.add(i);
+  }
+  if (!incoherent.size) return lines;
+  const inter = (a: IkiWord, b: IkiWord): number => {
+    const w = Math.min(a.xRight, b.xRight) - Math.max(a.xLeft, b.xLeft);
+    const h = Math.min(a.yBottom, b.yBottom) - Math.max(a.yTop, b.yTop);
+    return w > 0 && h > 0 ? w * h : 0;
+  };
+  const ghosts = new Set<number>();
+  for (const i of incoherent) {
+    const ratios = lines[i].words!.map((w) => {
+      const area = Math.max(1, (w.xRight - w.xLeft) * (w.yBottom - w.yTop));
+      let covered = 0;
+      for (let j = 0; j < lines.length && covered < area; j++) {
+        if (j === i || incoherent.has(j)) continue;
+        for (const w2 of lines[j].words ?? []) covered += inter(w, w2);
+      }
+      return Math.min(1, covered / area);
+    });
+    const min = Math.min(...ratios);
+    const mean = ratios.reduce((a, b) => a + b, 0) / ratios.length;
+    if (min >= 0.35 && mean >= 0.5) ghosts.add(i);
+  }
+  return ghosts.size ? lines.filter((_, i) => !ghosts.has(i)) : lines;
 }
 
 function parseIkiThermal(lines: IkiLine[]): IkiParseResult {
+  lines = dropGhostLines(lines);
   const rawText = lines.map((l) => l.text).join('\n');
   const region = regionOf(lines);
   // RECEIPT tilt SAMPLES: each WIDE multi-word line's (yCentre, slope). The receipt is
@@ -2143,7 +2944,13 @@ function parseIkiThermal(lines: IkiLine[]): IkiParseResult {
       const lw = ws.reduce((a, b) => (b.xLeft + b.xRight < a.xLeft + a.xRight ? b : a));
       const rw = ws.reduce((a, b) => (b.xLeft + b.xRight > a.xLeft + a.xRight ? b : a));
       const lcx = (lw.xLeft + lw.xRight) / 2, rcx = (rw.xLeft + rw.xRight) / 2;
-      if (rcx - lcx > 0.4 * W) refSamples.push({ y: (lw.yTop + rw.yTop) / 2, slope: (rw.yTop - lw.yTop) / (rcx - lcx) });
+      if (rcx - lcx <= 0.4 * W) continue;
+      // SHEAR-PROOF: the wide lines this sampler prefers are exactly the ones that
+      // glue the name column to the price column — a leftmost-vs-rightmost slope
+      // there measures the OCR column shear, not the paper tilt (receipt-232's
+      // bands pivoted up from it). robustLineSlope measures within columns only.
+      const s = robustLineSlope(ws);
+      if (s != null) refSamples.push({ y: (lw.yTop + rw.yTop) / 2, slope: s });
     }
   }
   const refTilt = refSamples.length ? Math.max(-0.12, Math.min(0.12, emedian(refSamples.map((s) => s.slope)))) : 0;
@@ -2431,8 +3238,22 @@ function parseIkiThermal(lines: IkiLine[]): IkiParseResult {
     // prints mid-products and must NOT truncate — excluded by the nuolaid guard; a trader number /
     // uppercase "ID" still qualifies a line on its own.
     const endCompact = endText.replace(/\s+/g, '');
-    const isTrader = T_TRADER_LINE_RE.test(endCompact) &&
-      (!/nuolaid/i.test(endCompact) || T_TRADER_NUM_RE.test(endText) || T_TRADER_ID_RE.test(endText));
+    // Lexicon-matched (Phase 3): one fuzzy "Prekiautojo" matcher replaces the strict +
+    // garbled stem pair. Distance-tiered trust: a CLEAN hit (d=0) behaves like the old
+    // strict stem (qualifies alone unless it's the "…nuolaida" promo line); a GARBLED
+    // hit (d>0 — "Prckiautojo", "Pr ekiaut o") additionally requires the trader number
+    // or an uppercase ID, so a product name can never truncate the list.
+    // CLEAN tier = the old strict PREFIX stem (it must keep accepting BARE truncated
+    // headers: "Prekiauto:" / "Pr ekiaut o" with no number — receipts 166/212). The
+    // lexicon supplies the GARBLED tier ("Prckiautojo") which always needs confirmation.
+    const traderClean = T_TRADER_LINE_RE.test(endCompact);
+    const traderD = traderClean ? 0 : keywordDistance(endText, LEX.PREKIAUTOJO);
+    const traderConfirmed = T_TRADER_NUM_RE.test(endText) || T_TRADER_ID_RE.test(endText);
+    const isTrader = traderD != null && (
+      traderD === 0
+        ? (!/nuolaid/i.test(endCompact) || traderConfirmed)
+        : (!/nuolaid/i.test(endCompact) && traderConfirmed)
+    );
     if (T_PRODUCTS_END_RE.test(endText) || isTrader) {
       pEnd = i;
       // The LAST product's NUOLAIDA discount can OCR-fuse onto this footer-boundary line
@@ -2448,6 +3269,21 @@ function parseIkiThermal(lines: IkiLine[]): IkiParseResult {
       break;
     }
   }
+  // ── STRUCTURAL ZONE GUARD (receipt-272 phantom): every wall above is a KEYWORD that can
+  // garble past its pattern ("IKI KORTELES NA", "saskaLtos-fakt" — both walls missed and 15
+  // marketing/trailer lines glued into one price-0 phantom product). The AMOUNTS are the
+  // structural truth the keywords aren't: every product row ends in a decimal amount, and
+  // the trailer (card info, marketing, VMI block) never does. Trim the zone to shortly
+  // after the LAST amount-bearing line — nothing below it can be a product, whatever the
+  // walls missed. (+3 margin: a trailing discount row / deposit label / wrapped name.)
+  {
+    const amtLineRe = /\d{1,4}[.,]\s?\d{2}\s*(?:[ABC]\s*)*$|\d{1,4}[.,]\s?\d{2}\s*[ABC]\b/;
+    let lastAmt = -1;
+    for (let i = pStart; i < pEnd; i++) {
+      if (amtLineRe.test(lines[i].text)) lastAmt = i;
+    }
+    if (lastAmt >= 0 && pEnd > lastAmt + 4) pEnd = lastAmt + 4;
+  }
   // ── skipped lines (coupons / bags / loyalty points) in the product section: their own grey
   //    bands in the photo view, never counted as products. Built BEFORE the engine so the
   //    column engine can tile them together with the products by the SAME rule (it needs each
@@ -2460,11 +3296,22 @@ function parseIkiThermal(lines: IkiLine[]): IkiParseResult {
   }
   // COLUMN ENGINE dispatch (flag-gated): use it when enough per-word data exists
   // AND it actually yields products; otherwise fall back to the legacy tokenizer.
+  // `combo` accumulates the dropped bare-RINKINYS deal discounts (→ footer.comboDiscount);
+  // reset before the fallback engine so a columnar attempt that yielded 0 products can't
+  // leave a stale amount behind.
+  const combo = { amount: 0, regions: [] as Region[] };
+  // Receipt-reconciliation side-channel: charges/negatives the engine drops from products
+  // (deposits, bag charges, IKI Taškais ±, coupons) but the PRINTED TOTAL includes.
+  const recon = { adjust: 0 };
   const engineProducts = USE_COLUMN_ENGINE && ikiHasWords(lines, pStart, pEnd)
-    ? parseIkiColumnar(lines, pStart, pEnd, skippedRegions, storeAddress)
+    ? parseIkiColumnar(lines, pStart, pEnd, skippedRegions, storeAddress, combo, recon)
     : null;
   const usedEngine = !!engineProducts && engineProducts.length > 0;
-  const products = usedEngine ? engineProducts! : parseThermalProducts(lines, pStart, pEnd, storeAddress);
+  if (!usedEngine) { combo.amount = 0; combo.regions = []; }
+  const products = usedEngine ? engineProducts! : parseThermalProducts(lines, pStart, pEnd, storeAddress, combo);
+  // Thermal-path combo rows arrive as bare regions — thread them into the grey skip bands
+  // (the columnar path pushes into skippedRegions itself, pre-tiling).
+  for (const r of combo.regions) skippedRegions.push({ ...r, kind: 'skipped' });
 
   // ── TOP-SECTION band walls (skew-aware) ──
   // Tile the header bands like the products: each band's BOTTOM edge is pinned to
@@ -2570,6 +3417,12 @@ function parseIkiThermal(lines: IkiLine[]): IkiParseResult {
 
   // ── footer fields (scan whole receipt; take first hit) + bbox bands ──
   let total: number | null = null;
+  // CASH-ROUNDING delta (Lithuanian 5-ct rounding): "Apvalinimo suma ±0,0X". Part of the
+  // printed to-pay total but of no product line — reconciliation runs short by it unless
+  // booked (receipt-278: Σlines 2,33 vs paid 2,35). Under the one-line OCR shear the
+  // value can ride the "Mokėti suapvalinus" line instead (receipt-229), so both keywords
+  // are scanned; |v| ≤ 0,04 keeps a sheared TOTAL from ever being read as rounding.
+  let roundingAdj = 0;
   let receiptNo = '';
   // Captured separately so "Kvito Nr." (the canonical key) always wins over the
   // "Kvitas" fallback even though Kvitas is printed FIRST (higher up the receipt).
@@ -2614,6 +3467,14 @@ function parseIkiThermal(lines: IkiLine[]): IkiParseResult {
       // NEGATIVE delta, which must NOT be read as the to-pay total (receipt-157 → 0,01).
       let mAmt: string | null = null;
       for (const mm of t.matchAll(/(-?)\s?(\d{1,4}[.,]\s?\d{2})/g)) { if (mm[1] !== '-') { mAmt = mm[2]; break; } }
+      // ROUNDING-ARTEFACT guard: Lithuanian cash rounding is to the nearest 5 ct, so
+      // |Apvalinimo suma| ≤ 0,04 — and no real to-pay total is below 5 ct. Under the
+      // one-line OCR SHEAR the rounding value lands POSITIVE on the "Mokėti suapvalinus"
+      // line ("Mokėti suapvalinus 0,02", receipt-229) and the first-positive rule above
+      // would take it as the total AND anchor the total band on it. Neutralize a sub-5ct
+      // Mokėti amount (no total, no band) and let the authoritative "Suma su PVM" line
+      // (scanned next) win. The line's other bookkeeping below still runs.
+      if (mAmt && parseNum(mAmt) < 0.05) mAmt = null;
       // OCR sometimes drops the decimal comma on the Mokėti amount, leaving a space
       // ("Mokėti 7 10" = 7,10). Only accept this right AFTER the Mokėti keyword (so a
       // stray "7 10" elsewhere can't be misread) and only when there's no comma form.
@@ -2637,6 +3498,14 @@ function parseIkiThermal(lines: IkiLine[]): IkiParseResult {
         footerRegions.push(footBand(prevBareLine, 'total', prevBareVal));
       }
     }
+    // Book the cash-rounding delta (see roundingAdj above): first sub-5ct amount on an
+    // Apvalinimo/suapvalinus line, signed (rounded down prints a negative).
+    if (roundingAdj === 0 && /Apvalinim|suapvalin/i.test(t)) {
+      for (const mm of t.matchAll(/(-?)\s?(\d{1,4}[.,]\s?\d{2})/g)) {
+        const v = parseNum(mm[2]);
+        if (v > 0 && v <= 0.04) { roundingAdj = mm[1] === '-' ? -v : v; break; }
+      }
+    }
     // "Suma su PVM <amount>" — IKI's TOTAL-with-VAT line. The amount may sit before OR after the
     // keyword ("12,90 Mokestis Suma su PVM"). This is the authoritative printed total on receipts
     // with no clean "Mokėti suapvalinus" line (receipt-159: 12,90 only appears beside "Suma su PVM").
@@ -2645,8 +3514,21 @@ function parseIkiThermal(lines: IkiLine[]): IkiParseResult {
     // to the fragile cash−change last resort, which a scrambled payment table reads wrong (199:
     // Grynieji/Grąža mis-boxed as 10,66/2,24 → a phantom 8,42 total).
     if (total == null && /\bSuma\s+su\s+P[VU]M\b/i.test(t)) {
+      let svFound = false;
       for (const mm of t.matchAll(/(-?)\s?(\d{1,4}[.,]\s?\d{2})/g)) {
-        if (mm[1] !== '-') { total = parseNum(mm[2]); footerRegions.push(footBand(l, 'total', mm[2])); break; }
+        if (mm[1] === '-') continue;
+        // Never the VAT RATE: a scrambled line can fuse "A 21,00 %" onto the Suma-su-PVM
+        // text (receipt-169) — a %-suffixed amount is a rate, not a total.
+        const after = t.slice((mm.index ?? 0) + mm[0].length, (mm.index ?? 0) + mm[0].length + 3);
+        if (after.includes('%')) continue;
+        total = parseNum(mm[2]); footerRegions.push(footBand(l, 'total', mm[2])); svFound = true; break;
+      }
+      // Space-as-decimal fallback, keyword-anchored (mirrors the Mokėti `sp` rule): OCR can
+      // drop the comma entirely ("Suma su PVM 2 35" = 2,35). Only when no comma-form amount
+      // exists on the line, and only right after the PVM keyword.
+      if (!svFound) {
+        const sv = t.match(/P[VU]M\D{0,3}(\d{1,4})\s+(\d{2})(?!\d)/);
+        if (sv) { total = parseFloat(`${sv[1]}.${sv[2]}`); footerRegions.push(footBand(l, 'total', `${sv[1]},${sv[2]}`)); }
       }
     }
     // LOOK-BEHIND (form 4): OCR split the amount onto the line BEFORE a bare "SUMA"
@@ -2677,8 +3559,30 @@ function parseIkiThermal(lines: IkiLine[]): IkiParseResult {
     if (!kvitoVal) { const m = t.match(T_RECEIPTNO_RE); if (m) { kvitoVal = m[1]; kvitoLine = l; } }
     if (!kvitasVal) { const m = t.match(T_KVITAS_RE); if (m) { kvitasVal = m[1]; kvitasLine = l; } }
     if (!kvitoNumVal) { const m = t.match(T_KVITONUM_RE); if (m) { kvitoNumVal = m[1]; kvitoNumLine = l; } }
-    if (totalSavings == null) { const m = t.match(T_SAVINGS_RE); if (m) totalSavings = parseNum(m[1]); }
-    if (!date) { const m = t.match(T_DATE_RE); if (m) { date = `${m[1]}-${m[2]}-${m[3]}`; dateLine = l; } }
+    if (totalSavings == null) {
+      // Lexicon-matched (Phase 3): any in-budget garble of "sutaupėte" qualifies the line;
+      // the amount is the line's first decimal. The old regex needed the stem spelled
+      // half-right; "sutaupëje"/"sutaup ete" now match with zero new patterns.
+      const m = t.match(T_SAVINGS_RE) ?? (hasKeyword(t, LEX.SUTAUPETE) ? t.match(/(\d+[.,]\s?\d{2})/) : null);
+      if (m) totalSavings = parseNum(m[1]);
+    }
+    if (!date) {
+      const m = t.match(T_DATE_RE);
+      if (m) {
+        // PLAUSIBILITY + 0→1 RESCUE: thermal zeros read as ones ("2026-16-18" for the
+        // printed 2026-06-18, receipt-242 re-scan — the impossible month then 500-looped
+        // the save downstream). Month 13-19 with a valid day is that exact confusion →
+        // rescue the leading 1 back to 0. Anything still implausible is DROPPED and the
+        // scan keeps looking — the VMI "CR-…" trailer line usually carries a clean date.
+        let mm = m[2];
+        const mmN = Number(mm), ddN = Number(m[3]);
+        if (mmN >= 13 && mmN <= 19 && ddN >= 1 && ddN <= 31) mm = `0${mm[1]}`;
+        if (Number(mm) >= 1 && Number(mm) <= 12 && ddN >= 1 && ddN <= 31) {
+          date = `${m[1]}-${mm}-${m[3]}`;
+          dateLine = l;
+        }
+      }
+    }
     if (!time) { const m = t.match(T_TIME_RE); if (m) { time = `${m[1]}:${m[2]}`; timeLine = l; timeMatch = m; } }
   }
   // LAST RESORT (cash receipt): total = Grynieji (cash tendered) − Grąža (change). When the VAT/
@@ -2726,9 +3630,22 @@ function parseIkiThermal(lines: IkiLine[]): IkiParseResult {
   if (kvitoVal && kvitoLine) footerRegions.push(footBand(kvitoLine, 'receiptNo', kvitoVal));
   if (kvitoNumVal && kvitoNumLine) footerRegions.push(footBand(kvitoNumLine, 'receiptNo', kvitoNumVal));
   if (kvitasVal && kvitasLine) footerRegions.push(footBand(kvitasLine, 'receiptNo', kvitasVal));
+  // SEGMENT-CORROBORATION WITNESS: IKI prints the slashed id's LAST segment separately in the
+  // VMI block ("Kvito Nr. 168/645/104148" ↔ "Kvito numeris 104148"). When the two DISAGREE one
+  // of them is OCR-garbled — we can't know which, so we never rewrite the canonical; instead we
+  // ADD the VMI-corrected variant as an extra dedup witness. The overlap-based duplicate check
+  // (getReceiptByAnyReceiptNoAndUser) then catches a re-scan through EITHER form, so a single
+  // garbled digit in one scan can no longer let a duplicate receipt through.
+  let segmentWitness = '';
+  if (kvitoVal && kvitoNumVal && kvitoVal.includes('/')) {
+    const segs = kvitoVal.split('/');
+    if (segs[segs.length - 1] !== kvitoNumVal) {
+      segmentWitness = [...segs.slice(0, -1), kvitoNumVal].join('/');
+    }
+  }
   // Array: canonical first, then any other distinct identifier (dedupe, keep order). Falls back to
   // just the canonical (incl. the synthetic id) when no printed identifier survived OCR.
-  const receiptNos = [...new Set([rnVal, kvitoVal, kvitoNumVal, kvitasVal].filter(Boolean))];
+  const receiptNos = [...new Set([rnVal, kvitoVal, kvitoNumVal, kvitasVal, segmentWitness].filter(Boolean))];
   if (receiptNos.length === 0 && receiptNo) receiptNos.push(receiptNo);
   footerRegions.sort((a, b) => a.yTop - b.yTop);
 
@@ -2751,12 +3668,105 @@ function parseIkiThermal(lines: IkiLine[]): IkiParseResult {
     const unit = (p.promoPrice != null ? p.promoPrice : p.price) ?? 0;
     return s + (unit > 0 ? unit * q : 0);
   }, 0));
-  if (itemSum > 0 && (total == null || total < itemSum * 0.5)) total = itemSum;
+  // Combo-aware: the paid total is Σproducts MINUS the captured bare-RINKINYS deal
+  // discount (receipt-229: 4.03 − 1.90 = 2.13 vs printed 2.33/2.35 — the residual gap is
+  // the valueless deposits, accepted). Both the plausibility test and the fallback use
+  // the adjusted sum, so a correctly-read printed total is judged against what was
+  // actually paid, and an unreadable payment block no longer inflates the total.
+  const adjSum = round2(Math.max(0, itemSum - (combo.amount > 0 ? combo.amount : 0)));
+  let totalFromFallback = false;
+  if (adjSum > 0 && (total == null || total < adjSum * 0.5)) { total = adjSum; totalFromFallback = true; }
+
+  // ── RECEIPT RECONCILIATION (Phase 2, shared/ROBUST_PARSING_PLAN.md) ──
+  // The printed total re-states the whole receipt:
+  //     Σ line-paids + dropped charges (deposits/bags/points = recon.adjust) − combo = total
+  // Three uses:
+  //  • SOLVE a single unreadable total ("3, 4: A" → totUnknown + candidates): the Σ-vs-total
+  //    delta belongs to that one line. Accepted ONLY when it matches a candidate reading
+  //    (±0.005) — unaccounted leakage can therefore never invent a fit — or any positive
+  //    value when the garble was unconstrained.
+  //  • CONFIRM (footer.reconciled = true): the books balance to the cent — downstream may
+  //    treat these prices as corroborated.
+  //  • FLAG (footer.reconciled = false): trusted reads that don't balance, or unknowns the
+  //    solver couldn't pin — an honest signal instead of a silently wrong receipt.
+  // `_paid`/`_unk` are engine-internal markers, stripped below before the result leaves.
+  let reconciled: boolean | undefined;
+  let reconDelta: number | undefined;
+  if (usedEngine && !totalFromFallback && total != null && total > 0) {
+    const anyP = products as any[];
+    // ── EQUATION 2 first — sutaupėte = Σ card-labeled discounts (verified: r238 8.01 =
+    //    7.48+0.30+0.23, card-only; plain NUOLAIDA and Taškai excluded). When exactly ONE
+    //    product's card discount is KNOWN-TO-EXIST but amount-less (its label printed,
+    //    the number didn't survive), the savings line pins it: D = savings − Σ known.
+    //    TENTATIVE until equation 1 (the printed total) corroborates below — committing
+    //    is gated on the books balancing, so a wrong savings semantic can never write a
+    //    promo that the total then contradicts. ──
+    const unkDiscs = anyP.filter((pp) => pp._unkDisc && pp._unkDisc.card);
+    if (totalSavings != null && totalSavings > 0 && unkDiscs.length === 1) {
+      const knownCardSum = round2(anyP.reduce((sum, pp) => sum + (pp._cardDisc ?? 0), 0));
+      const D = round2(totalSavings - knownCardSum);
+      const host = unkDiscs[0];
+      if (D > 0 && D <= host._unkDisc.lineTotal) {
+        host._tentDisc = D; // picked up by equation 1 below; committed only on balance/fit
+      }
+    }
+    const tentHost = anyP.find((pp) => pp._tentDisc != null);
+    const applyTent = () => {
+      if (!tentHost) return;
+      const D = tentHost._tentDisc;
+      const qty = tentHost.quantity && tentHost.quantity > 0 ? tentHost.quantity : 1;
+      const paidT = round2(tentHost._unkDisc.lineTotal - D);
+      if (paidT >= 0) tentHost.promoPrice = round2(paidT / qty);
+      if (process.env.IKI_DEBUG) console.log(`[RECON] savings equation pinned discount ${D} on "${tentHost.name}" (sutaupėte=${totalSavings})`);
+    };
+    const knowns = anyP.filter((pp) => pp._paid != null);
+    const unknowns = anyP.filter((pp) => pp._paid == null);
+    const tentAdj = tentHost ? tentHost._tentDisc : 0; // tentative discount lowers the known sum
+    const knownSum = round2(knowns.reduce((sum, pp) => sum + pp._paid, 0) - tentAdj + recon.adjust + roundingAdj - (combo.amount > 0 ? combo.amount : 0));
+    reconDelta = round2(total - knownSum);
+    if (unknowns.length === 0) {
+      reconciled = Math.abs(reconDelta) <= 0.011;
+      // equation 1 corroborates the savings-pinned discount → commit; else discard it.
+      if (tentHost) { if (reconciled) applyTent(); else if (process.env.IKI_DEBUG) console.log('[RECON] savings pin discarded (total does not corroborate)'); }
+    } else if (unknowns.length === 1 && unknowns[0]._unk) {
+      const u = unknowns[0];
+      const solvedTot = round2(reconDelta + (u._unk.discount ?? 0));
+      const cands: number[] | null = u._unk.cands;
+      const fits = solvedTot > 0 && reconDelta > 0 &&
+        (cands == null || cands.some((cv: number) => Math.abs(cv - solvedTot) <= 0.005));
+      if (fits) {
+        const qty = u.quantity && u.quantity > 0 ? u.quantity : 1;
+        u.price = qty > 1 ? round2(solvedTot / qty) : solvedTot;
+        if (u._unk.discount > 0) {
+          const paidU = round2(solvedTot - u._unk.discount);
+          u.promoPrice = paidU >= 0 ? round2(paidU / qty) : null;
+        }
+        u.pricePerUnit = u.price;
+        reconciled = true;
+        reconDelta = 0; // the delta is now fully attributed to the solved line
+        applyTent(); // the compound solve fit a candidate → both equations corroborate
+        if (process.env.IKI_DEBUG) console.log(`[RECON] solved unknown total ${solvedTot} for "${u.name}" (Σknown=${knownSum}, printed=${total})`);
+      } else {
+        reconciled = false;
+        if (process.env.IKI_DEBUG) console.log(`[RECON] cannot pin unknown "${u.name}": delta=${reconDelta} cands=${JSON.stringify(cands)}`);
+      }
+    } else {
+      reconciled = false;
+      if (process.env.IKI_DEBUG) console.log(`[RECON] ${unknowns.length} unknowns, delta=${reconDelta} — flag only`);
+    }
+  }
+  // Strip the internal markers — they must never serialize into parsedData.
+  for (const pp of products as any[]) { delete pp._paid; delete pp._unk; delete pp._cardDisc; delete pp._unkDisc; delete pp._tentDisc; }
 
   return {
     header: { chainName: 'IKI', storeCode: '', storeName: '', storeAddress, pvmCode, rawText, region: unionOf(headerRegions), lineRegions: headerRegions },
     products,
-    footer: { total, date, time, receiptNo, receiptNos, totalSavings, rawText, region: unionOf(footerRegions), lineRegions: footerRegions },
+    footer: {
+      total, date, time, receiptNo, receiptNos, totalSavings,
+      comboDiscount: combo.amount > 0 ? round2(combo.amount) : null,
+      reconciled, reconDelta,
+      rawText, region: unionOf(footerRegions), lineRegions: footerRegions,
+    },
     skippedRegions,
   };
 }

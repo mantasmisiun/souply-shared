@@ -51,6 +51,11 @@ export interface LidlProduct {
     quantity: number;
     unit: string;
     pricePerUnit: number | null;
+    // A by-WEIGHT line (sold per kg) is weighable. Set on EVERY product
+    // (true for unit==='kg', false per-piece) so the server resolver
+    // keeps a weighable catalog SP instead of treating the missing flag
+    // as a form mismatch — same contract as ikiParser's IkiProduct.
+    isWeighable?: boolean;
     rawLines: string[];
     region: Region;
 }
@@ -159,10 +164,13 @@ const UNIT_LINE_RE = new RegExp(
 );
 // OCR-split unit line halves. Decimal optional in both (integer
 // quantities like `x 2 €/vnt.` happen). Same `>` tolerance as
-// UNIT_LINE_RE.
-const UNIT_HEAD_RE = new RegExp(`^\\s*\\d+[.,_]\\s?${D}{1,2}\\s*[>×|]?\\s*[xkXК]\\s*$`);
+// UNIT_LINE_RE. Capture groups (head: ppu; tail: qty + unit suffix)
+// feed extractLidlProduct's split-half recovery — without it the
+// halves leaked into the product NAME and the qty (and, for
+// weighables, the kg signal) was lost.
+const UNIT_HEAD_RE = new RegExp(`^\\s*(\\d+[.,_]\\s?${D}{1,2})\\s*[>×|]?\\s*[xkXК]\\s*$`);
 const UNIT_TAIL_RE = new RegExp(
-    `^\\s*${D}+(?:[.,_]\\s?${D}{1,3})?\\s*(kg|[€£]\\s*/\\s*vnt\\.?|[€£]\\s*/\\s*kg)\\s*$`,
+    `^\\s*(${D}+(?:[.,_]\\s?${D}{1,3})?)\\s*(kg|[€£]\\s*/\\s*vnt\\.?|[€£]\\s*/\\s*kg)\\s*$`,
     'i'
 );
 // Orphan unit suffix — `€/vnt.` / `£/vnt.` / `€/kg` WITHOUT leading
@@ -178,9 +186,14 @@ const UNIT_ORPHAN_RE = /^\s*[€£]\s*\/\s*(?:vnt\.?|kg)\s*$/i;
 // unit `0,35 × 10,000` + garbage `yimo spaustuvai 4`). UNIT_LINE_RE
 // fails (no clean suffix) so the whole string leaks into name.
 // With UNIT_LENIENT_RE we still capture unit price + quantity from
-// the prefix and drop the trailing garbage.
+// the prefix and drop the trailing garbage. The qty terminator is
+// `(?![\d.,])` rather than `\b` — the garbage is usually glued
+// straight onto the digits ("10,000yimo": digit→letter is NOT a \b
+// boundary, so the old \b could never match its own motivating
+// example). More digits/separators after the captured qty still
+// abort (ambiguous longer number → leave the line alone).
 const UNIT_LENIENT_RE = new RegExp(
-    `^\\s*(\\d+[.,_]\\s?${D}{1,2})\\s*[xkXК]\\s*(\\d+[.,_]\\s?${D}{1,3})\\b`,
+    `^\\s*(\\d+[.,_]\\s?${D}{1,2})\\s*[xkXК]\\s*(\\d+[.,_]\\s?${D}{1,3})(?![\\d.,])`,
     'i'
 );
 // Cat X — weighable-style tail with garbage PREFIX. `CEoX 0,343 kg`
@@ -258,6 +271,35 @@ const DISCOUNT_HEADER_RE = /(?:lidl\s*plus|nuo[li]a[li]d[aos]?)/i;
 // findHeaderEnd's reach, it won't get absorbed.
 const RECEIPT_NO_RE = /^#\d{4,}/;
 const KVITAS_ROW_RE = /^\s*kvitas\s+\d+\s*\/\s*\d+/i;
+// ── date/time bail hardening (IKI T_DATE_RE / T_TIME_RE idioms) ──
+// Lidl prints `YYYY-MM-DD HH:MM` on ONE footer line and parseFooter's
+// combined same-line regex stays the FIRST preference. But a single
+// garbled character in either half used to lose BOTH (→ the app-level
+// RETAKE bail for the whole receipt), so date and time are additionally
+// scanned INDEPENDENTLY:
+//   date — separators may DOUBLE ("2025-06--18") or read as dots, and
+//   OCR may inject a space around them. The year is pinned to `20\d{2}`
+//   and month/day are range-checked at the call site so footer codes
+//   ("SM-000022355", loterija ids) can't masquerade as a date.
+const DATE_TOLERANT_RE =
+    /(20\d{2})\s?[-.]{1,2}\s?(\d{2})\s?(?:[-.]{1,2}|\s)\s?(\d{2})(?!\d)/;
+//   time — Lidl prints HH:MM (no seconds). A seconds-bearing form is
+//   tried first with IKI's tolerant FIRST separator ("12-20:35" — the
+//   strict second colon keeps dates from misreading as times); the bare
+//   HH:MM form keeps its colon REQUIRED (a dot would match prices) but
+//   tolerates the OCR space after it ("18: 33"). Hour/minute are
+//   range-checked at the call site.
+const TIME_SECONDS_TOLERANT_RE = /(\d{1,2})[:.\-]\s?(\d{2})\s?:\s?(\d{2})(?!\d)/;
+const TIME_TOLERANT_RE = /(?:^|[^\d:])(\d{1,2})\s?:\s?(\d{2})(?!\d)/;
+// Weighed-quantity signal that survives unit-line garble: Lidl prints
+// weighed quantities with THREE decimals ("4,032 kg", "0,343 kg") while
+// packaged sizes inside product names use 0-2 ("1 kg", "1,5 kg") — the
+// 3-decimal fraction is the discriminator that keeps a packaged product
+// from being flipped to weighable. OCR digit class on both sides.
+const KG_WEIGHED_QTY_RE = new RegExp(
+    `(${D}+[.,_]\\s?${D}{3})\\s*kg\\b`,
+    'i',
+);
 
 /**
  * NFD-strip diacritics before matching footer markers. OCR reads the
@@ -586,6 +628,33 @@ function parseFooter(lines: LidlLine[]): LidlFooter {
         }
     }
 
+    // Date/time bail hardening: the combined same-line match above stays
+    // the first preference, but ONE garbled character in either half used
+    // to lose BOTH fields → app-level RETAKE bail. Re-scan the footer for
+    // each field INDEPENDENTLY with OCR-tolerant separators (doubled
+    // hyphens, dots, spaces around separators, split date/time boxes).
+    // Range checks keep footer codes from masquerading as dates/times.
+    if (!date || !time) {
+        for (const l of lines) {
+            const t = l.text.trim();
+            if (!date) {
+                const m = t.match(DATE_TOLERANT_RE);
+                if (m && +m[2] >= 1 && +m[2] <= 12 && +m[3] >= 1 && +m[3] <= 31) {
+                    date = `${m[1]}-${m[2]}-${m[3]}`;
+                    trackLine(l, 'date');
+                }
+            }
+            if (!time) {
+                const m = t.match(TIME_SECONDS_TOLERANT_RE) ?? t.match(TIME_TOLERANT_RE);
+                if (m && +m[1] <= 23 && +m[2] <= 59) {
+                    time = `${m[1]}:${m[2]}`;
+                    trackLine(l, 'time');
+                }
+            }
+            if (date && time) break;
+        }
+    }
+
     // Receipt number via the multi-source, self-healing resolver. Handles MLKit
     // splitting the "Dokumento numeris" label from its value onto separate lines
     // (the old same-line `\d+` capture missed it) and cross-checks the zero-padded
@@ -640,6 +709,15 @@ export function parseLidlReceipt(
         const rn = extractReceiptNo(rawLines.slice(0, headerEnd));
         if (rn) footer.receiptNo = rn.value;
     }
+    // LAST RESORT (IKI idiom): no printed identifier survived OCR but
+    // date + time + total did — synthesise a stable dedup id from them
+    // so a readable receipt never RETAKE-bails on the missing receipt
+    // number alone. Shape mirrors ikiParser's synthetic fallback.
+    if (!footer.receiptNo && footer.date && footer.time && footer.total !== null) {
+        footer.receiptNo =
+            `${footer.date.replace(/-/g, '')}-${footer.time.replace(/:/g, '')}` +
+            `-${Math.round(footer.total * 100)}-lidl-receipt`;
+    }
     const plan = findReceiptBandsLidl(rawLines, options);
     const products: LidlProduct[] = [];
     for (const internal of plan.productInternals) {
@@ -651,19 +729,36 @@ export function parseLidlReceipt(
                 product.promoPrice =
                     Math.round((product.promoPrice / product.quantity) * 100) / 100;
             }
-        } else if (product.pricePerUnit === null && product.quantity > 1 && product.price > 0) {
+        } else if (
+            product.pricePerUnit === null &&
+            product.price > 0 &&
+            product.quantity > 0 &&
+            product.quantity !== 1
+        ) {
             // OCR dropped the unit-line's per-unit number ("<ppu> x <qty> vnt") but the
             // qty survived: `price` here is still the LINE TOTAL, and emitting it as-is
             // with quantity > 1 breaks the per-unit contract every other chain honors —
             // the server would write the multi-buy TOTAL as the SP's reference price.
             // Derive the unit price instead (total ÷ qty — same convention as IKI's
-            // multi-buy recovery). Holds for weighed lines too: total ÷ kg-qty = €/kg.
+            // multi-buy recovery). Holds for weighed lines too: total ÷ kg-qty = €/kg —
+            // including FRACTION-of-a-kg quantities (0,343 kg), which the old
+            // `quantity > 1` gate missed, leaving the fraction's line total as the
+            // "price" (a poisoned €/kg reference).
             const unit = Math.round((product.price / product.quantity) * 100) / 100;
-            product.pricePerUnit = unit;
-            product.price = unit;
-            if (product.promoPrice !== null) {
-                product.promoPrice =
-                    Math.round((product.promoPrice / product.quantity) * 100) / 100;
+            if (product.unit === 'kg' && (unit <= 0 || unit >= 1000)) {
+                // PRICE-POISONING GUARD: the derived €/kg is implausible — the kg
+                // quantity must be OCR-garbled. Show the line, never write price
+                // (server skips price<=0 writes; see the ikiParser guard).
+                product.price = 0;
+                product.pricePerUnit = null;
+                product.promoPrice = null;
+            } else {
+                product.pricePerUnit = unit;
+                product.price = unit;
+                if (product.promoPrice !== null) {
+                    product.promoPrice =
+                        Math.round((product.promoPrice / product.quantity) * 100) / 100;
+                }
             }
         }
         products.push(product);
@@ -1730,16 +1825,32 @@ const computeBandsContextLidlV2 = (
             label: 'nr',
         });
     }
+    // Datetime band: clean combined `YYYY-MM-DD HH:MM` line first; fall
+    // back to any footer line carrying an OCR-tolerant date (doubled/
+    // dotted separators) so the band still renders when the printed
+    // datetime is garbled but recoverable (see DATE_TOLERANT_RE).
+    let dtBandLine: LidlLine | null = null;
     for (const line of footerSlice) {
         if (/(\d{4}-\d{2}-\d{2})\s+(\d{1,2}:\d{2})/.test(line.text)) {
-            bands.push({
-                kind: 'datetime',
-                yTop: line.yTop,
-                yBottom: line.yBottom,
-                label: 'date',
-            });
+            dtBandLine = line;
             break;
         }
+    }
+    if (!dtBandLine) {
+        for (const line of footerSlice) {
+            if (DATE_TOLERANT_RE.test(line.text.trim())) {
+                dtBandLine = line;
+                break;
+            }
+        }
+    }
+    if (dtBandLine) {
+        bands.push({
+            kind: 'datetime',
+            yTop: dtBandLine.yTop,
+            yBottom: dtBandLine.yBottom,
+            label: 'date',
+        });
     }
     // Total band — prefer `Mokėti` (final amount paid) over
     // `Tarpinė suma` (subtotal before discounts/redemptions). On
@@ -1894,7 +2005,30 @@ export function extractLidlProduct(internal: LidlBandInternal): LidlExtractResul
     let unit = 'vnt';
     let pricePerUnit: number | null = null;
     let promoPrice: number | null = null;
+    // kg-signal tracking for the weighed price-poisoning guard.
+    //   weighed     — ANY surviving kg signal: clean unit line, split
+    //                 tail half, Cat X lenient tail, orphan `€/kg`, or
+    //                 a 3-decimal "N,NNN kg" weight inside a name line.
+    //   kgQtyKnown  — a usable kg quantity was actually parsed. This
+    //                 distinguishes a REAL "1,000 kg" (total == €/kg,
+    //                 fine) from the DEFAULT quantity=1 of a weighed
+    //                 line whose numbers all rotted (poisoning case).
+    //   unitResolved — an explicit unit line decided kg-vs-vnt; blocks
+    //                 the weaker in-name weight signal from overriding.
+    let weighed = false;
+    let kgQtyKnown = false;
+    let unitResolved = false;
     const nameLines: string[] = [];
+    // Discount plausibility clamp (IKI idiom): a discount can never
+    // exceed the line total — a negative paid means the discount was
+    // OCR-inflated or mis-attributed. DROP the promo (keep the base
+    // price) rather than ship a negative/implausible promo price.
+    const applyDiscount = (text: string) => {
+        const d = extractDiscountAmount(text);
+        if (d === null || promoPrice !== null || d <= 0) return;
+        const paid = Math.round((price - d) * 100) / 100;
+        if (paid >= 0) promoPrice = paid;
+    };
 
     // preName walk: collect the product name and detect the
     // multi-buy / weighable unit-line. Lidl's UNIT_LINE_RE shape
@@ -1911,12 +2045,9 @@ export function extractLidlProduct(internal: LidlBandInternal): LidlExtractResul
         if (PRICE_DEPOSIT_RE.test(text)) continue;
         // Discount fragment that y-sorted ahead of the name (rare
         // for Lidl; the usual position is postAnchor). Capture
-        // promo if it's the first one seen.
+        // promo if it's the first one seen (plausibility-clamped).
         if (DISCOUNT_HEADER_RE.test(text) || DISCOUNT_RE.test(text)) {
-            const d = extractDiscountAmount(text);
-            if (d !== null && promoPrice === null) {
-                promoPrice = Math.round((price - d) * 100) / 100;
-            }
+            applyDiscount(text);
             continue;
         }
         // Product unit-line: `<ppu> x <qty> <unit>`. Captures qty
@@ -1929,13 +2060,108 @@ export function extractLidlProduct(internal: LidlBandInternal): LidlExtractResul
             }
             quantity = parseNum(unitMatch[2]);
             unit = /kg/i.test(unitMatch[3] || '') ? 'kg' : 'vnt';
+            unitResolved = true;
+            if (unit === 'kg') {
+                weighed = true;
+                kgQtyKnown = quantity > 0;
+            }
             continue;
         }
+        // OCR-split unit-line halves. The band walk already recognises
+        // them ('unit' reason) but extraction used to drop them into
+        // the NAME — losing the qty and, for weighables, the whole kg
+        // signal. Head `0,59 x` carries the per-unit price; tail
+        // `4,032 kg` / `2,000 €/vnt.` carries qty + unit. A kg tail
+        // must carry the weighed 3-decimal fraction so a packaged size
+        // fragment ("1 kg") can never flip a per-piece product.
+        const headMatch = text.match(UNIT_HEAD_RE);
+        if (headMatch) {
+            if (pricePerUnit === null) pricePerUnit = parseNum(headMatch[1]);
+            continue;
+        }
+        const tailMatch = text.match(UNIT_TAIL_RE);
+        if (tailMatch) {
+            const isKg = /kg/i.test(tailMatch[2]);
+            if (!isKg || KG_WEIGHED_QTY_RE.test(text)) {
+                const q = parseNum(tailMatch[1]);
+                if (q > 0) quantity = q;
+                unitResolved = true;
+                if (isKg) {
+                    unit = 'kg';
+                    weighed = true;
+                    kgQtyKnown = q > 0;
+                }
+                continue;
+            }
+            // kg tail WITHOUT the weighed fraction — likely a packaged
+            // size fragment; fall through to the name path unchanged.
+        }
+        // Cat HH — unit line whose `€/vnt.`/`kg` suffix was lost or
+        // mashed with the next row's text ("0,35 x 10,000yimo
+        // spaustuvai 4"): capture ppu + qty from the leading
+        // `N,NN x N,NNN` and drop the trailing garbage instead of
+        // leaking the whole string into the name.
+        const lenientMatch = text.match(UNIT_LENIENT_RE);
+        if (lenientMatch) {
+            if (pricePerUnit === null) pricePerUnit = parseNum(lenientMatch[1]);
+            const q = parseNum(lenientMatch[2]);
+            if (q > 0) quantity = q;
+            continue;
+        }
+        // Cat X — weighable tail with a garbled PREFIX ("CEoX 0,343
+        // kg"): the x-marker + weight tail survive even when the
+        // leading €/kg rotted. Same 3-decimal gate as the tail half.
+        const weightLenient = text.match(UNIT_WEIGHT_LENIENT_RE);
+        if (weightLenient) {
+            const isKg = /kg/i.test(weightLenient[2]);
+            if (!isKg || KG_WEIGHED_QTY_RE.test(text)) {
+                const q = parseNum(weightLenient[1]);
+                if (q > 0) quantity = q;
+                unitResolved = true;
+                if (isKg) {
+                    unit = 'kg';
+                    weighed = true;
+                    kgQtyKnown = q > 0;
+                }
+                continue;
+            }
+        }
         // Bare unit-fragment (`€/vnt.` alone) and pure-barcode
-        // lines — neither contributes to the name.
-        if (UNIT_ORPHAN_RE.test(text)) continue;
+        // lines — neither contributes to the name. An orphan `€/kg`
+        // is additionally a kg SIGNAL: the weighed row's numbers all
+        // dropped, so weighed-ness must be flagged here or the line
+        // total (a fraction of a kg) poisons the €/kg reference.
+        if (UNIT_ORPHAN_RE.test(text)) {
+            if (/kg/i.test(text) && !unitResolved) {
+                weighed = true;
+                unit = 'kg';
+            }
+            continue;
+        }
         if (BARCODE_ONLY_RE.test(text)) continue;
+        // Lenient price-like fragment (".99", "O, 90 A", ",29 A") —
+        // an OCR-mangled price that lost its anchor shape. It can't
+        // rescue a lost anchor on its own, but it must not pollute
+        // the product name either.
+        if (PRICE_LIKE_RE.test(text)) continue;
 
+        // kg-signal that survives unit-line garble: a weighed
+        // 3-decimal weight ("0,343 kg") embedded in a line that reads
+        // as name text (the unit line mashed into the name / too
+        // rotted for the unit regexes). Signal + qty only — the text
+        // still contributes to the name so nothing visible is lost.
+        if (!unitResolved) {
+            const wm = text.match(KG_WEIGHED_QTY_RE);
+            if (wm) {
+                weighed = true;
+                unit = 'kg';
+                const q = parseNum(wm[1]);
+                if (q > 0 && !kgQtyKnown) {
+                    quantity = q;
+                    kgQtyKnown = true;
+                }
+            }
+        }
         nameLines.push(text);
     }
 
@@ -1948,10 +2174,7 @@ export function extractLidlProduct(internal: LidlBandInternal): LidlExtractResul
         if (DEPOSIT_RETURN_RE.test(text)) continue;
         if (NEGATIVE_DEPOSIT_PRICE_RE.test(text)) continue;
         if (DISCOUNT_HEADER_RE.test(text) || DISCOUNT_RE.test(text)) {
-            const d = extractDiscountAmount(text);
-            if (d !== null && promoPrice === null) {
-                promoPrice = Math.round((price - d) * 100) / 100;
-            }
+            applyDiscount(text);
             continue;
         }
         // Deposit name + bare deposit-price + deposit unit-line —
@@ -1996,14 +2219,28 @@ export function extractLidlProduct(internal: LidlBandInternal): LidlExtractResul
         ...internal.postAnchor.map((e) => e.line),
     ];
 
+    // PRICE-POISONING GUARD ("show it, never write price" — IKI idiom):
+    // a WEIGHED line (kg signal seen) whose €/kg is unrecoverable — no
+    // per-kg price survived AND no kg quantity to derive one from
+    // (total ÷ kg). The anchor total covers a FRACTION of a kg, so
+    // emitting it as the price would let the server write it as the
+    // per-kg reference. Emit price=0 / pricePerUnit=null instead — the
+    // server skips price<=0 writes; the item still SHOWS on the receipt
+    // (unit 'kg', isWeighable true).
+    const weighedNoPpu = weighed && pricePerUnit === null && !kgQtyKnown;
+    if (weighedNoPpu) warnings.push(`weighed-no-ppu "${name.slice(0, 40)}"`);
+
     return {
         product: {
             name,
-            price,
-            promoPrice,
-            quantity,
+            price: weighedNoPpu ? 0 : price,
+            promoPrice: weighedNoPpu ? null : promoPrice,
+            quantity: weighedNoPpu ? 1 : quantity,
             unit,
             pricePerUnit,
+            // Emitted on EVERY product (true = sold by weight) so the
+            // server resolver can gate weighable-vs-packaged matching.
+            isWeighable: unit === 'kg',
             rawLines: allLines.map((l) => l.text),
             region: regionOf(allLines),
         },

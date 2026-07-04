@@ -46,6 +46,10 @@ export interface NorfaProduct {
     quantity: number;
     unit: string;
     pricePerUnit: number | null;
+    /** True when the line is sold by weight (unit === 'kg'). Drives the
+     *  server resolver to keep a weighable catalog SP — same field the
+     *  IKI parser emits. */
+    isWeighable: boolean;
     rawLines: string[];
     region: Region;
     parsedAmount?: number | null;
@@ -87,16 +91,23 @@ export interface NorfaParseResult {
 // family of tolerances used by the Maxima parser.
 const D = '[\\d0OoIlL]';
 // `0,85 M1` / `1,22 M5`. Standalone total-price line. `\s?` inside the
-// decimal to tolerate OCR's occasional `1, 22`.
-const PRICE_RE = new RegExp(`^(\\d+[.,]\\s?${D}{1,2})\\s*M\\s*[15]\\s*$`, 'i');
+// decimal to tolerate OCR's occasional `1, 22`. The LEADING integer
+// part uses the tolerant digit class too — faded thermal prints read
+// `1,22 M1` as `l,22 M1` and the anchor (with its mandatory M-suffix)
+// is specific enough that letter-for-digit swaps can't false-match a
+// name line.
+const PRICE_RE = new RegExp(`^(${D}+[.,]\\s?${D}{1,2})\\s*M\\s*[15]\\s*$`, 'i');
 // `0,316x3,85 1,22 M1` — inline weighable. Captures:
 //   1 = quantity (e.g. 0,316)
 //   2 = unit price (e.g. 3,85)
 //   3 = total (e.g. 1,22)
 // Digit class allows OCR variants; without this, `0,666xl,25 0,83 M1`
-// (OCR read `1` as `l`) fails to match and bananas disappear.
+// (OCR read `1` as `l`) fails to match and bananas disappear. The
+// LEADING qty digit is tolerant as well (`l,924x0,77 1,48 M1` — the
+// leading 1 reads as `l` on faded prints); the whole-line shape with
+// x-separator + M-suffix keeps that from matching name text.
 const WEIGHABLE_RE = new RegExp(
-    `^\\s*(\\d+[.,]\\s?${D}{1,3})\\s*[xX]\\s*(${D}+[.,]\\s?${D}{1,2})\\s+(${D}+[.,]\\s?${D}{1,2})\\s*M\\s*[15]\\s*$`,
+    `^\\s*(${D}+[.,]\\s?${D}{1,3})\\s*[xX]\\s*(${D}+[.,]\\s?${D}{1,2})\\s+(${D}+[.,]\\s?${D}{1,2})\\s*M\\s*[15]\\s*$`,
     'i'
 );
 
@@ -125,11 +136,15 @@ const LOYALTY_RE = /lojalumo\s+kortel/i;
 //   `Kvito Nr. 12345` (short label form, seen at the top and bottom
 //   on some Norfa receipts).
 // Everything before this line is header.
-const RECEIPT_NO_HEADER_RE = /kvito\s+(?:numeri|nr\.?)/i;
+// "Kvito" itself rots on thermal prints exactly like on IKI: the
+// K→A and v→o/u/y swaps give "Koito"/"AVito"/"Kyito", so the stem is
+// [KA][vouy]ito (same class as ikiParser's T_RECEIPTNO_RE). The
+// mandatory "numeri…"/"Nr." context keeps it specific.
+const RECEIPT_NO_HEADER_RE = /[KA][vouy]ito\s+(?:numeri|nr\.?)/i;
 // Capture form for the receipt number itself — same alternation,
 // with the number captured. Used by parseFooter + the top-scan
 // fallback to extract the value.
-const RECEIPT_NO_CAPTURE_RE = /kvito\s+(?:numeri\S*|nr\.?)\s+(\d+)/i;
+const RECEIPT_NO_CAPTURE_RE = /[KA][vouy]ito\s+(?:numeri\S*|nr\.?)\s+(\d+)/i;
 // Non-catalog checkout items (plastic bags). Same policy as other
 // parsers — skip them entirely. Two routes catch the bag rows:
 //
@@ -137,12 +152,17 @@ const RECEIPT_NO_CAPTURE_RE = /kvito\s+(?:numeri\S*|nr\.?)\s+(\d+)/i;
 //      on bag rows. Caught even when OCR mangles the `š` letter
 //      (seen in the wild: `maiğelis` with `ğ` from š's caron getting
 //      mistaken for a breve).
-//   2. `mai[sšžzğç]\w*` — generic match for Lithuanian
-//      `maišelis`/`maišas` plural / declension forms with a tolerant
-//      letter class for the š position. `maiš-` prefixed words
-//      outside checkout contexts are virtually non-existent on
-//      grocery receipts, so false-positives are negligible.
-const NON_CATALOG_RE = /NORFA\s+PE\s+mai\w*|\bmai[sšžzğç]\w*\b/i;
+//   2. `^mai[sšžzğç] ?[eė]l\w*` — NAME-START-anchored match for the
+//      `maišelis`/`maišeliai` diminutive (the actual checkout-bag
+//      word) with a tolerant letter class for the š position.
+//      The old anywhere-in-name `\bmai[sšžzğç]\w*\b` form skipped
+//      REAL products: "Maišytos salotos" (mixed salad) matched
+//      `maiš\w*` and vanished from the receipt. Requiring the
+//      `-el-` diminutive stem excludes `maišytos` (mixed) and
+//      `maišai` (e.g. "šiukšlių maišai" trash bags — a legit
+//      catalog product); the start anchor stops mid-name brand
+//      collisions.
+const NON_CATALOG_RE = /NORFA\s+PE\s+mai\w*|^mai[sšžzğç]\s?[eė]l\w*/i;
 // "Size continuation" line — a product-name suffix like `50 %, 1 l`
 // that receipts print on the row below the main name when the full
 // name is too long to fit. During walk-back these appear BEFORE the
@@ -157,6 +177,32 @@ const NON_CATALOG_RE = /NORFA\s+PE\s+mai\w*|\bmai[sšžzğç]\w*\b/i;
 // prefix peeler that would otherwise split off "200 " and leave "g"
 // as a stray name fragment.
 const SIZE_CONTINUATION_RE = /^[\d\s%,.lIL]+(?:g|kg|ml|l|vnt\.?|rit\.?)?\s*$/i;
+
+// ── footer date/time (IKI-style garble classes) ──
+// Norfa prints the timestamp as `2026-03-26 17:18   KAS#38994` on the
+// last footer row. Separators are [-.]{1,2}: OCR sometimes DOUBLES a
+// hyphen ("2026-03--26") or reads it as a dot. A slash/space is NOT
+// accepted, so long id numbers can't match. (Same class as
+// ikiParser's T_DATE_RE.)
+const N_DATE_RE = /(\d{4})[-.]{1,2}(\d{2})[-.]{1,2}(\d{2})/;
+// HH:MM — the colon is MANDATORY (`;` allowed — OCR misreads `:` as
+// `;` on faded prints) with tolerant whitespace around it ("17: 18",
+// receipt-221-class garble on IKI). A hyphen/dot first separator is
+// deliberately NOT allowed here (unlike IKI's HH:MM:SS) because
+// Norfa has no trailing :SS to disambiguate — "03-26" inside the
+// date would read as a time.
+const N_TIME_RE = /\b(\d{1,2})\s*[:;]\s*(\d{2})\b/;
+// `NUOLAIDA KVITUI -0,74 EUR` — the RECEIPT-level discount (NORFA
+// money written off against this receipt). This — plus the per-item
+// `-N,NN EUR` lines in the body — is the receipt's true savings.
+// The `kv[il1]t` stem tolerates I/l/1 swaps in "KVITUI".
+// NEVER read `NUOLAIDA PREKIŲ SUMAI` as savings: that line is the
+// loyalty ACCRUAL BASE (the sum of discount-ELIGIBLE goods, e.g.
+// 63,07 EUR on a 78 € receipt) — on a receipt with no discount at
+// all it simply equals the receipt total.
+const DISCOUNT_KVITUI_RE = /nuolaida\s+kv[il1]t\w*/i;
+
+const round2 = (n: number) => Math.round(n * 100) / 100;
 
 /** Map OCR letter-for-digit confusions back to digits before parseFloat. */
 function sanitizeNumStr(s: string): string {
@@ -435,6 +481,14 @@ function parseFooter(lines: NorfaLine[]): NorfaFooter {
         });
     };
 
+    // Date/time: last-match-wins. The footer prints OTHER dates ABOVE
+    // the timestamp row ("NORFA pinigai galioja iki 2026-09-22"), so a
+    // first-match scan would pin the loyalty-expiry date. The real
+    // timestamp is the LAST date-shaped token in the footer (bottom
+    // row, next to KAS#). Track the source lines for banding.
+    let dateLine: NorfaLine | undefined;
+    let timeLine: NorfaLine | undefined;
+
     for (let i = 0; i < lines.length; i++) {
         const t = lines[i].text.trim();
 
@@ -465,23 +519,62 @@ function parseFooter(lines: NorfaLine[]): NorfaFooter {
                 }
             }
         }
-        // `NUOLAIDA PREKIŲ SUMAI` — total discount across all items.
-        if (/nuolaida\s+preki/i.test(t)) {
-            const sameLine = t.match(/(\d+[.,]\s?\d{1,2})\s*EUR/i);
+        // `NUOLAIDA KVITUI -0,74 EUR` — receipt-level discount. The
+        // amount usually shares the label's line; MLKit sometimes
+        // splits it onto a neighbour box (require the minus there so a
+        // stray positive amount from an adjacent totals row can't be
+        // grabbed). Stored as a POSITIVE savings figure.
+        //
+        // `NUOLAIDA PREKIŲ SUMAI` is deliberately NOT read: it is the
+        // loyalty accrual base (sum of discount-eligible goods), not a
+        // discount — the old code shipped it as "savings" and users saw
+        // "you saved 63,07 €" on a 78 € receipt.
+        if (totalSavings === null && DISCOUNT_KVITUI_RE.test(t)) {
+            const sameLine = t.match(/-?\s*(\d+[.,]\s?\d{1,2})\s*EUR/i);
             if (sameLine) {
-                totalSavings = parseNum(sameLine[1]);
+                totalSavings = Math.abs(parseNum(sameLine[1]));
             } else {
-                const neighbour = lines[i - 1]?.text ?? lines[i + 1]?.text ?? '';
-                const m = neighbour.match(/(\d+[.,]\s?\d{1,2})\s*EUR/i);
-                if (m) totalSavings = parseNum(m[1]);
+                // Split-box fallback: try BOTH neighbours, taking
+                // whichever carries a NEGATIVE amount (the minus is
+                // required here so an adjacent totals row — "KVITO
+                // SUMA 1,45 EUR" — can never be read as the discount).
+                for (const neighbour of [lines[i + 1]?.text, lines[i - 1]?.text]) {
+                    const m = neighbour?.match(/-\s*(\d+[.,]\s?\d{1,2})\s*EUR/i);
+                    if (m) {
+                        totalSavings = Math.abs(parseNum(m[1]));
+                        break;
+                    }
+                }
             }
         }
-        // Date/time block: `2026-01-07 15:29` (no label).
-        const dtMatch = t.match(/(\d{4}-\d{2}-\d{2})\s+(\d{1,2}:\d{2})/);
-        if (dtMatch) {
-            date = dtMatch[1];
-            time = dtMatch[2];
-            trackLine(lines[i], 'dateTime');
+        // Date/time block: `2026-03-26 17:18` (no label). Independent
+        // scans with garble tolerance (doubled-hyphen dates, space
+        // after the time colon) — the old fused-only regex lost BOTH
+        // fields when either half was garbled.
+        const dMatch = t.match(N_DATE_RE);
+        if (dMatch) {
+            const mo = parseInt(sanitizeNumStr(dMatch[2]), 10);
+            const dy = parseInt(sanitizeNumStr(dMatch[3]), 10);
+            if (mo >= 1 && mo <= 12 && dy >= 1 && dy <= 31) {
+                date = `${dMatch[1]}-${dMatch[2]}-${dMatch[3]}`;
+                dateLine = lines[i];
+                // Time on the same line: only scan AFTER the date so
+                // the date's own "03-26" digits can't be misread.
+                const rest = t.slice((dMatch.index ?? 0) + dMatch[0].length);
+                const tm = rest.match(N_TIME_RE);
+                if (tm && parseInt(tm[1], 10) <= 23 && parseInt(tm[2], 10) <= 59) {
+                    time = `${tm[1].padStart(2, '0')}:${tm[2]}`;
+                    timeLine = lines[i];
+                }
+            }
+        } else if (N_TIME_RE.test(t)) {
+            // Time-only line (MLKit split the timestamp row). Guard
+            // the hour range so money figures can't sneak in.
+            const tm = t.match(N_TIME_RE);
+            if (tm && parseInt(tm[1], 10) <= 23 && parseInt(tm[2], 10) <= 59) {
+                time = `${tm[1].padStart(2, '0')}:${tm[2]}`;
+                timeLine = lines[i];
+            }
         }
         // Receipt number at footer tail — accepts both "Kvito numeris"
         // and "Kvito Nr." label forms.
@@ -492,6 +585,16 @@ function parseFooter(lines: NorfaLine[]): NorfaFooter {
                 trackLine(lines[i], 'receiptNo');
             }
         }
+    }
+
+    // Band the CHOSEN date/time source lines (last-match-wins, so this
+    // must run after the loop — an in-loop track would band the
+    // loyalty-expiry date row too).
+    if (dateLine && timeLine && dateLine === timeLine) {
+        trackLine(dateLine, 'dateTime');
+    } else {
+        if (dateLine) trackLine(dateLine, 'dateTime');
+        if (timeLine) trackLine(timeLine, 'dateTime');
     }
 
     lineRegions.sort((a, b) => a.yTop - b.yTop);
@@ -550,11 +653,48 @@ export function parseNorfaReceipt(rawLines: NorfaLine[]): NorfaParseResult {
             }
         }
     }
-    const plan = findReceiptBandsNorfa(rawLines);
+    // Synthetic fallback id (IKI idiom): when NO printed identifier
+    // survived OCR anywhere on the receipt, synthesise a stable dedup
+    // key from date + time + total cents so a re-scan of the same
+    // receipt still collides with the stored one.
+    if (
+        !footer.receiptNo &&
+        footer.date &&
+        footer.time &&
+        footer.total !== null
+    ) {
+        footer.receiptNo =
+            `${footer.date.replace(/-/g, '')}-${footer.time.replace(/:/g, '')}` +
+            `-${Math.round(footer.total * 100)}-norfa-receipt`;
+    }
+    const ctx = computeBandsContextV2(rawLines);
     const products: NorfaProduct[] = [];
-    for (const internal of plan.productInternals) {
-        const { product } = extractNorfaProduct(internal);
+    for (const internal of ctx.productInternals) {
+        const { product, foreignDiscountEur } = extractNorfaProduct(internal);
+        // Foreign-discount re-attribution: a discount line that
+        // y-sorted BELOW the next product's name lands in THAT band's
+        // preName, but the money belongs to the PREVIOUS product (its
+        // own discounts print directly under its anchor row). Apply it
+        // to the previous accepted product — with the plausibility
+        // clamp (paid >= 0 AND discount <= price) — instead of the old
+        // behaviour of discounting the WRONG (current) product.
+        // Products are still line-total priced here (normalisation
+        // runs below), so the clamp compares like with like.
+        if (foreignDiscountEur != null && products.length > 0) {
+            const prev = products[products.length - 1];
+            if (prev.promoPrice === null && prev.price > 0) {
+                const paid = round2(prev.price - foreignDiscountEur);
+                if (paid >= 0 && foreignDiscountEur <= prev.price) {
+                    prev.promoPrice = paid;
+                }
+            }
+        }
         if (!product) continue;
+        products.push(product);
+    }
+    // Per-unit normalisation (separate pass so a foreign discount from
+    // band N can still reach product N−1's line-total price above).
+    for (const product of products) {
         if (product.pricePerUnit !== null && product.quantity > 0) {
             product.price = product.pricePerUnit;
             if (product.promoPrice !== null) {
@@ -562,7 +702,19 @@ export function parseNorfaReceipt(rawLines: NorfaLine[]): NorfaParseResult {
                     Math.round((product.promoPrice / product.quantity) * 100) / 100;
             }
         }
-        products.push(product);
+    }
+    // Savings = Σ per-item `-N,NN EUR` discount lines in the BODY +
+    // |NUOLAIDA KVITUI| from the footer (parseFooter). Scanned off the
+    // merged product slice (each physical discount row appears exactly
+    // once there — mergeRowFragments folds duplicate boxes), so a
+    // discount dropped by band mis-attribution still counts.
+    let itemDiscountSum = 0;
+    for (const l of ctx.productSlice) {
+        const m = l.text.match(/-\s*(\d+[.,]\s?\d{1,2})\s*EUR/i);
+        if (m) itemDiscountSum += parseNum(m[1]);
+    }
+    if (itemDiscountSum > 0) {
+        footer.totalSavings = round2((footer.totalSavings ?? 0) + itemDiscountSum);
     }
     return { header, products, footer };
 }
@@ -1211,7 +1363,7 @@ const computeBandsContextV2 = (rawLines: NorfaLine[]): NorfaBandsContext => {
     // Footer bands (visual only — receipt-no, datetime, total).
     for (const line of footerSlice) {
         const t = line.text.trim();
-        if (/kvito\s+numeri/i.test(t) || /^\d{4,}\s*#?\s*$/.test(t)) {
+        if (RECEIPT_NO_HEADER_RE.test(t) || /^\d{4,}\s*#?\s*$/.test(t)) {
             bands.push({
                 kind: 'receipt-no',
                 yTop: line.yTop,
@@ -1221,16 +1373,24 @@ const computeBandsContextV2 = (rawLines: NorfaLine[]): NorfaBandsContext => {
             break;
         }
     }
+    // Timestamp band: prefer the fused "date + time" row (tolerant
+    // separators, space-after-colon) so the loyalty-expiry date rows
+    // ("galioja iki 2026-09-22") higher up can't claim the band.
+    let dtBandLine: NorfaLine | undefined;
     for (const line of footerSlice) {
-        if (/(\d{4}-\d{2}-\d{2})\s+(\d{1,2}:\d{2})/.test(line.text)) {
-            bands.push({
-                kind: 'datetime',
-                yTop: line.yTop,
-                yBottom: line.yBottom,
-                label: 'date',
-            });
-            break;
-        }
+        const dm = line.text.match(N_DATE_RE);
+        if (!dm) continue;
+        dtBandLine = line; // date-only fallback: last date row wins
+        const rest = line.text.slice((dm.index ?? 0) + dm[0].length);
+        if (N_TIME_RE.test(rest)) break; // fused row — authoritative
+    }
+    if (dtBandLine) {
+        bands.push({
+            kind: 'datetime',
+            yTop: dtBandLine.yTop,
+            yBottom: dtBandLine.yBottom,
+            label: 'date',
+        });
     }
     for (const line of footerSlice) {
         if (/^kvito\s+suma/i.test(line.text.trim())) {
@@ -1353,6 +1513,11 @@ export function traceReceiptBandsNorfa(rawLines: NorfaLine[]): string {
 export interface NorfaExtractResult {
     product: NorfaProduct | null;
     warnings: string[];
+    /** A discount EUR amount found in preName — it y-sorted below the
+     *  NEXT product's name, so it belongs to the PREVIOUS product.
+     *  parseNorfaReceipt re-attributes it (with plausibility clamps);
+     *  it is never applied to THIS band's product. */
+    foreignDiscountEur?: number | null;
 }
 
 export function extractNorfaProduct(internal: NorfaBandInternal): NorfaExtractResult {
@@ -1373,6 +1538,14 @@ export function extractNorfaProduct(internal: NorfaBandInternal): NorfaExtractRe
         pricePerUnit = parseNum(weighMatch[2]);
         price = parseNum(weighMatch[3]);
         unit = quantity % 1 !== 0 ? 'kg' : 'vnt';
+        // RECOVER a garbled €/kg: when the printed unit price read as
+        // 0 but the line total + kg quantity survived, derive
+        // €/kg = total ÷ qty (IKI idiom) so the item stays weighed
+        // with a real €/kg instead of a poisoned/zero unit price.
+        if (!(pricePerUnit > 0) && quantity > 0 && price > 0) {
+            const derived = round2(price / quantity);
+            if (derived > 0 && derived < 1000) pricePerUnit = derived;
+        }
     } else if (weighIntMatch) {
         // Integer-qty multi-buy (e.g. "2x2,15 4,30 M1"). qty is
         // always integer here so unit is `vnt`, never `kg`.
@@ -1398,6 +1571,7 @@ export function extractNorfaProduct(internal: NorfaBandInternal): NorfaExtractRe
     const nameLines: string[] = [];
     const sizeSuffixes: string[] = [];
     let promoPrice: number | null = null;
+    let foreignDiscountEur: number | null = null;
 
     const extractDiscountEur = (text: string): number | null => {
         const m = text.match(/-\s*(\d+[.,]\s?\d{1,2})\s*EUR/i);
@@ -1420,14 +1594,17 @@ export function extractNorfaProduct(internal: NorfaBandInternal): NorfaExtractRe
         if (!text) continue;
         // A discount line sitting in preName means the previous
         // product's discount got y-sorted ahead of this one's name.
-        // It belongs to that previous product, not us — drop it.
-        // (Pull the EUR amount only if we somehow have no discount
-        // captured yet; defensive — the postAnchor pass below is
-        // the canonical source.)
+        // It belongs to that PREVIOUS product, not us. The old code
+        // "defensively" applied it to THIS product's price — that
+        // minted a wrong promo on the wrong item (e.g. the neighbour's
+        // -1,80 turning a 2,50 line into a phantom 0,70 promo). Hand
+        // the amount back to the caller instead; parseNorfaReceipt
+        // re-attributes it to the previous product under the
+        // plausibility clamps. Never used for this band's promo.
         if (NUOLAIDA_TOKEN_RE.test(text) || DISCOUNT_AMOUNT_RE.test(text)) {
             const d = extractDiscountEur(text);
-            if (d !== null && promoPrice === null) {
-                promoPrice = Math.round((price - d) * 100) / 100;
+            if (d !== null && foreignDiscountEur === null) {
+                foreignDiscountEur = d;
             }
             continue;
         }
@@ -1630,8 +1807,14 @@ export function extractNorfaProduct(internal: NorfaBandInternal): NorfaExtractRe
         if (!text) continue;
         if (NUOLAIDA_TOKEN_RE.test(text) || DISCOUNT_AMOUNT_RE.test(text)) {
             const d = extractDiscountEur(text);
-            if (d !== null && promoPrice === null) {
-                promoPrice = Math.round((price - d) * 100) / 100;
+            // PLAUSIBILITY CLAMP (IKI's sanity gate): a discount can
+            // never exceed the line total — paid must stay >= 0. When
+            // it doesn't, the discount was mis-read or mis-attributed;
+            // DROP the promo (keep the base price) rather than ship a
+            // negative/implausible promo price.
+            if (d !== null && promoPrice === null && d > 0) {
+                const paid = Math.round((price - d) * 100) / 100;
+                if (paid >= 0 && d <= price) promoPrice = paid;
             }
             continue;
         }
@@ -1667,25 +1850,49 @@ export function extractNorfaProduct(internal: NorfaBandInternal): NorfaExtractRe
     const name = [headName, tailName].filter(Boolean).join(' ').trim();
 
     if (!name) {
-        return { product: null, warnings: ['skip:no-name'] };
+        return { product: null, warnings: ['skip:no-name'], foreignDiscountEur };
     }
     if (NON_CATALOG_RE.test(name)) {
         return {
             product: null,
             warnings: [`skip:non-catalog "${name.slice(0, 60)}"`],
+            foreignDiscountEur,
         };
     }
     if (DEPOSIT_RE.test(name)) {
         return {
             product: null,
             warnings: [`skip:deposit-only "${name.slice(0, 60)}"`],
+            foreignDiscountEur,
         };
     }
     if (/^\d+[.,]?\d*$/.test(name)) {
         return {
             product: null,
             warnings: [`skip:numeric-only-name "${name}"`],
+            foreignDiscountEur,
         };
+    }
+
+    // PRICE-POISONING GUARD ("show it, never write price" — IKI
+    // idiom): the NAME says this line is sold per kg (Norfa prints
+    // the `, 1kg` / `, 1 kg` / `, lkg` per-unit tail on every weighed
+    // row) but the `qty x €/kg` row was lost to OCR, so the anchor is
+    // just the bare line total. That total covers a FRACTION of a kg —
+    // storing it as the unit price would poison the per-kg reference
+    // price. Keep the item visible (unit 'kg') but emit price = 0 /
+    // pricePerUnit = null; the server's ingestion skips price <= 0 and
+    // never writes a reference price for it.
+    const NAME_KG_SIGNAL_RE = /[,)]\s*[1lI]\s?kg\b/i;
+    const weighedNoPpu =
+        pricePerUnit === null && unit !== 'kg' && NAME_KG_SIGNAL_RE.test(name);
+    if (weighedNoPpu) {
+        warnings.push('weighed-no-ppu:price-zeroed');
+        price = 0;
+        promoPrice = null;
+        quantity = 1;
+        unit = 'kg';
+        pricePerUnit = null;
     }
 
     const allLines = [
@@ -1702,10 +1909,14 @@ export function extractNorfaProduct(internal: NorfaBandInternal): NorfaExtractRe
             quantity,
             unit,
             pricePerUnit,
+            // Sold by weight — either a recovered `qty x €/kg` (unit
+            // 'kg') or the weighed-but-unpriceable guard above.
+            isWeighable: unit === 'kg',
             rawLines: allLines.map((l) => l.text),
             region: regionOf(allLines),
         },
         warnings,
+        foreignDiscountEur,
     };
 }
 

@@ -109,6 +109,12 @@ export interface RimiProduct {
      *  name-similarity alone returns the wrong pack at confidence 1.0). */
     parsedAmount?: number | null;
     parsedUnit?: string | null;
+    /** True when the line is sold by weight (unit === 'kg'), false for
+     *  per-piece rows. IKI-parser parity: drives the server resolver to
+     *  keep a weighable catalog SP instead of falling through to a
+     *  garbled same-name orphan. The processing coordinator threads it
+     *  through unchanged — the parser only EMITs the field. */
+    isWeighable?: boolean;
 }
 
 export interface RimiHeader {
@@ -173,10 +179,15 @@ const DISCOUNT_RE =
 const NUOL_FRAGMENT_RE = /Nuo[li]\s*\.?\s*-\s*[\dOoIl]+[.,]\s?[\dOoIl]{1,2}/i;
 const GALUT_FRAGMENT_RE = /Gal[uūü]t\s*[.,]?\s*k?aina\s*[\dOoIl]+[.,]\s?[\dOoIl]{1,2}/i;
 
-// Weighable: `0,340 kg X 7,59 EUR/kg`. `E?UR` tolerates an iOS-MLKit
-// pattern where the leading `E` of `EUR` is dropped — observed on
-// receipt 55 as "0,978 kg X 1,69UR/K_3. 1", which otherwise fails the
-// weight-line classifier and the entire row drops to unit=vnt qty=1.
+// Weighable: `0,340 kg X 7,59 EUR/kg`. `[EF]?UR` tolerates two OCR
+// patterns on the currency token:
+//   - the leading `E` of `EUR` dropped entirely — observed on receipt
+//     55 as "0,978 kg X 1,69UR/K_3. 1", which otherwise fails the
+//     weight-line classifier and the entire row drops to unit=vnt qty=1.
+//   - E↔F thermal-print confusion ("FUR" for "EUR") — the E's bottom
+//     bar fades on thermal paper and MLKit reads F. Same class as the
+//     IKI parser's T_EUR (`[EÉĖÈÊF]...`); diacritic variants are
+//     already collapsed by normalizeForNumberRegex's stripDiacritics.
 // "UR" preceded by `\d+[.,]\d{1,2}\s*` has no plausible false-positive
 // shape in product names.
 //
@@ -185,15 +196,29 @@ const GALUT_FRAGMENT_RE = /Gal[uūü]t\s*[.,]?\s*k?aina\s*[\dOoIl]+[.,]\s?[\dOoI
 // as "0,494 kg? X 7,99 EUR/kg" where MLKit inserted a "?" after kg.
 // Pre-fix that row was misclassified as preName and glued into the
 // product name with unit/quantity/ppu all lost.
-const WEIGHT_RE = /(\d+[.,]\s?\d{1,3})\s*kg[^xX×]*[xX×]\s*(\d+[.,]\s?\d{1,2})\s*(?:E?UR|€)/i;
+const WEIGHT_RE = /(\d+[.,]\s?\d{1,3})\s*kg[^xX×]*[xX×]\s*(\d+[.,]\s?\d{1,2})\s*(?:[EF]?UR|€)/i;
 
 // Fallback for weighable lines where MLKit dropped the `kg` between
 // the quantity and the X — observed on receipt 56 band 10 salmon as
 // "0,524 .24 x 23,99 EUR/kg". The `EUR/kg` suffix is the unique
 // signature that disambiguates "weighable" from "multi-buy" when the
 // `kg` token between qty and X is missing; multi-buy lines never carry
-// a `/kg` rate suffix. Tried only after WEIGHT_RE fails.
-const WEIGHT_RATE_ONLY_RE = /(\d+[.,]\s?\d{1,3})\s*[^xX×]*[xX×]\s*(\d+[.,]\s?\d{1,2})\s*(?:E?UR|€)\s*\/\s*kg/i;
+// a `/kg` rate suffix. Tried only after WEIGHT_RE fails. Currency
+// class shares WEIGHT_RE's `[EF]?UR` OCR tolerance.
+const WEIGHT_RATE_ONLY_RE = /(\d+[.,]\s?\d{1,3})\s*[^xX×]*[xX×]\s*(\d+[.,]\s?\d{1,2})\s*(?:[EF]?UR|€)\s*\/\s*kg/i;
+
+// Weighed-line HINT: the row is weight-SHAPED ("… kg × …" body or a
+// "… EUR/kg" rate suffix) but too OCR-garbled for WEIGHT_RE /
+// WEIGHT_RATE_ONLY_RE to extract numbers from (e.g. a letter inside
+// the €/kg rate that the digit fold doesn't cover: "0,978 kg X 1,b9
+// EUR/kg"). Used by extractRimiProduct's price-poisoning guard: a
+// band with a kg hint but no recoverable €/kg must NOT fall back to
+// unit=vnt with the anchor line total as its price — that total is
+// for a FRACTION of a kg and would poison the per-unit reference
+// price ("show it, never write price"). Neither alternative has a
+// plausible false-positive shape inside product names ("kg" directly
+// followed by an ×, or a currency-slash-kg rate suffix).
+const WEIGHT_HINT_RE = /\bkg\b[^xX×]{0,10}[xX×]|(?:[EF]?UR|€)\s*\/\s*kg\b/i;
 
 // Multi-buy: `2 vnt X 1,99 EUR`.
 const MULTI_RE = /(\d+)\s*vnt\s*\.?\s*[xX×]\s*(\d+[.,]\s?\d{1,2})\s*(?:EUR)?/i;
@@ -241,8 +266,22 @@ const FOOTER_SIGNAL_RE =
 //   1. "Kvito Nr. X/Y/Z Kasa NNNN" — canonical compact form.
 //   2. "Kvito numeris XXXXX" — VMI verification block fallback.
 //   3. "BANKO KVITO NR. NNNNN" — bank slip, NOT the receipt no.
-const RECEIPT_NO_KVITO_NR_RE = /^Kvito\s+Nr\.?\b/i;
-const RECEIPT_NO_KVITO_NUMERIS_RE = /^Kvito\s+numeris\b/i;
+//
+// Stem tolerance (IKI-parser parity, T_RECEIPTNO_RE): thermal OCR
+// garbles the "Kvito" stem one glyph at a time — `K`↔`A` (lost
+// left stroke), `v`→`o`/`u`/`y`, and drops the `r` of "Nr." — so
+// `[KA][vouy]ito` + `Nr?` accepts "Avito N. 80/162", "Kyito Nr,"
+// etc. Guards that keep the widened stem from misfiring:
+//   - the Nr-form's lookahead `(?=[\s\d]|$)` rejects "Kvito
+//     numeris …" (an `n` alone would satisfy `Nr?`, but the next
+//     char is `u`, not whitespace/digit) so the numeris path still
+//     owns that layout;
+//   - parseFooter additionally requires ≥1 digit in the captured
+//     tail, so a fully-garbled footer row can't mint a junk id.
+const RECEIPT_NO_KVITO_NR_RE = /^[KA][vouy]ito\s+Nr?[.,]?(?=[\s\d]|$)/i;
+// Prefix stripper for the Nr form — must mirror RECEIPT_NO_KVITO_NR_RE.
+const RECEIPT_NO_KVITO_NR_STRIP_RE = /^[KA][vouy]ito\s+Nr?[.,]?\s*/i;
+const RECEIPT_NO_KVITO_NUMERIS_RE = /^[KA][vouy]ito\s+numeris\b/i;
 const BANKO_KVITO_RE = /^BANKO\s+KVITO/i;
 
 // LAIKAS line — date/time anchor.
@@ -317,7 +356,15 @@ const STORE_NAME_RE = /\bUAB\b.*\bRIMI\b|\bRIMI\b.*\bUAB\b/i;
 // Bag-deposit row — `Užstatas - vienkartinė plastiko pakuotė
 // 0,10`. Used by both V1's product-name filter and V2's band
 // absorption logic.
-export const DEPOSIT_PATTERN = /[uūü]žstat/i;
+//
+// `[žz2]` widening (IKI-parser parity): OCR reads the ž caron
+// inconsistently — plain `z` ("Uzstatas") when the caron fades,
+// `2` when the caron fuses with the z body. Without the class a
+// garbled deposit row fails the filter and mints a phantom
+// "Uzstatas…" product. No Lithuanian grocery word contains
+// `u[žz2]stat` other than the deposit, so the class adds no
+// false-positive surface.
+export const DEPOSIT_PATTERN = /[uūü][žz2]stat/i;
 
 // Deposit-name continuation keyword. Rimi's full deposit row
 // reads "Užstatas - vienkartinė {metalinė|plastiko|popierinė}
@@ -374,6 +421,9 @@ function parseNumLoose(str: string): number {
             .replace(/[IilL]/g, '1'),
     );
 }
+
+/** Round to 2 decimal places (money math). */
+const round2 = (n: number): number => Math.round(n * 100) / 100;
 
 /** Bounding region that covers all given lines. Empty input returns zeros. */
 function regionOf(lines: RimiLine[]): Region {
@@ -646,7 +696,12 @@ const normalizeForNumberRegex = (s: string): string =>
 
 const isWeightOrMultiLine = (line: RimiLine): boolean => {
     const t = normalizeForNumberRegex(line.text);
-    return WEIGHT_RE.test(t) || WEIGHT_RATE_ONLY_RE.test(t) || MULTI_RE.test(t);
+    // WEIGHT_HINT_RE: a weight-SHAPED row too garbled for the strict
+    // regexes still classifies as weight/multi so (a) band-tail
+    // absorption keeps it with ITS product instead of leaking it into
+    // the next band's preName, and (b) a bare price following it can't
+    // become a relaxed anchor.
+    return WEIGHT_RE.test(t) || WEIGHT_RATE_ONLY_RE.test(t) || MULTI_RE.test(t) || WEIGHT_HINT_RE.test(t);
 };
 
 const isDiscountLine = (line: RimiLine): boolean => {
@@ -920,7 +975,7 @@ const WEIGHT_LINE_FRAGMENT_RE =
 // from numeric tokens in product names. `[^xX×]{0,20}` absorbs stray OCR
 // fragments (e.g. the `.27` price fragment) between the weight qty and the `X`.
 const WEIGHT_LINE_RATE_FRAGMENT_RE =
-    /\d[\dOoIlL.,]*[^xX×]{0,20}[xX×]\s*[\dOoIlL.,]+\s*(?:E?UR|€)?\s*\/\s*kg\b/gi;
+    /\d[\dOoIlL.,]*[^xX×]{0,20}[xX×]\s*[\dOoIlL.,]+\s*(?:[EF]?UR|€)?\s*\/\s*kg\b/gi;
 
 /**
  * Detect and extract a pack-size token from the product name.
@@ -1327,7 +1382,7 @@ export function parseFooter(lines: RimiLine[]): RimiFooter {
             // (definitive end of the total/payment block) so
             // unrelated amounts further down can't slip in.
             if (chosenAmount === null) {
-                const KVITO_NR_STOP = /^Kvito\s+Nr/i;
+                const KVITO_NR_STOP = /^[KA][vouy]ito\s+Nr?/i;
                 for (let k = i + 1; k <= Math.min(lines.length - 1, i + 10); k++) {
                     const cand = lines[k];
                     if (KVITO_NR_STOP.test(cand.text.trim())) break;
@@ -1435,21 +1490,28 @@ export function parseFooter(lines: RimiLine[]): RimiFooter {
         // receiptNo doesn't contain stray letters (and so DB lookups
         // that compare against fresh OCR output still match).
         if (!receiptNo && !BANKO_KVITO_RE.test(text) && RECEIPT_NO_KVITO_NR_RE.test(text)) {
-            const tail = text.replace(/^Kvito\s+Nr\.?\s*/i, '');
+            const tail = text.replace(RECEIPT_NO_KVITO_NR_STRIP_RE, '');
             const cleaned = ocrDigit(
                 tail
                     .replace(/\s*Kasa\s+\d+.*$/i, '')
                     .replace(/\s+/g, '')
                     .trim(),
             );
-            if (cleaned) {
+            // Require ≥1 digit (post-ocrDigit fold) — the widened
+            // [KA][vouy]ito stem admits more garbled lines, and a
+            // digitless tail would otherwise mint a junk id that
+            // poisons dedup. Digitless → fall through to the numeris
+            // form / synthetic fallback instead.
+            if (cleaned && /\d/.test(cleaned)) {
                 receiptNo = cleaned;
                 trackLine(lines[i], 'receiptNo');
             }
         }
 
         if (!receiptNo && !BANKO_KVITO_RE.test(text) && RECEIPT_NO_KVITO_NUMERIS_RE.test(text)) {
-            const m = text.match(/^Kvito\s+numeris\s+(\d+)/i);
+            // Digit class admits the O/o/I/l OCR confusions —
+            // normalised right below via ocrDigit, same as the Nr form.
+            const m = text.match(/^[KA][vouy]ito\s+numeris\s+([\dOoIl]+)/i);
             if (m) {
                 receiptNo = ocrDigit(m[1]);
                 trackLine(lines[i], 'receiptNo');
@@ -1468,6 +1530,38 @@ export function parseFooter(lines: RimiLine[]): RimiFooter {
         }
     }
 
+    // LAST RESORT (cash receipt, IKI-parser parity): total = Grynieji
+    // (cash tendered) − Grąža (change). When the payment block is too
+    // scrambled to read a "Mokėti" total but the cash + change rows
+    // survived, this still recovers it. Only when BOTH are cleanly
+    // present and cash ≥ change.
+    if (total === null) {
+        const amtIn = (re: RegExp): number | null => {
+            for (const l of lines) {
+                if (!re.test(stripDiacritics(l.text))) continue;
+                const m = l.text.match(/(\d+[.,]\s?\d{2})/);
+                if (m) return parseNumLoose(m[1]);
+            }
+            return null;
+        };
+        const cash = amtIn(/Grynie/i);
+        const change = amtIn(/Gr[aą][zž]a/i);
+        if (cash !== null && change !== null && cash >= change) {
+            total = round2(cash - change);
+        }
+    }
+
+    // Synthetic receipt-id fallback (IKI-parser parity): when the
+    // printed "Kvito Nr." row was too garbled to survive OCR, a
+    // missing receiptNo bails the WHOLE scan downstream. Date + time
+    // + total identify the purchase just as uniquely — the same
+    // receipt photographed again yields the same synthetic id, so
+    // backend dedup still works. Only minted when all three parts
+    // are present; a partial key would collide across receipts.
+    if (!receiptNo && date && time && total !== null) {
+        receiptNo = syntheticReceiptNo(date, time, total);
+    }
+
     lineRegions.sort((a, b) => a.yTop - b.yTop);
     return {
         total,
@@ -1479,6 +1573,17 @@ export function parseFooter(lines: RimiLine[]): RimiFooter {
         region: regionOf(lines),
         lineRegions,
     };
+}
+
+/**
+ * Deterministic fallback receipt id from date + time + total —
+ * `${YYYYMMDD}-${HHMMSS}-${cents}-rimi-receipt`. Shared by
+ * parseFooter (printed id garbled) and parseRimiReceipt (total only
+ * recovered by the item-sum fallback) so both paths mint the SAME id
+ * for the same receipt.
+ */
+function syntheticReceiptNo(date: string, time: string, total: number): string {
+    return `${date.replace(/-/g, '')}-${time.replace(/:/g, '')}-${Math.round(total * 100)}-rimi-receipt`;
 }
 
 // ───────── band model (internal) ─────────
@@ -2096,6 +2201,13 @@ export function extractRimiProduct(internal: RimiBandInternal): RimiExtractResul
     let savings: number | null = null;
     let finalPrice: number | null = null;
     let depositSeen = false;
+    // Weighed-hint state: a weight-SHAPED line was seen but every
+    // weight regex failed on it (WEIGHT_HINT_RE). Drives the price-
+    // poisoning guard after the loop; hintKgQty keeps the printed kg
+    // quantity when at least that half of the garbled line survived,
+    // so €/kg can be re-derived from the anchor total.
+    let weighedHint = false;
+    let hintKgQty: number | null = null;
     const nameFragments: string[] = [];
 
     const allEntries: Array<{ entry: RimiBandLineEntry; isPreName: boolean }> = [
@@ -2194,6 +2306,23 @@ export function extractRimiProduct(internal: RimiBandInternal): RimiExtractResul
             unit = 'vnt';
             continue;
         }
+        // Weighed-hint capture: the row is weight-SHAPED ("kg ×" body
+        // or "EUR/kg" rate suffix) but too garbled for any weight
+        // regex above (e.g. a non-foldable letter inside the €/kg
+        // digits: "0,978 kg X 1,b9 EUR/kg"). Remember the hint, try
+        // to salvage the printed kg quantity for €/kg re-derivation,
+        // and NEVER let the fragment into the displayed name.
+        if (WEIGHT_HINT_RE.test(stripped)) {
+            weighedHint = true;
+            if (hintKgQty === null) {
+                const km = stripped.match(/(\d+[.,]\s?\d{1,3})\s*kg\b/i);
+                if (km) {
+                    const q = parseNumLoose(km[1]);
+                    if (q > 0) hintKgQty = q;
+                }
+            }
+            continue;
+        }
         if (
             entry.reason === 'deposit' ||
             entry.reason === 'deposit-cont' ||
@@ -2282,6 +2411,50 @@ export function extractRimiProduct(internal: RimiBandInternal): RimiExtractResul
     let { amount: parsedAmount, unit: parsedUnit, strippedName: nameAfterPackExtract } =
         extractPackSize(rawName);
 
+    // WEIGHED PRICE-POISONING GUARD (IKI-parser parity, "show it,
+    // never write price"): the band carries a kg signal but ALL of
+    // the weight regexes failed, so no €/kg was established. Two
+    // kg-signal sources:
+    //   - weighedHint: a weight-SHAPED line was seen in the band but
+    //     was too garbled to parse (receipt-55/56 shapes);
+    //   - a bare ", kg" name tail with no pack-size digits ("Švieži
+    //     kalakutų filė, kg") — the per-kg reference suffix — when
+    //     OCR dropped the weight row entirely. Fixed packs print a
+    //     digit before kg ("1 kg") which extractPackSize captures
+    //     and strips, so they never reach this test.
+    // Recovery first: when the printed kg quantity survived on the
+    // hint line, €/kg = anchor total ÷ qty. When unrecoverable the
+    // item must NOT fall back to unit=vnt with the anchor line total
+    // as its price — that total is for a FRACTION of a kg and would
+    // poison the per-unit reference price. Keep the item (unit 'kg'
+    // so it still SHOWS on the receipt) but zero its price and null
+    // its €/kg → the server's price ingestion skips `price <= 0` and
+    // never writes a reference price.
+    let weighedNoPpu = false;
+    const bareKgTail =
+        parsedAmount === null && /,\s*kg\s*$/i.test(nameAfterPackExtract);
+    if (pricePerUnit === null && (weighedHint || bareKgTail)) {
+        if (hintKgQty !== null && hintKgQty > 0) {
+            const derived = round2(price / hintKgQty);
+            if (derived > 0 && derived < 1000) {
+                pricePerUnit = derived;
+                quantity = hintKgQty;
+                unit = 'kg';
+                warnings.push(
+                    `weighed RECOVERED: €/kg=${derived.toFixed(2)} (price=${price.toFixed(2)} ÷ kg=${hintKgQty})`,
+                );
+            }
+        }
+        if (pricePerUnit === null) {
+            weighedNoPpu = true;
+            unit = 'kg';
+            if (hintKgQty !== null && hintKgQty > 0) quantity = hintKgQty;
+            warnings.push(
+                'weighed NO-PPU: kg signal but €/kg unrecoverable — price zeroed (never a unit reference)',
+            );
+        }
+    }
+
     // Inference layer: when extractPackSize returned null we still have
     // two high-confidence guesses we can make from receipt-line context.
     //
@@ -2361,7 +2534,21 @@ export function extractRimiProduct(internal: RimiBandInternal): RimiExtractResul
         );
     }
 
-    const promoPrice = finalPrice;
+    // DISCOUNT PLAUSIBILITY CLAMP (IKI-parser parity): a discount can
+    // never exceed the line total, and a promo can never exceed the
+    // base price — paid must satisfy 0 ≤ Galut.kaina ≤ price. A
+    // violation means the discount row was mis-attributed or OCR-
+    // mangled, so DROP the discount (keep the base price) rather than
+    // ship a negative or inflated promo. Weighed-no-ppu items carry no
+    // promo at all — their price is zeroed, so a promo would be
+    // nonsensical (same rule as IKI's weighedNoPpu).
+    let promoPrice = weighedNoPpu ? null : finalPrice;
+    if (promoPrice !== null && (promoPrice < 0 || promoPrice > price)) {
+        warnings.push(
+            `discount DROPPED: implausible Galut.kaina=${promoPrice.toFixed(2)} vs price=${price.toFixed(2)}`,
+        );
+        promoPrice = null;
+    }
 
     // ppu × qty reconcile + self-heal. Receipts print the price-per-
     // unit in the middle column (`2 vnt. X 4,99 EUR` or `0,690 kg X
@@ -2412,11 +2599,17 @@ export function extractRimiProduct(internal: RimiBandInternal): RimiExtractResul
     return {
         product: {
             name,
-            price,
+            // Weighed-no-ppu: price 0 (not the fraction-of-kg line
+            // total) — the server skips price<=0 writes, so the item
+            // shows on the receipt without minting a reference price.
+            price: weighedNoPpu ? 0 : price,
             promoPrice,
             quantity,
             unit,
-            pricePerUnit,
+            pricePerUnit: weighedNoPpu ? null : pricePerUnit,
+            // Priced per kg → weighable (per-piece rows emit false).
+            // Threaded to the server matcher by the coordinator.
+            isWeighable: unit === 'kg',
             rawLines,
             region,
             parsedAmount,
@@ -2510,6 +2703,32 @@ export function parseRimiReceipt(rawLines: RimiLine[]): RimiParseResult {
         }
         products.push(product);
     }
+
+    // TOTAL SANITY (IKI-parser parity): the to-pay total must be in
+    // the ballpark of the items' summed PAID amounts. A garbled
+    // payment block can leave the total missing OR pin it to a stray
+    // tiny value. When the parsed total is null or implausibly small
+    // versus the item sum, fall back to that sum (each product's
+    // discounted per-unit price × quantity — prices here are already
+    // per-unit normalized, so unit × qty recovers the line total).
+    // Only fires on a gross mismatch (< half), so a correctly-read
+    // total is never overwritten. Weighed-no-ppu items contribute 0
+    // (their price is deliberately zeroed).
+    const itemSum = round2(products.reduce((s, p) => {
+        const q = p.quantity && p.quantity > 0 ? p.quantity : 1;
+        const unitPrice = (p.promoPrice != null ? p.promoPrice : p.price) ?? 0;
+        return s + (unitPrice > 0 ? unitPrice * q : 0);
+    }, 0));
+    if (itemSum > 0 && (footer.total === null || footer.total < itemSum * 0.5)) {
+        footer.total = itemSum;
+    }
+    // The synthetic receipt-id fallback needs a total — when the total
+    // only became available via the item-sum fallback above, mint the
+    // id here with the exact same key parseFooter would have used.
+    if (!footer.receiptNo && footer.date && footer.time && footer.total !== null) {
+        footer.receiptNo = syntheticReceiptNo(footer.date, footer.time, footer.total);
+    }
+
     return { header, products, footer };
 }
 

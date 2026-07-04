@@ -83,8 +83,14 @@ export interface MaskBand {
 const LT_FOLD: Record<string, string> = {
     ą: 'a', č: 'c', ę: 'e', ė: 'e', į: 'i', š: 's', ų: 'u', ū: 'u', ž: 'z',
 };
+// NFD-strip ALL diacritics, not just the Lithuanian set: OCR produces stray Latin-1
+// accents too ("KOR(ELÉS" — the acute É is not \w, so it broke the label regexes and
+// left the full loyalty number unmasked, receipt-268). LT_FOLD stays as a belt for any
+// glyph NFD leaves composed.
 const fold = (s: string): string =>
-    s.toLowerCase().replace(/[ąčęėįšųūž]/g, (c) => LT_FOLD[c] ?? c);
+    s.toLowerCase()
+        .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+        .replace(/[ąčęėįšųūž]/g, (c) => LT_FOLD[c] ?? c);
 
 // ── markers ─────────────────────────────────────────────────────────
 // A STAR-MASKED number: ≥4 masking glyphs (`* x X • ·`), spaces allowed
@@ -114,9 +120,13 @@ const CASHIER_LABEL = /kasin[\w ]{0,4}k\w*\s*(nr\.?|nr)?\s*[:.\-–]?\s*/;
 // "IKI KORTELĖS NR. 99110000000005068582". The label is a loyalty-card "NR".
 // "kor?el" (1 optional char between KOR and EL) tolerates the common OCR misread
 // KORTELĖS → KORIELĖS (T→I), which otherwise left the full card number unmasked.
-const LOYALTY_NUMBER_LABEL = /kor\w?el\w*\s*nr/;
-// A long bare digit run (the full loyalty number; spaces allowed between groups).
-const LONG_DIGIT_RUN = /\d[\d ]{8,}\d/;
+// `.?` (not `\w?`) in the T slot: OCR also reads the T as NON-word junk ("KOR(ELĖS NR",
+// receipt-268 — the full loyalty number sailed through unmasked). The trailing "nr"
+// anchor keeps the loosened stem specific.
+const LOYALTY_NUMBER_LABEL = /kor.?el\w*\s*nr/;
+// A long bare digit run (the full loyalty number; spaces allowed between groups, plus the
+// ^/- junk OCR inserts mid-number — "9440006300214^32954" must mask END TO END).
+const LONG_DIGIT_RUN = /\d[\d ^\-]{8,}\d/;
 
 /** How many lines a context label reaches forward to a bare number. */
 const CONTEXT_REACH = 6;

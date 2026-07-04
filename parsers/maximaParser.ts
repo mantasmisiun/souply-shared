@@ -62,6 +62,10 @@ export interface MaximaProduct {
   quantity: number;
   unit: string;
   pricePerUnit: number | null;
+  /** True when the row is sold by weight (unit 'kg'), false for per-piece.
+   *  Mirrors ikiParser's field — drives the server resolver to keep a
+   *  weighable catalog SP rather than a same-name per-piece orphan. */
+  isWeighable?: boolean;
   rawLines: string[];
   region: Region;
   parsedAmount?: number | null;
@@ -142,6 +146,32 @@ const UNIT_QTY_RE = new RegExp(
 // `vnt` for matches against this fallback.
 const UNIT_QTY_NOUNIT_RE =
   /^\s*(\d+[.,]\s?\d{1,2})\s*[xX×]\s*(\d+(?:[.,]\s?\d{1,3})?)\s*$/i;
+
+// ── weighed-row rescue net ──
+//
+// When a weighed row ("1,99 X 1,118 kg") is garbled BEYOND the
+// tolerances above (e.g. "1,9J X ?,?? kq"), neither UNIT_QTY_RE nor
+// UNIT_QTY_NOUNIT_RE matches, the row leaks out of its band into the
+// next product's name, and — worse — the product falls back to
+// quantity=1 with `price` = the LINE TOTAL for a fraction of a kg.
+// That line total then poisons the per-kg reference price server-side.
+//
+// LOOSE step-1 matcher: `<price-ish token> X <short garbage> kg-ish`,
+// whole-line. First char must be digit-shaped so a product NAME that
+// happens to mention kg can't match; the trailing kg token accepts the
+// q/a mis-reads UNIT_QTY_RE already tolerates. Absorbing the row keeps
+// band geometry right and routes it to step 2's rescue below.
+const UNIT_QTY_KG_LOOSE_RE =
+  /^\s*[\d0OoIlL][^\sxX×]{0,7}\s*[xX×].{0,14}?k[gqa]\b\.?\s*$/i;
+
+// Step-2 rescue: pull just the printed KG QUANTITY out of a loose row
+// so €/kg can be re-derived from the receipt's own arithmetic
+// (€/kg = line total ÷ kg). Anchored on the X separator + kg token.
+const UNIT_QTY_KG_QTY_RESCUE_RE =
+  /[xX×]\s*([\d0OoIlL]+(?:[.,]\s?[\d0OoIlL]{1,3})?)\s*k[gqa]\b/i;
+
+// Bare kg signal — the row is weighed even if nothing numeric survived.
+const KG_TOKEN_RE = /\bk[gqa]\b/i;
 
 /**
  * Map OCR's letter-digit confusions back to digits so parseNum can
@@ -583,9 +613,13 @@ export function parseFooter(lines: MaximaLine[]): MaximaFooter {
     }
 
     // Receipt datetime — extract date and time INDEPENDENTLY.
+    // Separator tolerance (adapted from ikiParser's T_DATE_RE): OCR
+    // renders the hyphens as dots or doubles them ("2026.01.12",
+    // "2026--01-12"), so accept `[-.]{1,2}` with optional stray spaces
+    // while keeping the strict month/day range validation.
     if (!date) {
       const m = text.match(
-        /(20\d{2})\s*-\s*(0[1-9]|1[0-2])\s*-\s*(0[1-9]|[12]\d|3[01])/,
+        /(20\d{2})\s*[-.]{1,2}\s*(0[1-9]|1[0-2])\s*[-.]{1,2}\s*(0[1-9]|[12]\d|3[01])/,
       );
       if (m) {
         date = `${m[1]}-${m[2]}-${m[3]}`;
@@ -598,6 +632,18 @@ export function parseFooter(lines: MaximaLine[]): MaximaFooter {
       );
       if (m) {
         time = m[1].length === 5 ? `${m[1]}:00` : m[1];
+        trackLine(lines[i], 'time');
+      }
+    }
+    // Tolerant time fallback (adapted from ikiParser's T_TIME_RE): OCR
+    // injects a space after a colon ("18: 33:52") or turns the first
+    // separator into `.`/`-` ("18-33:52"). The literal `:` before the
+    // seconds keeps a date from ever matching; ranges are validated so
+    // garbage two-digit pairs can't become a phantom time.
+    if (!time) {
+      const m = text.match(/(\d{2})[:.\-]\s*(\d{2})\s*:\s*(\d{2})/);
+      if (m && +m[1] <= 23 && +m[2] <= 59 && +m[3] <= 59) {
+        time = `${m[1]}:${m[2]}:${m[3]}`;
         trackLine(lines[i], 'time');
       }
     }
@@ -618,12 +664,40 @@ export function parseFooter(lines: MaximaLine[]): MaximaFooter {
         }
       }
     }
+    // Stem-garble tolerance (adapted from ikiParser's T_RECEIPTNO_RE):
+    // "Kvito" rots on thermal prints — K→A and v→o/u/y give "Kuito"/
+    // "Koito"/"Avito"; "Nr." arrives as "Nr,"/"N." (dropped r) or fused
+    // to the digits ("Nr.3775"). One garbled character here used to
+    // hard-bail the whole scan via the app's ensureKeyReceiptFields
+    // gate. The strict forms above still run first so clean receipts
+    // are byte-for-byte unchanged.
     if (!receiptNo) {
-      const docMatch = text.match(/Dokumento\s+numeris:?\s+(\d{3,})/i);
+      const m = text.match(/[KA][vouy]ito\s+Nr?[.,]?\s*([0-9/]{3,})/i);
+      if (m) {
+        receiptNo = m[1];
+        trackLine(lines[i], 'receiptNo');
+      } else if (
+        /^[KA][vouy]ito\s+Nr?[.,]?\s*$/i.test(text) &&
+        i + 1 < lines.length
+      ) {
+        const next = lines[i + 1].text.trim();
+        const digits = next.match(/^(\d{3,})/);
+        if (digits) {
+          receiptNo = digits[1];
+          trackLine(lines[i], 'receiptNo');
+          trackLine(lines[i + 1], 'receiptNo');
+        }
+      }
+    }
+    // Alternative source: the VMI block's "Dokumento numeris". Stem
+    // tolerance on "numeris" (OCR splits it — "numer i s") mirrors
+    // ikiParser's T_KVITONUM_RE.
+    if (!receiptNo) {
+      const docMatch = text.match(/Dokumento\s+numer[a-z]*\s*i?\s*s?\s*:?\s+(\d{3,})/i);
       if (docMatch) {
         receiptNo = docMatch[1];
         trackLine(lines[i], 'receiptNo');
-      } else if (/Dokumento\s+numeris:?\s*$/i.test(text) && i + 1 < lines.length) {
+      } else if (/Dokumento\s+numer[a-z]*\s*i?\s*s?\s*:?\s*$/i.test(text) && i + 1 < lines.length) {
         const next = lines[i + 1].text.trim();
         const m = next.match(/^(\d{3,})/);
         if (m) {
@@ -642,6 +716,30 @@ export function parseFooter(lines: MaximaLine[]): MaximaFooter {
         const ns = lines[i + 1].text.trim().match(/(\d+[.,]\s?\d{2})/);
         if (ns) totalSavings = parseNum(ns[1]);
       }
+    }
+  }
+
+  // LAST RESORT (cash receipt, adapted from ikiParser): total =
+  // Grynieji (cash tendered) − Grąža (change). When the totals block
+  // is too scrambled to read "Kvito suma"/"Mokėtina suma" but the cash
+  // + change lines survived, this still recovers the paid amount. Only
+  // when BOTH are cleanly present and cash ≥ change. `Gr[aą][zž]a`
+  // requires the exact word stem, so "Grąžinamos pakuotės" etc. can't
+  // false-match.
+  if (total === null) {
+    const amtIn = (re: RegExp): number | null => {
+      for (const l of lines) {
+        if (re.test(l.text)) {
+          const m = l.text.match(/(\d{1,4}[.,]\s?\d{2})/);
+          if (m) return parseNum(m[1]);
+        }
+      }
+      return null;
+    };
+    const cash = amtIn(/Grynie/i);
+    const change = amtIn(/Gr[aą][zž]a/i);
+    if (cash !== null && change !== null && cash >= change) {
+      total = Math.round((cash - change) * 100) / 100;
     }
   }
 
@@ -710,7 +808,13 @@ function isDiscountLabelLine(line: MaximaLine): boolean {
 }
 
 function isUnitQtyLine(line: MaximaLine): boolean {
-  return UNIT_QTY_RE.test(line.text) || UNIT_QTY_NOUNIT_RE.test(line.text);
+  return (
+    UNIT_QTY_RE.test(line.text) ||
+    UNIT_QTY_NOUNIT_RE.test(line.text) ||
+    // Garbled weighed row — absorb it so it neither leaks into the next
+    // band's name nor leaves this band thinking it's a per-piece row.
+    UNIT_QTY_KG_LOOSE_RE.test(line.text)
+  );
 }
 
 function isDepositLine(line: MaximaLine): boolean {
@@ -1533,6 +1637,9 @@ export function extractMaximaProduct(internal: BandInternal): ExtractResult {
   let pricePerUnit: number | null = null;
   let quantity = 1;
   let unit = 'vnt';
+  // Weighed row whose €/kg could NOT be established (see poisoning
+  // guard below) — the item is kept visible but price-neutralized.
+  let weighedNoPpu = false;
   const unitQtyEntry = internal.postAnchor.find((e) => e.reason === 'unit-qty');
   if (unitQtyEntry) {
     const text = unitQtyEntry.line.text;
@@ -1552,13 +1659,71 @@ export function extractMaximaProduct(internal: BandInternal): ExtractResult {
       if (noUnitMatch) {
         pricePerUnit = parseNum(noUnitMatch[1]);
         quantity = parseNum(noUnitMatch[2]);
-        unit = 'vnt';
+        // Unit suffix dropped by OCR. A FRACTIONAL quantity can't be a
+        // pack count (packs are whole `vnt` per the UNIT_QTY_RE note),
+        // so it's a weighed kg row — mark it so isWeighable is right.
+        unit = Number.isInteger(quantity) ? 'vnt' : 'kg';
       } else {
-        warnings.push(
-          `unit-qty tag present but no regex matched: "${text}"`,
-        );
+        // Step 1 tagged this line via UNIT_QTY_KG_LOOSE_RE — a weighed
+        // row garbled beyond the strict tolerances. Recover what the
+        // receipt's own arithmetic still allows (mirrors ikiParser):
+        // if the printed KG QUANTITY is readable, €/kg = line total ÷ kg.
+        const qtyM = text.match(UNIT_QTY_KG_QTY_RESCUE_RE);
+        const rescuedQty = qtyM ? parseNum(qtyM[1]) : NaN;
+        if (qtyM && isFinite(rescuedQty) && rescuedQty > 0) {
+          const derived = Math.round((price / rescuedQty) * 100) / 100;
+          if (derived > 0 && derived < 1000) {
+            quantity = rescuedQty;
+            unit = 'kg';
+            pricePerUnit = derived;
+            warnings.push(
+              `unit-qty RESCUED €/kg ${derived.toFixed(2)} = ` +
+                `price ${price.toFixed(2)} ÷ kg ${rescuedQty} ("${text}")`,
+            );
+          } else {
+            unit = 'kg';
+            weighedNoPpu = true;
+          }
+        } else if (KG_TOKEN_RE.test(text) || UNIT_QTY_KG_LOOSE_RE.test(text)) {
+          // Weighed, but nothing recoverable — poisoning guard fires.
+          unit = 'kg';
+          weighedNoPpu = true;
+        } else {
+          warnings.push(
+            `unit-qty tag present but no regex matched: "${text}"`,
+          );
+        }
       }
     }
+    // Weighed-row qty plausibility: a kg quantity garbled to 0 would
+    // leave `quantity=0` and the receipt-level normalization would then
+    // keep `price` = the LINE TOTAL (for a fraction of a kg) — poison.
+    // Re-derive it from total ÷ €/kg; if that's impossible the guard
+    // below neutralizes the price instead.
+    if (unit === 'kg' && !weighedNoPpu && !(quantity > 0)) {
+      if (pricePerUnit !== null && pricePerUnit > 0) {
+        quantity = Math.round((price / pricePerUnit) * 1000) / 1000;
+      }
+      if (!(quantity > 0)) weighedNoPpu = true;
+    }
+  }
+
+  // PRICE-POISONING GUARD (adapted from ikiParser): a WEIGHED item
+  // whose €/kg STILL couldn't be established must NOT fall back to a
+  // unit price equal to the LINE TOTAL — that total is for a fraction
+  // (or multiple) of a kg, so storing it would poison the per-kg
+  // reference price. Keep the item (unit 'kg' so it still SHOWS on the
+  // receipt) but zero its price → the server's price ingestion skips
+  // `price <= 0` and never writes a reference price.
+  // (User rule: "show it, never write price".)
+  if (weighedNoPpu) {
+    warnings.push(
+      `weighed price-poisoning guard: €/kg unrecoverable — price zeroed ` +
+        `("${unitQtyEntry?.line.text ?? ''}")`,
+    );
+    price = 0;
+    pricePerUnit = null;
+    if (!(quantity > 0)) quantity = 1;
   }
 
   // promoPrice from the first discount/neg event we see. The
@@ -1570,23 +1735,30 @@ export function extractMaximaProduct(internal: BandInternal): ExtractResult {
   // sign is implied by the event type.
   let promoPrice: number | null = null;
   for (const e of internal.postAnchor) {
+    let amount: number | null = null;
     if (e.reason === 'discount-amount' || e.reason === 'bare-negative') {
       const txt = e.line.text.trim();
       const m = txt.match(NEG_AMOUNT_RE) ?? txt.match(STANDALONE_PRICE_RE);
-      if (m) {
-        const amount = parseNum(m[1]);
-        promoPrice = Math.round((price - amount) * 100) / 100;
-        break;
-      }
-    }
-    if (e.reason === 'inline-discount') {
+      if (m) amount = parseNum(m[1]);
+    } else if (e.reason === 'inline-discount') {
       const m = e.line.text.match(INLINE_NEG_AMOUNT_RE);
-      if (m) {
-        const amount = parseNum(m[1]);
-        promoPrice = Math.round((price - amount) * 100) / 100;
-        break;
-      }
+      if (m) amount = parseNum(m[1]);
     }
+    if (amount === null) continue;
+    // PLAUSIBILITY CLAMP (adapted from ikiParser's validDisc gate): a
+    // discount can never exceed the line total — paid must satisfy
+    // `paid >= 0` and `discount <= price`. A stranded/misread minus or
+    // a digit-garbled savings amount would otherwise anchor a NEGATIVE
+    // (or inflated) promo price. Drop the discount and keep the base
+    // price rather than shipping an impossible promo.
+    if (amount > 0 && amount <= price) {
+      promoPrice = Math.round((price - amount) * 100) / 100;
+    } else {
+      warnings.push(
+        `discount IMPLAUSIBLE (${amount.toFixed(2)} vs price ${price.toFixed(2)}) — dropped`,
+      );
+    }
+    break;
   }
 
   // Reconcile self-check on bands that have an extracted unit-qty.
@@ -1651,6 +1823,9 @@ export function extractMaximaProduct(internal: BandInternal): ExtractResult {
     quantity,
     unit,
     pricePerUnit,
+    // Sold by weight ⇔ the row priced per kg (incl. the zeroed
+    // poisoning-guard case, which stays `unit: 'kg'` so it shows).
+    isWeighable: unit === 'kg',
     rawLines,
     region,
   };
@@ -1750,6 +1925,39 @@ export function parseMaximaReceipt(
     }
     products.push(product);
   }
+
+  // TOTAL SANITY (adapted from ikiParser): the to-pay total must be in
+  // the ballpark of the items' summed PAID amounts. A scrambled totals
+  // block can leave the total missing OR pin it to a stray tiny value.
+  // When the parsed total is null or implausibly small versus the item
+  // sum (< half), fall back to that sum — each product's discounted
+  // per-unit price × quantity. Deposits/refunds aren't in `products`,
+  // so the printed total is always ≥ itemSum and a correctly-read
+  // total is never overwritten.
+  const itemSum =
+    Math.round(
+      products.reduce((s, p) => {
+        const q = p.quantity && p.quantity > 0 ? p.quantity : 1;
+        const unitPaid = (p.promoPrice != null ? p.promoPrice : p.price) ?? 0;
+        return s + (unitPaid > 0 ? unitPaid * q : 0);
+      }, 0) * 100,
+    ) / 100;
+  if (itemSum > 0 && (footer.total === null || footer.total < itemSum * 0.5)) {
+    footer.total = itemSum;
+  }
+
+  // SYNTHETIC RECEIPT ID (adapted from ikiParser): when no printed id
+  // survived OCR ("Kvito Nr." AND "Dokumento numeris" both garbled),
+  // synthesise a stable dedup key from date + time + total cents so a
+  // single rotten character no longer hard-bails the entire scan at
+  // the app's ensureKeyReceiptFields gate. Runs AFTER the total
+  // fallback so a recovered item-sum total can still feed the id.
+  if (!footer.receiptNo && footer.date && footer.time && footer.total !== null) {
+    footer.receiptNo =
+      `${footer.date.replace(/-/g, '')}-${footer.time.replace(/:/g, '')}-` +
+      `${Math.round(footer.total * 100)}-maxima-receipt`;
+  }
+
   return { header, products, footer };
 }
 
