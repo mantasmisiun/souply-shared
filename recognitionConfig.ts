@@ -186,6 +186,15 @@ export const RECOGNITION = {
     subsetFullWeight: 0.92,
     subsetMinCoverage: 0.6,
     /**
+     * UNDER-DETERMINED subset cap. When the query's ONLY significant (>shortTokenThreshold)
+     * token is a single shared word but the candidate carries ≥2 MORE significant tokens the
+     * query has no evidence for, the subset match is ambiguous — a destroyed/truncated OCR
+     * name ("IKI LEDO F" → "Ledo kubelių formelė, 3 dizainų", the mold, not the ice cubes).
+     * Cap such a match just BELOW bands.bandS1 (0.85) so it can't auto-apply and instead
+     * surfaces for a human swipe. @ref productMatcher.ts scoreNameConfidence
+     */
+    underdeterminedSubsetCap: 0.84,
+    /**
      * Distinguishing-noun disagreement penalty. Generic brand/packaging words
      * ("Fasuoti", "IKI", "ŪKIS") are shared across very different products, so a
      * candidate can clear coverage on those alone while the DISTINGUISHING noun

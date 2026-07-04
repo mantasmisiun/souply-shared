@@ -860,6 +860,7 @@ function isIkiHeaderNamePart(part: string, storeAddress?: string): boolean {
   // VAT / company registration block — tokens that never appear in a product name.
   if (/\bP[VY][MN]\b/i.test(t)) return true;                        // "PVM" (OCR PVN / PYM …)
   if (/mok[eė]t/i.test(t)) return true;                            // "mokėtojo" (kodas line)
+  if (/\d{8,}/.test(t.replace(/\s+/g, ''))) return true;           // 8+ digit run = the VAT/company code, never a product
   if (/\bLietuva\b/i.test(t)) return true;                         // "IKI Lietuva, UAB"
   if (/(^|[^A-Za-z])[UJ]A[B8]([^A-Za-z]|$)/i.test(t)) return true; // UAB / JAB / A8 company suffix
   // IKI store-name header line — NARROW so IKI store-brand PRODUCTS ("IKI Pienas")
@@ -3178,6 +3179,21 @@ function parseIkiThermal(lines: IkiLine[]): IkiParseResult {
     if (i < 5 && lines[i].text.replace(/\D/g, '').length >= 7 &&
         lines[i].text.replace(/[^A-Za-zĄČĘĖĮŠŲŪŽąčęėįšųūž]/g, '').length <= 2) {
       pvmCode = lines[i].text.replace(/\D/g, ''); pvmLineIdx = i; headerRegions.push(footBand(lines[i], 'storeCode', pvmCode)); break;
+    }
+    // FALLBACK 2: the "PVM mokėtojo kodas" LABEL garbled to arbitrary letters ("DUM
+    // :101937219", receipt-292 — the top of the receipt was destroyed) so the ≤2-letter
+    // gate above misses it, but the 9-digit VAT code itself survived. A CONSECUTIVE run of
+    // 8+ digits in the header zone is unambiguously the company/VAT code — no product name
+    // or price carries one — so treat that line as the header boundary regardless of how
+    // many junk letters ride with it. (Space-tolerant for the "1019372 19" split-code OCR.)
+    {
+      // Skip the LOYALTY-CARD line ("IKI KORTELĖS NR. 999000111222", 12 digits) — it also
+      // carries a long digit run but is NOT the header VAT code; catching it as the header
+      // boundary would push pStart past real products (receipt-162/merged-line fixtures).
+      const digitRun = lines[i].text.replace(/\s+/g, '').match(/\d{8,}/);
+      if (i < 5 && digitRun && !/kortel/i.test(lines[i].text)) {
+        pvmCode = digitRun[0]; pvmLineIdx = i; headerRegions.push(footBand(lines[i], 'storeCode', pvmCode)); break;
+      }
     }
     // Fallback: a header line (first 3) that STARTS with "PVM" IS the VAT line even when its
     // "mokėtojo kodas LT…" code is OCR-shredded to a stub ("PVM 7219"). Without it pvmLineIdx
