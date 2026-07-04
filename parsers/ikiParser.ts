@@ -3546,6 +3546,10 @@ function parseIkiThermal(lines: IkiLine[]): IkiParseResult {
   let timeLine: IkiLine | undefined;
   let timeMatch: RegExpMatchArray | undefined;
   let sumaPending = false; // previous line had a bare "SUMA" keyword w/o an amount
+  // Total-keyword lines whose AMOUNT was glyph-shredded ("Mokėti IU,1", receipt-309) —
+  // remembered so the cash-lane fallback can still anchor the 'total' BAND semantically.
+  let mokLineNoAmt: IkiLine | undefined;
+  let grynLine: IkiLine | undefined;
   let prevAmtLine: IkiLine | undefined; // previous line carried "X,XX EUR" but no SUMA
   let prevAmtVal: string | undefined;
   let prevBareLine: IkiLine | undefined; // immediately-preceding line that was JUST a bare amount
@@ -3606,6 +3610,10 @@ function parseIkiThermal(lines: IkiLine[]): IkiParseResult {
         // immediately-preceding bare amount as the to-pay total. (receipt-148.)
         total = parseNum(prevBareVal);
         footerRegions.push(footBand(prevBareLine, 'total', prevBareVal));
+      } else if (total == null && mokLineNoAmt == null) {
+        // Keyword present, amount unreadable — keep the line as the band anchor for the
+        // cash-lane fallback ("Mokėti IU,1": 1→I, 0→U glyphs, receipt-309).
+        mokLineNoAmt = l;
       }
     }
     // Book the cash-rounding delta (see roundingAdj above): first sub-5ct amount on an
@@ -3699,7 +3707,7 @@ function parseIkiThermal(lines: IkiLine[]): IkiParseResult {
   // payment table is too scrambled to read a "Mokėti"/"SUMA" total but the cash + change survived,
   // this still recovers it. Only when BOTH are cleanly present and cash ≥ change. (user-suggested.)
   if (total == null) {
-    const amtIn = (re: RegExp): number | null => {
+    const amtIn = (re: RegExp): { v: number; line: IkiLine } | null => {
       for (const l of lines) {
         if (!re.test(l.text)) continue;
         // First amount that is NOT a VAT rate: the sheared payment table can fuse
@@ -3709,14 +3717,23 @@ function parseIkiThermal(lines: IkiLine[]): IkiParseResult {
         for (const m of l.text.matchAll(/(\d{1,4}[.,]\s?\d{2})/g)) {
           const after = l.text.slice((m.index ?? 0) + m[0].length, (m.index ?? 0) + m[0].length + 3);
           if (after.includes('%')) continue;
-          return parseNum(m[1]);
+          return { v: parseNum(m[1]), line: l };
         }
       }
       return null;
     };
     const cash = amtIn(/Grynie/i);
     const change = amtIn(/Gr[aą][zž]a/i);
-    if (cash != null && change != null && cash >= change) total = round2(cash - change);
+    if (cash != null && change != null && cash.v >= change.v) {
+      total = round2(cash.v - change.v);
+      grynLine = cash.line;
+      // The cash lane derives the total from TWO lines, so no lane above banded it —
+      // the Kvitas photo then shows every band except 'total' (receipt-309 "10,10").
+      // Anchor the band on the semantic total line when we saw one (the Mokėti line
+      // whose amount was glyph-shredded), else on the Grynieji line the value came from.
+      const anchor = mokLineNoAmt ?? grynLine;
+      if (anchor) footerRegions.push(footBand(anchor, 'total', String(total)));
+    }
   }
   // Date + time bands: one combined 'dateTime' band when they share a line,
   // else a 'date' AND a 'time' band so BOTH are covered — IKI prints
