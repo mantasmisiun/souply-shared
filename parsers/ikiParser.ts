@@ -1349,8 +1349,10 @@ function ikiClassifyRow(ws: EWord[], lines: IkiLine[]): ERow {
   // unreadable, and the unit "kg" mis-read as "ka"). Without this the calc row gets
   // mistaken for a clean total and fused into the name ("LIETUVISKI POMIDORAI 0,720
   // ka X 3.ga EUR/kg"), losing the weight. The €/kg is then recovered at assembly
-  // from total ÷ qty. (receipt-111 POMIDORAI.)
-  const hasLeadingKgQty = /^\d{1,4}[.,]\s?\d{3}\b/.test(text);
+  // from total ÷ qty. (receipt-111 POMIDORAI.) The unit may be GLUED to the digits
+  // ("0,245kg" — Vision dropped both the space and the ×): `\b` never fires between
+  // a digit and a letter, so the glued unit is an explicit alternative. (receipt-315.)
+  const hasLeadingKgQty = /^\d{1,4}[.,]\s?\d{3}(?:\b|k[gqa9])/i.test(text);
   const hasPerKgMarker = /e[uü]?r\s*\/\s*k[ga]/i.test(text) || /e[uü]?r\s*\/\s*k[ga]/i.test(firstSrc)
     || /eur\s*k[ga]/i.test(text) || /eur\s*k[ga]/i.test(firstSrc);
   // WEIGHT row — straight from the words, OR RECOVERED when OCR shattered the
