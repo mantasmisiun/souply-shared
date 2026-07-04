@@ -15,7 +15,14 @@ Paid LLM/VLM fallbacks are explicitly OUT of scope (revisit only if paid solutio
   alias pairs → aligned edit ops → ranked report + diff vs the hand-coded maps →
   snapshot JSON. Human reviews before any map update (deliberate gate). Add to the
   nightly job list when corpus grows.
-- Phase 5 ⏳ device/build-bound (see below).
+- Phase 5 ✅ (2026-07-05) **result-level ensemble shipped**: Apple Vision became the iOS
+  PRIMARY engine (mlkitOcr auto-routes, since 06-26); on a parse that fails
+  SELF-VERIFICATION (unreconciled / phantom / priceless lines) the SAME image is re-read
+  by ML Kit and the receipt's arithmetic picks the better parse (receipt-process
+  `[ensemble]`; happy path pays nothing; the winning engine's lines are what get stored
+  as wordsDump). Android's counterpart = the flagged strip re-OCR (productReocr).
+  Remaining (deferred): token-level candidate merging into the row solver; PP-OCRv5
+  Android spike.
 
 ---
 
