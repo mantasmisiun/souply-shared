@@ -121,9 +121,12 @@ const CASHIER_LABEL = /kasin[\w ]{0,4}k\w*\s*(nr\.?|nr)?\s*[:.\-–]?\s*/;
 // "kor?el" (1 optional char between KOR and EL) tolerates the common OCR misread
 // KORTELĖS → KORIELĖS (T→I), which otherwise left the full card number unmasked.
 // `.?` (not `\w?`) in the T slot: OCR also reads the T as NON-word junk ("KOR(ELĖS NR",
-// receipt-268 — the full loyalty number sailed through unmasked). The trailing "nr"
-// anchor keeps the loosened stem specific.
-const LOYALTY_NUMBER_LABEL = /kor.?el\w*\s*nr/;
+// receipt-268 — the full loyalty number sailed through unmasked). The trailing anchor
+// keeps the loosened stem specific: "nr" OR the spelled-out "numer(is)" — IKI's GIFT
+// card prints "KORTELĖS NUMERIS 0000123971" (receipt-398/401; OCR can even reverse the
+// order, "0000123971 KORTELES NUMERIS"), which the nr-only anchor let sail through into
+// the stored image AND the wordsDump line text.
+const LOYALTY_NUMBER_LABEL = /kor.?el\w*\s*n(?:r|umer)/;
 // A long bare digit run (the full loyalty number; spaces allowed between groups, plus the
 // ^/- junk OCR inserts mid-number — "9440006300214^32954" must mask END TO END).
 const LONG_DIGIT_RUN = /\d[\d ^\-]{8,}\d/;
