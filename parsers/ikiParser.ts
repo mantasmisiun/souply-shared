@@ -2041,7 +2041,7 @@ function tileByContent(items: Array<{ dt: number; db: number; region: Region }>,
   }
 }
 
-export function parseIkiColumnar(lines: IkiLine[], start: number, end: number, skipped?: Region[], headerAddr?: string, combo?: { amount: number }, recon?: { adjust: number }): IkiProduct[] {
+export function parseIkiColumnar(lines: IkiLine[], start: number, end: number, skipped?: Region[], headerAddr?: string, combo?: { amount: number }, recon?: { adjust: number; orphanDiscs?: Array<{ amount: number; beforeIdx: number }> }): IkiProduct[] {
   const words = ikiCollectWords(lines, start, end);
   if (words.length < 2) return [];
   const lineH = emedian(words.map((w) => w.yBottom - w.yTop).filter((h) => h > 0)) || 24;
@@ -2154,7 +2154,22 @@ export function parseIkiColumnar(lines: IkiLine[], start: number, end: number, s
         }
       }
     }
-    if (c.total == null && !c.totUnknown && !ikiStrongName(name)) return; // guarded recovery (an unknown-total row still anchors)
+    if (c.total == null && !c.totUnknown && !ikiStrongName(name)) {
+      // ORPHAN STACKED DISCOUNT (receipt-398): IKI can print TWO consecutive standalone
+      // "-X,XX A NUOLAIDA SU KORTELE" rows. The first attaches to the open product; the
+      // second trips the two-A-price flush and lands on a FRESH nameless cur that dies
+      // right here — a REAL printed discount silently vanishes and the books stop
+      // balancing. Hand the amount to reconciliation (parseIkiThermal) instead: it
+      // attaches it to the nearest earlier product that can absorb it, and ONLY when
+      // that makes the printed total balance to the cent — a mis-captured amount that
+      // doesn't balance is simply never applied.
+      if (recon?.orphanDiscs && c.discount > 0 && c.weighRows === 0 && c.kgRows === 0 &&
+          c.perKg == null && c.unitQty == null) {
+        recon.orphanDiscs.push({ amount: c.discount, beforeIdx: out.length });
+        if (process.env.IKI_DEBUG) console.log(`[ORPHAN-DISC] captured stacked discount ${c.discount} (beforeIdx ${out.length})`);
+      }
+      return; // guarded recovery (an unknown-total row still anchors)
+    }
     const lt = c.total ?? 0;
     // RECOVER a garbled €/kg: the printed €/kg was unreadable ("3,9a EUR" → null) but we
     // have the line total and the printed kg quantity, so €/kg = total ÷ qty
@@ -3669,7 +3684,7 @@ function parseIkiThermal(lines: IkiLine[]): IkiParseResult {
   const combo = { amount: 0, regions: [] as Region[] };
   // Receipt-reconciliation side-channel: charges/negatives the engine drops from products
   // (deposits, bag charges, IKI Taškais ±, coupons) but the PRINTED TOTAL includes.
-  const recon = { adjust: 0 };
+  const recon = { adjust: 0, orphanDiscs: [] as Array<{ amount: number; beforeIdx: number }> };
   const engineProducts = USE_COLUMN_ENGINE && ikiHasWords(lines, pStart, pEnd)
     ? parseIkiColumnar(lines, pStart, pEnd, skippedRegions, storeAddress, combo, recon)
     : null;
@@ -3803,6 +3818,11 @@ function parseIkiThermal(lines: IkiLine[]): IkiParseResult {
   let timeLine: IkiLine | undefined;
   let timeMatch: RegExpMatchArray | undefined;
   let sumaPending = false; // previous line had a bare "SUMA" keyword w/o an amount
+  // ALTERNATE printed totals (receipt-398): when part of the bill is paid by gift card,
+  // the card slip's "SUMA 11,77 EUR" is only the BANK-paid portion while "Mokėti EUR
+  // 12,36" is the true total. First-match keeps winning; extra readings that DISAGREE
+  // are remembered so reconciliation can switch to the one the products actually sum to.
+  const altTotals: number[] = [];
   // Total-keyword lines whose AMOUNT was glyph-shredded ("Mokėti IU,1", receipt-309) —
   // remembered so the cash-lane fallback can still anchor the 'total' BAND semantically.
   let mokLineNoAmt: IkiLine | undefined;
@@ -3849,17 +3869,23 @@ function parseIkiThermal(lines: IkiLine[]): IkiParseResult {
       // OCR sometimes drops the decimal comma on the Mokėti amount, leaving a space
       // ("Mokėti 7 10" = 7,10). Only accept this right AFTER the Mokėti keyword (so a
       // stray "7 10" elsewhere can't be misread) and only when there's no comma form.
-      const sp = mAmt ? null : t.match(/Mok[eė]t\s?i\D{0,3}(\d{1,4})\s+(\d{2})(?!\d)/i);
+      // (?:\s*EUR)? — the currency can sit BETWEEN keyword and amount ("Moketi EUR 12 . 36",
+      // receipt-398); \s?[.,]?\s+ tolerates the decimal separator drifting free with spaces.
+      const sp = mAmt ? null : t.match(/Mok[eė]t\s?i(?:\s*EUR)?\D{0,3}(\d{1,4})\s?[.,]?\s+(\d{2})(?!\d)/i);
       // …and OCR can also REVERSE the reading order, printing the amount BEFORE the keyword
       // ("7 10 Mokėt i" = 7,10 Mokėti). Same space-as-decimal tolerance, keyword-anchored.
       const spB = (mAmt || sp) ? null : t.match(/(\d{1,4})[.,\s]\s?(\d{2})(?!\d)\s+Mok[eė]t\s?i/i);
       if (mAmt) {
-        if (total == null) total = parseNum(mAmt);
+        const v = parseNum(mAmt);
+        if (total == null) total = v;
+        else if (Math.abs(v - total) > 0.011 && !altTotals.includes(v)) altTotals.push(v);
         footerRegions.push(footBand(l, 'total', mAmt));
       } else if (sp || spB) {
         const g = (sp || spB)!;
         const v = `${g[1]},${g[2]}`;
-        if (total == null) total = parseFloat(`${g[1]}.${g[2]}`);
+        const n = parseFloat(`${g[1]}.${g[2]}`);
+        if (total == null) total = n;
+        else if (Math.abs(n - total) > 0.011 && !altTotals.includes(n)) altTotals.push(n);
         footerRegions.push(footBand(l, 'total', v));
       } else if (total == null && prevBareVal && prevBareLine) {
         // CASH receipt: "Mokėti" prints as a COLUMN HEADER ("PVM suma Moketi Be PVM") with the
@@ -4147,8 +4173,54 @@ function parseIkiThermal(lines: IkiLine[]): IkiParseResult {
     reconDelta = round2(total - knownSum);
     if (unknowns.length === 0) {
       reconciled = Math.abs(reconDelta) <= 0.011;
+      // ── GIFT-CARD TOTAL + ORPHAN STACKED DISCOUNT RESCUE (receipt-398) ──
+      // Two flagged states this repairs, both arithmetic-gated so a wrong guess can
+      // never commit:
+      //  • the chosen total was the card slip's BANK-paid portion (gift card covered
+      //    the rest) while an alternate reading ("Mokėti EUR …") is the true total —
+      //    switch ONLY to an alternate the products sum to exactly;
+      //  • a stacked second "-X,XX NUOLAIDA" row was dropped by the assembler
+      //    (recon.orphanDiscs) — attach each orphan to the nearest earlier plain unit
+      //    product that can absorb it, ONLY when the books then balance to the cent.
+      if (!reconciled) {
+        const orphans = recon.orphanDiscs ?? [];
+        const orphanSum = round2(orphans.reduce((sm, o) => sm + o.amount, 0));
+        const attachOrphans = (): boolean => {
+          // dry-run host selection; commit only when EVERY orphan finds a host
+          const picks: Array<{ host: any; amount: number }> = [];
+          const taken = new Set<any>();
+          for (const o of orphans) {
+            let found: any = null;
+            for (let i = Math.min(o.beforeIdx, anyP.length) - 1; i >= 0; i--) {
+              const pp = anyP[i];
+              if (taken.has(pp) || pp.promoPrice != null || pp.unit === 'kg') continue;
+              if (!(pp.price != null && pp.price > 0) || (pp.quantity ?? 1) !== 1) continue;
+              if (round2(pp.price - o.amount) < 0) continue;             // can't go negative
+              found = pp; break;
+            }
+            if (!found) return false;
+            taken.add(found); picks.push({ host: found, amount: o.amount });
+          }
+          for (const pk of picks) {
+            pk.host.promoPrice = round2(pk.host.price - pk.amount);
+            if (process.env.IKI_DEBUG) console.log(`[RECON] orphan discount ${pk.amount} attached to "${pk.host.name}" (promo ${pk.host.promoPrice})`);
+          }
+          return true;
+        };
+        for (const cand of [total, ...altTotals]) {
+          if (cand == null || !(cand > 0)) continue;
+          if (cand !== total && Math.abs(round2(cand - knownSum)) <= 0.011) {
+            if (process.env.IKI_DEBUG) console.log(`[RECON] total ${total} → ${cand} (alternate reading balances)`);
+            total = cand; reconciled = true; reconDelta = 0; applyTent(); break;
+          }
+          if (orphanSum > 0 && Math.abs(round2(cand - round2(knownSum - orphanSum))) <= 0.011 && attachOrphans()) {
+            if (cand !== total && process.env.IKI_DEBUG) console.log(`[RECON] total ${total} → ${cand} (alternate reading + orphan discounts balance)`);
+            total = cand; reconciled = true; reconDelta = 0; applyTent(); break;
+          }
+        }
+      }
       // equation 1 corroborates the savings-pinned discount → commit; else discard it.
-      if (tentHost) { if (reconciled) applyTent(); else if (process.env.IKI_DEBUG) console.log('[RECON] savings pin discarded (total does not corroborate)'); }
+      else if (tentHost) { applyTent(); }
     } else if (unknowns.length === 1 && unknowns[0]._unk) {
       const u = unknowns[0];
       const solvedTot = round2(reconDelta + (u._unk.discount ?? 0));
