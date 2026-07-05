@@ -249,6 +249,32 @@ export const RECOGNITION = {
     categoryScopeBoost: 0.07,
   },
 
+  /** Cross-chain rescue: unmatched line + cross-chain candidate → swipe card →
+   *  user-confirmed PROVISIONAL mint in the receipt's chain, promoted to the global
+   *  catalog on corroboration. @ref crossChainMintService.ts, receiptResolveQueueService.ts */
+  crossChainMint: {
+    /** Card price gate: the line's paid price vs the candidate chain's latest price
+     *  must sit within ±40% (ratio band) for the card to be shown at all. */
+    cardPriceBandLow: 0.6,
+    cardPriceBandHigh: 1.4,
+    /** Same-product proof between two users' confirms: their OCR receipt prints
+     *  (normalized) must reach this confusion-weighted similarity. Receipt prints
+     *  are deterministic per product, so print-vs-print supports a HIGH bar. */
+    clusterSim: 0.85,
+    /** Distinct users (mutually-similar alias cluster) needed to promote. */
+    promoteDistinctUsers: 2,
+    /** Paid prices across the cluster corroborate when max/min ≤ this ratio.
+     *  When they DISAGREE, promotion demands a third distinct user instead. */
+    priceAgreeRatio: 1.3,
+    promoteUsersOnPriceDisagree: 3,
+    /** Mint-time same-chain TWIN dedupe: before minting, the source's catalog name is
+     *  compared against the receipt chain's existing SP names with each side's own
+     *  brandName tokens stripped (catalog-vs-catalog, so the bar is tight). At or above
+     *  this similarity the existing SP is REUSED and the pair (twin ↔ source) enters the
+     *  standard pair-vote ledger instead of minting a duplicate. */
+    sameChainTwinSim: 0.9,
+  },
+
   // ── Resolver (souply-api/src/services/receiptLineResolver.ts, productModel.ts) ──
   resolve: {
     /** Cross-chain bootstrap price floor (−40%, loose: cheaper chains). @ref receiptLineResolver.ts:26 */
@@ -358,6 +384,10 @@ export const RECOGNITION = {
       bootstrappedUnverified: 0.6,  // resolver bootstrapped an SP without a price confirm
       amountUnitPenalty: 0.45,      // size/family penalty fired in Round-1
       skippedUnpriced: 0.25,        // price ≤ 0 garbled line (no SP created)
+      unmatchedLine: 0.55,          // resolver linked NOTHING (NO-MINT / cross-chain-only match):
+                                    //   however the name lane scored, no match exists — without
+                                    //   this cap a 0.97 cross-chain-only line reads as band S1
+                                    //   and surfaceBands then hides it from every rescue card
       clearanceSkip: 0.5,           // price anomaly skipped the write — identity uncertain
       userRejected: 0.35,           // user swiped 'different' on this line's match — a single
                                     //   personal vote is authoritative (1-vote split), so the
