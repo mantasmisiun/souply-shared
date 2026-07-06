@@ -91,6 +91,14 @@ export interface MaximaFooter {
   time: string;
   receiptNo: string;
   totalSavings: number | null;
+  /** "Pritaikytos nuolaidos −3,90" (or "Su AČIŪ kortele sutaupėte −1,82") —
+   *  the PRINTED sum of per-product discounts. Feeds the label-only discount
+   *  pin (a lost discount = appliedDiscounts − Σ known discounts). */
+  appliedDiscounts: number | null;
+  /** "Atsiskaityta MAXIMOS pinigais −0,16" — loyalty money used as TENDER.
+   *  Kvito suma is printed AFTER it, so receipt-level solves must add it
+   *  back when balancing products against the total. */
+  maximaMoney: number | null;
   rawText: string;
   region: Region;
   lineRegions: LabeledRegion[];
@@ -566,6 +574,8 @@ export function parseFooter(lines: MaximaLine[]): MaximaFooter {
   let time = "";
   let receiptNo = "";
   let totalSavings: number | null = null;
+  let appliedDiscounts: number | null = null;
+  let maximaMoney: number | null = null;
 
   // Per-line region tracker — same intent as parseHeader. Tagged
   // with `kind` for per-field colour + label.
@@ -708,6 +718,51 @@ export function parseFooter(lines: MaximaLine[]): MaximaFooter {
       }
     }
 
+    // Pritaikytos nuolaidos -3,90 — amount on the same (possibly row-merged)
+    // line or its same-y neighbour.
+    if (/pritaikytos\s+nuolaid/i.test(text)) {
+      const m = text.match(/-?\s?(\d+[.,]\s?\d{2})/);
+      if (m) appliedDiscounts = parseNum(m[1]);
+      else {
+        const near = lines.find(
+          (l) => l !== lines[i] && Math.abs(l.yTop - lines[i].yTop) < 20 && /-?\s?\d+[.,]\s?\d{2}/.test(l.text),
+        );
+        const nm = near?.text.match(/-?\s?(\d+[.,]\s?\d{2})/);
+        if (nm) appliedDiscounts = parseNum(nm[1]);
+      }
+    }
+
+    // Su AČIŪ kortele sutaupėte -1,82 — same semantic as Pritaikytos
+    // nuolaidos on receipts that print this variant instead. Weaker source:
+    // never overrides an explicit Pritaikytos value.
+    // Sign-OPTIONAL amounts for the two branches below: splitMergedLines can
+    // strand the minus on the label half ("…pinigais -" + "0,16 A"), and the
+    // sign is semantically fixed by the label anyway.
+    if (appliedDiscounts === null && /a[čc]i[uų]\s+kortele\s+sutaup/i.test(text)) {
+      const m = (text + ' ' + (lines[i + 1]?.text ?? '')).match(/-?\s?(\d+[.,]\s?\d{2})/);
+      if (m) appliedDiscounts = parseNum(m[1]);
+      else {
+        const near = lines.find(
+          (l) => l !== lines[i] && Math.abs(l.yTop - lines[i].yTop) < 20 && /\d+[.,]\s?\d{2}/.test(l.text),
+        );
+        const nm = near?.text.match(/-?\s?(\d+[.,]\s?\d{2})/);
+        if (nm) appliedDiscounts = parseNum(nm[1]);
+      }
+    }
+
+    // Atsiskaityta MAXIMOS pinigais -0,16 — loyalty-money tender.
+    if (/maximos\s+pinigais/i.test(text)) {
+      const m = text.match(/-?\s?(\d+[.,]\s?\d{2})/);
+      if (m) maximaMoney = parseNum(m[1]);
+      else {
+        const near = lines.find(
+          (l) => l !== lines[i] && Math.abs(l.yTop - lines[i].yTop) < 20 && /\d+[.,]\s?\d{2}/.test(l.text),
+        );
+        const nm = near?.text.match(/-?\s?(\d+[.,]\s?\d{2})/);
+        if (nm) maximaMoney = parseNum(nm[1]);
+      }
+    }
+
     // Sutaupėte 13,40
     if (/sutaup[eėè]te/i.test(text)) {
       const s = text.match(/(\d+[.,]\s?\d{2})/);
@@ -750,6 +805,8 @@ export function parseFooter(lines: MaximaLine[]): MaximaFooter {
     time,
     receiptNo,
     totalSavings,
+    appliedDiscounts,
+    maximaMoney,
     rawText: lines.map((l) => l.text).join("\n"),
     region: regionOf(lines),
     lineRegions,
@@ -758,9 +815,25 @@ export function parseFooter(lines: MaximaLine[]): MaximaFooter {
 
 export function cleanProductName(name: string): string {
   let cleaned = name;
+  // Trailing OCR junk first (column separators read as "|", stray dashes /
+  // bullets) — a 300-dpi PDF render appends " |" after the size, which used to
+  // defeat the size strip below and leave "70 g |" inside the name.
+  cleaned = cleaned.replace(/[\s|\\/•·–—-]+$/g, "").trim();
   cleaned = cleaned.replace(/,?\s*\d+[\.,]?\d*\s*(g|kg|ml|l|vnt\.?)\s*$/i, "").trim();
   cleaned = cleaned.replace(/,\s*$/, "").trim();
   return cleaned;
+}
+
+/** Pack size from a product name's tail ("…, 70 g" → 70/g). The SAME pattern
+ *  cleanProductName strips — captured instead of discarded, so matching can
+ *  disambiguate size variants and the UI can label the pack. */
+export function extractPackSize(rawName: string): { amount: number; unit: string } | null {
+  const t = rawName.replace(/[\s|\\/•·–—-]+$/g, "").trim();
+  const m = t.match(/(\d+[\.,]?\d*)\s*(g|kg|ml|l)\.?\s*$/i);
+  if (!m) return null;
+  const amount = parseFloat(m[1].replace(",", "."));
+  if (!Number.isFinite(amount) || amount <= 0) return null;
+  return { amount, unit: m[2].toLowerCase() };
 }
 
 // ───────── band model (internal) ─────────
@@ -1098,6 +1171,15 @@ export interface BandInternal {
    * these so they don't appear in the parsed products list.
    */
   phantom?: boolean;
+  /** Phantom-only: the carved lines (name + broken/orphan rows) — feed the
+   *  receipt-level broken-price solve in parseMaximaReceipt. */
+  phantomLines?: MaximaLine[];
+  /** Phantom-only: the CENTS of a broken price tail (".,09 A" → 9) — the
+   *  corroboration key for the solve. null when the carve wasn't price-shaped. */
+  brokenTailCents?: number | null;
+  /** Phantom-only: the carve ended in a clean "−D A" row — the discount is
+   *  KNOWN, only the price row was lost ([name, label, −D] shape). */
+  knownDiscount?: number | null;
   /** Name fragments appearing before the anchor, in slice order. */
   preName: BandLineEntry[];
   /**
@@ -1147,7 +1229,11 @@ export interface MaximaParseOptions {
 // `1,79 A` on Maxima 2026-01-12). The combination of a name+broken-
 // price on a single line is a strong signal that the line represents
 // one complete product whose price can't be reconstructed.
-const BROKEN_PRICE_TAIL_COMMA_RE = /(?:^|\s),\d{2}\s*[AB]\s*$/;
+// `[.,]{1,2}` (not just `,`): the dropped integer can leave a stray DOT where
+// the digit was — "S. m .,09 A" instead of "s. m. 2,09 A" (kvitas_2025-11-08
+// čederis at 300 dpi). A valid `N,NN A` never matches: it has a digit before
+// the comma, and this pattern requires whitespace/line-start there.
+const BROKEN_PRICE_TAIL_COMMA_RE = /(?:^|\s)[.,]{1,2}\d{2}\s*[AB]\s*$/;
 // A `\s\d{1,2}\s+[AB]\s*$` tail with no comma at all — even worse
 // than the above. Seen as `78 A` instead of `3,78 A` on Maxima
 // 2026-01-17 (where MLKit dropped both the integer and the comma).
@@ -1155,6 +1241,25 @@ const BROKEN_PRICE_TAIL_COMMA_RE = /(?:^|\s),\d{2}\s*[AB]\s*$/;
 // stand alone (not after another digit, comma, or dot) so legitimate
 // `<X>,YY A` prices don't false-trigger.
 const BROKEN_PRICE_TAIL_NO_COMMA_RE = /(?<![\d,.])\d{1,2}\s+[AB]\s*$/;
+/** The carved block's LAST line is a clean negative amount ("-0,34 A") — the
+ *  orphan-discount carve shape [name…, label, −D]: the product's PRICE row was
+ *  the only loss, its discount is KNOWN. Enables the price solve below. */
+const phantomKnownDiscount = (text: string): number | null => {
+  const m = text.trim().match(NEG_AMOUNT_RE);
+  return m ? parseNum(m[1]) : null;
+};
+
+/** Cents of a broken price tail (".,09 A" → 9, "78 A" → 78); null when the
+ *  line isn't price-shaped. Keys the receipt-level solve's corroboration. */
+const brokenTailCents = (text: string): number | null => {
+  const t = text.trim();
+  let m = t.match(/[.,]{1,2}(\d{2})\s*[AB]\s*$/);
+  if (m) return parseInt(m[1], 10);
+  m = t.match(/(?<![\d,.])(\d{1,2})\s+[AB]\s*$/);
+  if (m) return parseInt(m[1], 10);
+  return null;
+};
+
 const isBrokenPriceTail = (text: string): boolean => {
   if (BROKEN_PRICE_TAIL_COMMA_RE.test(text)) return true;
   // Belt-and-braces: don't fire if the line is already a valid
@@ -1221,11 +1326,74 @@ function findOrphanDiscountTrimPoint(
         const endIdx = nextPaired ? i + 1 : i;
         return endIdx + 1;
       }
+      // (3) LONE label, name-matched (kvitas_2025-11-05): MLKit dropped BOTH
+      // the price row AND the neg-amount of a product, leaving just
+      // [name, Sutaupėte:label]. The pair rule above can't fire — but a
+      // Sutaupėte label NAMES its product, so when the label body textually
+      // matches the name lines right before it AND another name line follows
+      // before the anchor, the leading group is a complete product whose
+      // value lines were lost. Carve it off as a phantom; without this the
+      // lost product's name fuses into the NEXT band's product (and poisons
+      // its match).
+      if (hasNameBefore && isDl && !isNeg) {
+        // Strip the label keyword AND its leftover tail ("Sutaupėt|e:" — the
+        // regex stem ends before the final e, which otherwise prefixes the
+        // body as "e:<body>" and kills the prefix match at char 0).
+        const labelBody = normForLabelMatch(
+          text
+            .slice(text.search(DISCOUNT_LABEL_RE))
+            .replace(DISCOUNT_LABEL_RE, '')
+            .replace(/^\p{L}{0,3}\s*[:\-.]?\s*/u, ''),
+        );
+        const namesBefore = normForLabelMatch(
+          productSlice
+            .slice(sliceStart, i)
+            .map((l) => l.text)
+            .filter((t) => /\p{L}/u.test(t))
+            .join(' '),
+        );
+        // A REAL name line must follow — not a price/amount row (whose VAT
+        // "A" is technically a letter) and not separator junk. Require some
+        // letter mass once amounts are stripped.
+        const followedByName = productSlice
+          .slice(i + 1, anchorIdx)
+          .some((l) => {
+            const t = l.text.trim();
+            if (NEG_AMOUNT_RE.test(t) || /^\d+[.,]\s?\d{2}\s*[AB]?$/.test(t)) return false;
+            return (t.replace(/[^\p{L}]/gu, '').length) >= 4;
+          });
+        // The shared prefix must cover MOST (80%) of the label, not just a
+        // fixed floor — sibling flavours ("Duonos traškučiai MARETTI, …")
+        // share 20+ brand chars, and a previous band's leaked label must
+        // never steal the next product's name on brand-prefix alone.
+        const need = Math.max(12, Math.ceil(0.8 * Math.min(labelBody.length, namesBefore.length)));
+        if (followedByName && labelBody.length >= 12 && commonPrefixLen(labelBody, namesBefore) >= need) {
+          return i + 1;
+        }
+      }
     } else if (/\p{L}/u.test(text)) {
       hasNameBefore = true;
     }
   }
   return null;
+}
+
+// Normalisation for the lone-label name match: lowercase, diacritics
+// stripped (OCR ų→y etc. collapse), non-alphanumerics dropped — so the
+// truncated label tail and the (possibly multi-line) name compare cleanly.
+function normForLabelMatch(s: string): string {
+  return s
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]/g, '');
+}
+
+function commonPrefixLen(a: string, b: string): number {
+  const n = Math.min(a.length, b.length);
+  let i = 0;
+  while (i < n && a[i] === b[i]) i++;
+  return i;
 }
 
 /**
@@ -1302,6 +1470,12 @@ function computeBandsContext(
         internals.push({
           bandIdx: bands.length - 1,
           phantom: true,
+          phantomLines,
+          knownDiscount: phantomKnownDiscount(phantomLines[phantomLines.length - 1].text),
+          brokenTailCents:
+            phantomKnownDiscount(phantomLines[phantomLines.length - 1].text) != null
+              ? null
+              : brokenTailCents(phantomLines[phantomLines.length - 1].text),
           anchor: {
             line: productSlice[sentinelIdx],
             sliceIdx: sentinelIdx,
@@ -1379,6 +1553,12 @@ function computeBandsContext(
       internals.push({
         bandIdx: bands.length - 1,
         phantom: true,
+        phantomLines,
+        knownDiscount: phantomKnownDiscount(phantomLines[phantomLines.length - 1].text),
+        brokenTailCents:
+          phantomKnownDiscount(phantomLines[phantomLines.length - 1].text) != null
+            ? null
+            : brokenTailCents(phantomLines[phantomLines.length - 1].text),
         anchor: {
           line: productSlice[sentinelIdx],
           sliceIdx: sentinelIdx,
@@ -1418,7 +1598,7 @@ export function findProductBands(
   lines: MaximaLine[],
   options: MaximaParseOptions = {},
 ): ReceiptBandPlan {
-  const ctx = computeBandsContext(lines, options);
+  const ctx = computeBandsContext(lines.map(foldMaximaHomoglyphs), options);
   return { bands: ctx.bands, internals: ctx.internals };
 }
 
@@ -1441,8 +1621,11 @@ const fmtY = (line: MaximaLine): string =>
  * trace shows is byte-for-byte the same one step 2 sees in
  * `internals`.
  */
-export function traceProductBands(rawLines: MaximaLine[]): string {
-  const ctx = computeBandsContext(rawLines);
+export function traceProductBands(rawLines: MaximaLine[], options: MaximaParseOptions = {}): string {
+  // Accepts the SAME options as findProductBands — the batch runs iosOcr on
+  // device, and a trace computed with defaults showed different bands than the
+  // real plan (e.g. no phantom carving), which mis-led debugging.
+  const ctx = computeBandsContext(rawLines.map(foldMaximaHomoglyphs), options);
   const { processed, headerEnd, footerStart, productSlice, internals } = ctx;
 
   const out: string[] = [];
@@ -1629,6 +1812,7 @@ export function extractMaximaProduct(internal: BandInternal): ExtractResult {
   }
 
   const name = cleanProductName(rawName);
+  const packSize = extractPackSize(rawName);
 
   // Unit-qty extraction. Strict (with unit) first, then no-unit
   // fallback. If the band had a `unit-qty` event but neither regex
@@ -1724,6 +1908,33 @@ export function extractMaximaProduct(internal: BandInternal): ExtractResult {
     price = 0;
     pricePerUnit = null;
     if (!(quantity > 0)) quantity = 1;
+  }
+
+  // DEPOSIT-COUNT FALLBACK (kvitas_2026-03-23 AKVILĖ ×6): a multi-pack whose
+  // own "P × N vnt." row OCR dropped still reveals its count on the DEPOSIT
+  // row ("0,10 X 6 vnt." — one deposit per bottle). When no unit-qty parsed
+  // (quantity still 1) and the deposit count divides the line total to exact
+  // cents, adopt it: quantity = N, €/unit = price ÷ N. When a unit-qty DID
+  // parse, the deposit count is used as VERIFICATION only (warn on mismatch).
+  {
+    const depositQtyEntry = internal.postAnchor.find((e) => e.reason === 'deposit-qty');
+    const dm = depositQtyEntry?.line.text.match(/\d+[.,]\d{2}\s*[XxХ]\s*(\d{1,2})\s*vnt/i);
+    const depositCount = dm ? parseInt(dm[1], 10) : null;
+    if (depositCount != null && depositCount >= 2) {
+      if (!unitQtyEntry && quantity === 1 && unit === 'vnt') {
+        const perUnit = Math.round((price / depositCount) * 100) / 100;
+        if (Math.abs(perUnit * depositCount - price) < 0.005 && perUnit > 0) {
+          quantity = depositCount;
+          pricePerUnit = perUnit;
+          warnings.push(
+            `quantity ${depositCount} adopted from DEPOSIT row (own unit-qty row lost; ` +
+              `€/unit ${perUnit.toFixed(2)} = ${price.toFixed(2)} ÷ ${depositCount})`,
+          );
+        }
+      } else if (unitQtyEntry && quantity >= 1 && unit === 'vnt' && quantity !== depositCount) {
+        warnings.push(`deposit count ${depositCount} ≠ parsed quantity ${quantity} — check the band`);
+      }
+    }
   }
 
   // promoPrice from the first discount/neg event we see. The
@@ -1826,6 +2037,8 @@ export function extractMaximaProduct(internal: BandInternal): ExtractResult {
     // Sold by weight ⇔ the row priced per kg (incl. the zeroed
     // poisoning-guard case, which stays `unit: 'kg'` so it shows).
     isWeighable: unit === 'kg',
+    parsedAmount: packSize?.amount ?? null,
+    parsedUnit: packSize?.unit ?? null,
     rawLines,
     region,
   };
@@ -1905,17 +2118,55 @@ export function traceMaximaExtract(rawLines: MaximaLine[]): string {
  * trace and reconcile self-check; the normalization happens once
  * at this boundary.
  */
+// MLKit reads Lithuanian receipt glyphs as CYRILLIC homoglyphs ("6,49 Х 2,096 kg"
+// with U+0425 Х, kvitas_2026-02-09/-02-21/-03-29 at 300 dpi) — every classifier
+// regex compares LATIN, so an un-folded homoglyph silently breaks the unit-qty
+// row and cascades (calc + discount rows fall out of the band). Same fold the
+// IKI parser applies at entry; only visually-identical pairs, no guessing.
+const MAXIMA_CYRILLIC_HOMOGLYPHS: Record<string, string> = {
+  'А': 'A', 'В': 'B', 'С': 'C', 'Е': 'E', 'Н': 'H', 'І': 'I', 'Ј': 'J', 'К': 'K',
+  'М': 'M', 'О': 'O', 'Р': 'P', 'Т': 'T', 'Х': 'X', 'Ѕ': 'S',
+  'а': 'a', 'с': 'c', 'е': 'e', 'і': 'i', 'ј': 'j', 'о': 'o', 'р': 'p', 'х': 'x', 'ѕ': 's', 'у': 'y',
+};
+const MAXIMA_CYRILLIC_RE = /[Ѐ-ӿ]/;
+const foldMaximaHomoglyphs = (l: MaximaLine): MaximaLine =>
+  MAXIMA_CYRILLIC_RE.test(l.text)
+    ? { ...l, text: l.text.replace(/[Ѐ-ӿ]/g, (c) => MAXIMA_CYRILLIC_HOMOGLYPHS[c] ?? c) }
+    : l;
+
 export function parseMaximaReceipt(
   lines: MaximaLine[],
   options: MaximaParseOptions = {},
 ): MaximaParseResult {
-  const ctx = computeBandsContext(lines, options);
+  const ctx = computeBandsContext(lines.map(foldMaximaHomoglyphs), options);
   const header = parseHeader(ctx.processed.slice(0, ctx.headerEnd));
   const footer = parseFooter(ctx.processed.slice(ctx.footerStart));
   const products: MaximaProduct[] = [];
+  // Bands whose Sutaupėte LABEL survived OCR but whose amount row did not —
+  // the label proves a discount exists; the printed total can pin its value.
+  const labelOnlyDiscounts: MaximaProduct[] = [];
+  // NON-PRODUCT money on the receipt (PET deposits, plastic bags): the
+  // printed total includes them, `products` doesn't — the broken-price
+  // solve below must be able to account for them (IKI's recon.adjust).
+  const adjustCandidates: number[] = [];
   for (const internal of ctx.internals) {
-    const { product } = extractMaximaProduct(internal);
-    if (!product) continue;
+    if (!internal.phantom) {
+      for (const e of internal.postAnchor) {
+        if (e.reason === 'deposit-name') {
+          const m = e.line.text.match(/(\d+[.,]\d{2})/);
+          if (m) adjustCandidates.push(Math.round(parseFloat(m[1].replace(',', '.')) * 100) / 100);
+        }
+      }
+    }
+    const { product, warnings } = extractMaximaProduct(internal);
+    if (!product) {
+      // Non-catalog rows (plastic bag) still carry money the total includes.
+      if (warnings.some((w) => w.startsWith('skip:non-catalog'))) {
+        const m = internal.anchor.line.text.match(/(\d+[.,]\d{2})/);
+        if (m) adjustCandidates.push(Math.round(parseFloat(m[1].replace(',', '.')) * 100) / 100);
+      }
+      continue;
+    }
     if (product.pricePerUnit !== null && product.quantity > 0) {
       product.price = product.pricePerUnit;
       if (product.promoPrice !== null) {
@@ -1923,7 +2174,213 @@ export function parseMaximaReceipt(
           Math.round((product.promoPrice / product.quantity) * 100) / 100;
       }
     }
+    if (product.promoPrice === null) {
+      const hasLabel = internal.postAnchor.some((e) => e.reason === 'discount-label');
+      const hadAmount = internal.postAnchor.some(
+        (e) => e.reason === 'discount-amount' || e.reason === 'bare-negative' || e.reason === 'inline-discount',
+      );
+      if (hasLabel && !hadAmount) labelOnlyDiscounts.push(product);
+    }
     products.push(product);
+  }
+
+  // DISCOUNT PIN (adapted from ikiParser's savings equation): a Sutaupėte/
+  // AČIŪ label whose amount row OCR dropped can be recovered from the
+  // receipt's own numbers. Two equations, strongest first:
+  //   1. footer "Pritaikytos nuolaidos" (the printed Σ of all product
+  //      discounts): missing = printed − Σ known. Handles MULTIPLE label-only
+  //      bands — split equally ONLY when the hosts share the same gross price
+  //      and the split lands on exact cents (kvitas_2026-01-22_2: two CHEETOS
+  //      at 2,59 lost their −1,30 rows; 3,90 − 1,30 = 2,60 → 1,30 each).
+  //   2. Σpaid − printed total (single host only — the original pin).
+  // Committed only when every host keeps paid ≥ 0.
+  const printedTotal = footer.total;
+  const round2 = (v: number) => Math.round(v * 100) / 100;
+  const paidSumOf = () =>
+    round2(
+      products.reduce((sum, p) => {
+        const q = p.quantity && p.quantity > 0 ? p.quantity : 1;
+        const unitPaid = (p.promoPrice != null ? p.promoPrice : p.price) ?? 0;
+        return sum + (unitPaid > 0 ? unitPaid * q : 0);
+      }, 0),
+    );
+  const grossOf = (p: MaximaProduct) => {
+    const q = p.quantity && p.quantity > 0 ? p.quantity : 1;
+    return round2(p.price * q);
+  };
+  const pinHost = (host: MaximaProduct, discount: number) => {
+    const q = host.quantity && host.quantity > 0 ? host.quantity : 1;
+    const gross = grossOf(host);
+    if (discount > 0.009 && discount <= gross + 0.005) {
+      host.promoPrice = round2((gross - discount) / q);
+      return true;
+    }
+    return false;
+  };
+  if (labelOnlyDiscounts.length > 0) {
+    let pinned = false;
+    if (footer.appliedDiscounts !== null && footer.appliedDiscounts > 0) {
+      const knownDiscounts = round2(
+        products.reduce((sum, p) => {
+          if (p.promoPrice == null) return sum;
+          const q = p.quantity && p.quantity > 0 ? p.quantity : 1;
+          return sum + Math.max(0, (p.price - p.promoPrice) * q);
+        }, 0),
+      );
+      const remaining = round2(footer.appliedDiscounts - knownDiscounts);
+      if (remaining > 0.009) {
+        if (labelOnlyDiscounts.length === 1) {
+          pinned = pinHost(labelOnlyDiscounts[0], remaining);
+        } else {
+          const grosses = labelOnlyDiscounts.map(grossOf);
+          const allSame = grosses.every((g) => Math.abs(g - grosses[0]) < 0.005);
+          const per = round2(remaining / labelOnlyDiscounts.length);
+          const exact = Math.abs(per * labelOnlyDiscounts.length - remaining) < 0.005;
+          if (allSame && exact) {
+            pinned = labelOnlyDiscounts.every((h) => pinHost(h, per));
+          }
+        }
+      }
+    }
+    if (!pinned && labelOnlyDiscounts.length === 1 && printedTotal !== null && printedTotal > 0) {
+      const delta = round2(paidSumOf() - printedTotal);
+      pinHost(labelOnlyDiscounts[0], delta);
+    }
+  }
+
+  // BROKEN-PRICE SOLVE (IKI's single-unknown recon, Maxima edition): EXACTLY
+  // ONE phantom whose carved block ends in a broken price tail (integer digits
+  // lost, CENTS readable — ".,09 A") + a printed total → the missing price is
+  // total − Σpaid − (deposits/bags subset). The receipt doesn't say which
+  // non-product rows the total includes, so every subset is tried and the
+  // solve commits ONLY when exactly one lands on the broken tail's cents —
+  // ambiguity or no fit keeps the honest phantom skip. Mutually exclusive
+  // with the discount pin above (both consume the same Σpaid−total delta).
+  const brokenPhantoms = ctx.internals.filter(
+    (b) => b.phantom && b.phantomLines?.length && b.brokenTailCents != null,
+  );
+  if (
+    brokenPhantoms.length === 1 && labelOnlyDiscounts.length === 0 &&
+    printedTotal !== null && printedTotal > 0 && adjustCandidates.length <= 6
+  ) {
+    const paidSum =
+      Math.round(
+        products.reduce((sum, p) => {
+          const q = p.quantity && p.quantity > 0 ? p.quantity : 1;
+          const unitPaid = (p.promoPrice != null ? p.promoPrice : p.price) ?? 0;
+          return sum + (unitPaid > 0 ? unitPaid * q : 0);
+        }, 0) * 100,
+      ) / 100;
+    const wantCents = brokenPhantoms[0].brokenTailCents as number;
+    const fits: number[] = [];
+    for (let mask = 0; mask < (1 << adjustCandidates.length); mask++) {
+      let adj = 0;
+      for (let i = 0; i < adjustCandidates.length; i++) if (mask & (1 << i)) adj += adjustCandidates[i];
+      const missing = Math.round((printedTotal - paidSum - adj) * 100) / 100;
+      if (missing > 0.009 && Math.round(missing * 100) % 100 === wantCents && !fits.includes(missing)) {
+        fits.push(missing);
+      }
+    }
+    if (fits.length === 1) {
+      const lines = brokenPhantoms[0].phantomLines as MaximaLine[];
+      const nameRaw = lines
+        .map((l) => l.text)
+        .join(' ')
+        .replace(/[.,]{1,2}\d{2}\s*[AB]\s*$/, '')
+        .replace(/(?<![\d,.])\d{1,2}\s+[AB]\s*$/, '')
+        .trim();
+      const packSize = extractPackSize(nameRaw);
+      products.push({
+        name: cleanProductName(nameRaw),
+        price: fits[0],
+        promoPrice: null,
+        quantity: 1,
+        unit: 'vnt',
+        pricePerUnit: null,
+        isWeighable: false,
+        parsedAmount: packSize?.amount ?? null,
+        parsedUnit: packSize?.unit ?? null,
+        rawLines: lines.map((l) => l.text),
+        region: regionOf(lines),
+      });
+      // Keep the display order y-sorted (the recovered product belongs mid-list).
+      products.sort((a, b) => a.region.yTop - b.region.yTop);
+    }
+  }
+
+  // KNOWN-DISCOUNT PHANTOM SOLVE ([name, label, −D] carve — the price row was
+  // the ONLY loss; kvitas_2026-02-24 product 1). The paid amount comes from
+  // the receipt equation (total − Σpaid − adjustments subset), price = paid+D.
+  // No cents key exists here, so the guard is stricter: the fit must be
+  // UNIQUE across every adjustment subset, and the label must have NAMED the
+  // product (that's what the carve already verified).
+  const knownDiscPhantoms = ctx.internals.filter(
+    (b) => b.phantom && b.phantomLines?.length && b.knownDiscount != null && b.knownDiscount > 0,
+  );
+  if (
+    knownDiscPhantoms.length === 1 && brokenPhantoms.length === 0 &&
+    labelOnlyDiscounts.length === 0 && printedTotal !== null && printedTotal > 0 &&
+    adjustCandidates.length <= 6
+  ) {
+    // MAXIMA money is a TENDER printed before Kvito suma — a solve candidate
+    // with the OPPOSITE sign (it lowered the total, so add it back).
+    const solveCandidates = [...adjustCandidates];
+    if (footer.maximaMoney !== null && footer.maximaMoney > 0) solveCandidates.push(-footer.maximaMoney);
+    const paidSum = paidSumOf();
+    const fits: number[] = [];
+    for (let mask = 0; mask < (1 << solveCandidates.length); mask++) {
+      let adj = 0;
+      for (let i = 0; i < solveCandidates.length; i++) if (mask & (1 << i)) adj += solveCandidates[i];
+      const missingPaid = round2(printedTotal - paidSum - adj);
+      if (missingPaid > 0.009 && !fits.includes(missingPaid)) fits.push(missingPaid);
+    }
+    // No cents key on this solve — when subsets disagree, a SAME-FAMILY sibling
+    // corroborates instead: Maxima flavour variants share the price, so a
+    // product whose normalized name shares the phantom's long prefix and whose
+    // own per-line PAID appears among the fits pins the right one
+    // (kvitas_2026-02-24: JĖGA sūrio ↔ JĖGA paprikomis, both 1,59 → paid 1,25).
+    let fit: number | null = fits.length === 1 ? fits[0] : null;
+    if (fit === null && fits.length > 1) {
+      const phName = normForLabelMatch(
+        (knownDiscPhantoms[0].phantomLines as MaximaLine[]).map((l) => l.text).join(' '),
+      );
+      for (const sib of products) {
+        const sibName = normForLabelMatch(sib.name);
+        const need = Math.max(12, Math.ceil(0.8 * Math.min(sibName.length, 30)));
+        if (commonPrefixLen(phName, sibName) < need) continue;
+        const q = sib.quantity && sib.quantity > 0 ? sib.quantity : 1;
+        const sibPaid = round2(((sib.promoPrice != null ? sib.promoPrice : sib.price) ?? 0) * q);
+        if (fits.some((f) => Math.abs(f - sibPaid) < 0.005)) { fit = sibPaid; break; }
+      }
+    }
+    if (fit !== null) {
+      const fits1: number[] = [fit];
+      void fits1;
+      const D = knownDiscPhantoms[0].knownDiscount as number;
+      const lines = knownDiscPhantoms[0].phantomLines as MaximaLine[];
+      // Name = the carved lines minus the label row and the −D row.
+      const nameRaw = lines
+        .filter((l) => !DISCOUNT_LABEL_RE.test(l.text) && !NEG_AMOUNT_RE.test(l.text.trim()))
+        .map((l) => l.text)
+        .join(' ')
+        .trim();
+      const price = round2(fit + D);
+      const packSize = extractPackSize(nameRaw);
+      products.push({
+        name: cleanProductName(nameRaw),
+        price,
+        promoPrice: fit,
+        quantity: 1,
+        unit: 'vnt',
+        pricePerUnit: null,
+        isWeighable: false,
+        parsedAmount: packSize?.amount ?? null,
+        parsedUnit: packSize?.unit ?? null,
+        rawLines: lines.map((l) => l.text),
+        region: regionOf(lines),
+      });
+      products.sort((a, b) => a.region.yTop - b.region.yTop);
+    }
   }
 
   // TOTAL SANITY (adapted from ikiParser): the to-pay total must be in
