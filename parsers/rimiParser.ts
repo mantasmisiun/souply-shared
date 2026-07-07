@@ -234,10 +234,16 @@ const WEIGHT_RATE_ONLY_RE = /(\d+[.,]\s?\d{1,3})\s*[^xX×]*[xX×]\s*(\d+[.,]\s?\
 // price ("show it, never write price"). Neither alternative has a
 // plausible false-positive shape inside product names ("kg" directly
 // followed by an ×, or a currency-slash-kg rate suffix).
-const WEIGHT_HINT_RE = /\bkg\b[^xX×]{0,10}[xX×]|(?:[EF]?UR|€)\s*\/\s*kg\b/i;
+// The third alternative catches the fully-mushed skew garble: "46g429 EUKG"
+// (printed "0,406 kg X 4,29 EUR/kg", ios-55 paprikos) — digits+g+digits with
+// the EUR/kg marker collapsed into one EUKG token. No Lithuanian word ends in
+// "EUKG", so the token alone is a safe weighed signal.
+const WEIGHT_HINT_RE = /\bkg\b[^xX×]{0,10}[xX×]|(?:[EF]?UR|€)\s*\/\s*kg\b|\bE[UO]?KG\b/i;
 
-// Multi-buy: `2 vnt X 1,99 EUR`.
-const MULTI_RE = /(\d+)\s*vnt\s*\.?\s*[xX×]\s*(\d+[.,]\s?\d{1,2})\s*(?:EUR)?/i;
+// Multi-buy: `2 vnt X 1,99 EUR`. The X tolerates one junk char after it —
+// photo OCR reads "2 vnt. x*2,69 EUR" (rimi-30-04-2026-2 p11 leaked the whole
+// multi line into the product name and lost its quantity).
+const MULTI_RE = /(\d+)\s*vnt\s*\.?\s*[xX×]\s*[*·]?\s*(\d+[.,]\s?\d{1,2})\s*(?:EUR)?/i;
 
 // Fused weight/multi anchor: MLKit occasionally emits the row's right-
 // column anchor (`X,YY A`) and the row's left-column weight/multi
@@ -869,11 +875,29 @@ export function mergeRowFragmentsRimi(rawLines: RimiLine[]): RimiLine[] {
             }
         }
         if (cl.length === 1) { out.push(cl[0]); continue; }
-        const hasDiscountCtx = cl.some((f) => DISCOUNT_CTX_FRAGMENT_RE.test(f.text));
+        // DOUBLE-READ suppression, CLUSTER-WIDE: the engine sometimes emits
+        // the SAME physical text twice at near-identical coords — name rows
+        // ("Virtos GIMINIŲ dešrelės," + "Virtos CIMINIŲ derelės," on
+        // rimi-30-04-2026-2) AND price anchors (two "2,99 A" on ios-56, which
+        // minted a phantom band holding only the next discount line). Two
+        // fragments occupying ≥70% of the same x-span cannot be side-by-side
+        // text; keep the one with more content.
+        const deduped: RimiLine[] = [];
+        for (const f of [...cl].sort((a, b) => a.xLeft - b.xLeft)) {
+            const dup = deduped.findIndex((k) => {
+                const ov = Math.min(k.xRight, f.xRight) - Math.max(k.xLeft, f.xLeft);
+                const minW = Math.min(k.xRight - k.xLeft, f.xRight - f.xLeft);
+                return minW > 0 && ov >= 0.7 * minW;
+            });
+            if (dup === -1) deduped.push({ ...f });
+            else if (f.text.trim().length > deduped[dup].text.trim().length) deduped[dup] = { ...f };
+        }
+        if (deduped.length === 1) { out.push(deduped[0]); continue; }
+        const hasDiscountCtx = deduped.some((f) => DISCOUNT_CTX_FRAGMENT_RE.test(f.text));
         const separate = hasDiscountCtx
             ? []
-            : cl.filter((f) => PRICE_SHAPE_FRAGMENT_RE.test(f.text.trim()));
-        const mergeable = cl.filter((f) => !separate.includes(f));
+            : deduped.filter((f) => PRICE_SHAPE_FRAGMENT_RE.test(f.text.trim()));
+        const mergeable = deduped.filter((f) => !separate.includes(f));
         if (mergeable.length >= 2) {
             const xs = [...mergeable].sort((a, b) => a.xLeft - b.xLeft);
             out.push({
@@ -885,7 +909,7 @@ export function mergeRowFragmentsRimi(rawLines: RimiLine[]): RimiLine[] {
             });
             out.push(...separate);
         } else {
-            out.push(...cl);
+            out.push(...deduped);
         }
     }
     out.push(...fusedOut);
@@ -893,9 +917,23 @@ export function mergeRowFragmentsRimi(rawLines: RimiLine[]): RimiLine[] {
     return out;
 }
 
+/** OCR ZERO-GARBLE fold for price rows: a leading digit read as a letter turns
+ *  "0,65 A" into "O,65" and the row stops anchoring — the band walls collapse
+ *  and TWO products merge into one (rimi-30-04-2026-13 product 13). Folded
+ *  ONLY when the ENTIRE text is a price shape with the letter in the leading
+ *  slot — a name can never match (letters follow the digits). Same O→0 / l→1
+ *  confusion classes the rest of the file already folds via ocrDigit. */
+const PRICE_LEAD_GARBLE_RE = /^[OoIl](?=[.,]\s?\d{2}\s*[AB]?\s*$)/;
+const foldPriceLeadGarble = (l: RimiLine): RimiLine => {
+    const t = l.text.trim();
+    if (!PRICE_LEAD_GARBLE_RE.test(t)) return l;
+    const digit = /^[Oo]/.test(t) ? '0' : '1';
+    return { ...l, text: digit + t.slice(1) };
+};
+
 /** Single entry-normalisation for every public Rimi entry point. */
 const normalizeRimiLines = (rawLines: RimiLine[]): RimiLine[] =>
-    mergeRowFragmentsRimi(rawLines.map(foldRimiHomoglyphs));
+    mergeRowFragmentsRimi(rawLines.map(foldRimiHomoglyphs).map(foldPriceLeadGarble));
 
 export function isRimiReceipt(lines: string[]): boolean {
     const first15 = lines.slice(0, 15).join(' ').toUpperCase();
@@ -2518,6 +2556,10 @@ export interface RimiExtractResult {
      *  the printed Mokėti (78B94F81: the 0,01 bag broke reconciliation by one
      *  cent). parseRimiReceipt adds this to the reconciliation sum. */
     skippedLineTotal?: number;
+    /** Printed anchor total of a weighed-no-ppu product whose price was
+     *  ZEROED by the poison guard — the €/kg is unrecoverable but the line's
+     *  money is known and belongs in the reconciliation sum. */
+    zeroedLineTotal?: number;
 }
 
 const RECONCILE_TOLERANCE_EUR = 0.02;
@@ -2564,6 +2606,7 @@ export function extractRimiProduct(internal: RimiBandInternal): RimiExtractResul
     // so €/kg can be re-derived from the anchor total.
     let weighedHint = false;
     let hintKgQty: number | null = null;
+    let hintText: string | null = null;
     const nameFragments: string[] = [];
     const fusedNameFragments: string[] = [];
 
@@ -2678,6 +2721,7 @@ export function extractRimiProduct(internal: RimiBandInternal): RimiExtractResul
                     if (q > 0) hintKgQty = q;
                 }
             }
+            if (hintText === null) hintText = stripped;
             continue;
         }
         if (
@@ -2740,8 +2784,12 @@ export function extractRimiProduct(internal: RimiBandInternal): RimiExtractResul
         // Strip a trailing "…WORD.? -N,NN" savings fragment that leaked
         // when OCR mangled "Nuol. -N,NN" beyond classifier recognition
         // (e.g. "RIP. -1,92" read where the receipt printed "Nuol. -1,92").
+        // Cents are EXACTLY two digits: printed Nuol amounts always are, and
+        // one-digit tolerance made a produce GRADE token + a wrapped size
+        // digit ("…C2-3, 1" on ios-55 citrinos) read as savings 3,10 — a
+        // phantom discount on a discount-less product.
         const savingsInName = nameText.match(
-            /(?:^|\s+)\S{1,8}\.?\s*-\s*([\dOoIl]+[.,]\s?[\dOoIl]{1,2})\s*$/i,
+            /(?:^|\s+)\S{1,8}\.?\s*-\s*([\dOoIl]+[.,]\s?[\dOoIl]{2})\s*$/i,
         );
         if (savingsInName) {
             if (savings === null) {
@@ -2751,6 +2799,25 @@ export function extractRimiProduct(internal: RimiBandInternal): RimiExtractResul
         }
         if (/[a-zA-Z\dąčęėįšųūžĄČĘĖĮŠŲŪŽ]/.test(nameText)) {
             nameFragments.push(nameText);
+        }
+    }
+
+    // MULTI-CORROBORATED ANCHOR HEAL: the anchor total sometimes garbles a
+    // single LEADING digit while the multi-buy line reads clean — ios-56
+    // printed "2,78 A" for "2 vnt. X 1,39 EUR" but OCR gave "0,78A". When
+    // ppu × qty differs from the anchor by exactly a leading-digit
+    // substitution, the receipt's own arithmetic corroborates the fix
+    // (Maxima-parser parity: broken-tail cents solve). Never fires when a
+    // Galut. kaina is present (the promo lane owns that math).
+    if (pricePerUnit !== null && quantity > 1 && finalPrice === null) {
+        const expected = Math.round(pricePerUnit * quantity * 100) / 100;
+        if (Math.abs(expected - price) > 0.009) {
+            const expStr = expected.toFixed(2);
+            const gotStr = price.toFixed(2);
+            if (expStr.length === gotStr.length && expStr.slice(1) === gotStr.slice(1) && expStr[0] !== gotStr[0]) {
+                warnings.push(`anchor HEALED ${gotStr} → ${expStr} (${pricePerUnit.toFixed(2)} × ${quantity} corroborates)`);
+                price = expected;
+            }
         }
     }
 
@@ -2833,6 +2900,40 @@ export function extractRimiProduct(internal: RimiBandInternal): RimiExtractResul
                 warnings.push(
                     `weighed RECOVERED: €/kg=${derived.toFixed(2)} (price=${price.toFixed(2)} ÷ kg=${hintKgQty})`,
                 );
+            }
+        }
+        // GARBLED-PPU recovery (ios-55 paprikos): the mushed hint line still
+        // CONTAINS the printed €/kg digits right before the EUKG marker —
+        // "46g429 EUKG" ← "0,406 kg X 4,29 EUR/kg". Take the 3-4 digit run
+        // before the marker as X,XX / XX,XX, derive qty = anchor ÷ €/kg, and
+        // accept ONLY with corroboration: the qty is a plausible weighed
+        // amount AND the hint's LEADING digits appear (in order) inside the
+        // derived qty's digits ("46" ⊆ "0406"). Both numbers come from the
+        // printed line — this is recovery, not fabrication.
+        if (pricePerUnit === null && hintText !== null && price > 0) {
+            const ppuM = hintText.match(/(\d{3,4})\s*E[UO]?KG\b/i);
+            if (ppuM) {
+                const d = ppuM[1];
+                const ppuCand = parseFloat(`${d.slice(0, d.length - 2)}.${d.slice(-2)}`);
+                if (ppuCand > 0) {
+                    const qtyCand = Math.round((price / ppuCand) * 1000) / 1000;
+                    const leadM = hintText.match(/^\D*(\d+)/);
+                    const leadDigits = leadM ? leadM[1] : '';
+                    const qtyDigits = qtyCand.toFixed(3).replace(/\D/g, '');
+                    const isSubseq = (needle: string, hay: string): boolean => {
+                        let i = 0;
+                        for (const ch of hay) if (ch === needle[i]) i++;
+                        return i >= needle.length;
+                    };
+                    if (qtyCand >= 0.02 && qtyCand <= 25 && leadDigits.length >= 2 && isSubseq(leadDigits, qtyDigits)) {
+                        pricePerUnit = ppuCand;
+                        quantity = qtyCand;
+                        unit = 'kg';
+                        warnings.push(
+                            `weighed RECOVERED from garble: €/kg=${ppuCand.toFixed(2)}, kg=${qtyCand} (anchor ${price.toFixed(2)} corroborates "${hintText.slice(0, 24)}")`,
+                        );
+                    }
+                }
             }
         }
         if (pricePerUnit === null) {
@@ -3018,6 +3119,12 @@ export function extractRimiProduct(internal: RimiBandInternal): RimiExtractResul
             parsedUnit,
         },
         warnings,
+        // The MONEY is still known even when the €/kg isn't — the anchor is
+        // the printed line total. Reconciliation books it via this side
+        // channel so a weighed-no-ppu item doesn't fail the whole receipt's
+        // arithmetic (price stays 0: the poison guard is about REFERENCE
+        // prices, not about the receipt's own books).
+        zeroedLineTotal: weighedNoPpu && price > 0 ? price : undefined,
     };
 }
 
@@ -3101,8 +3208,9 @@ export function parseRimiReceipt(inputLines: RimiLine[]): RimiParseResult {
     // 0, which correctly FAILS reconciliation (the parse has a hole).
     let lineTotalSum = 0;
     for (const internal of ctx.productInternals) {
-        const { product, skippedLineTotal } = extractRimiProduct(internal);
+        const { product, skippedLineTotal, zeroedLineTotal } = extractRimiProduct(internal);
         if (skippedLineTotal) lineTotalSum += skippedLineTotal;
+        if (zeroedLineTotal) lineTotalSum += zeroedLineTotal;
         if (!product) continue;
         const printedLineTotal = (product.promoPrice != null ? product.promoPrice : product.price) ?? 0;
         if (printedLineTotal > 0) lineTotalSum += printedLineTotal;
