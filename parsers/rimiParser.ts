@@ -96,6 +96,13 @@ export interface RimiLine {
      *  excluded from row-clustering (it y-overlaps BOTH rows and would glue
      *  them together) and its text is quarantined from product names. */
     fusedRow?: boolean;
+    /** The TOP-half remnant of a split fused box: a two-row fusion whose text
+     *  ends in a price is [previous product's discount row][next product's
+     *  name row] — the price physically belongs to the TOP row (the previous
+     *  band's Galut. kaina). The split keeps every band's content inside its
+     *  own walls: this line is tail-eligible for the band above, never an
+     *  anchor, and extractRimiProduct reads it as a recovered Galut. */
+    fusedSplitTail?: boolean;
 }
 
 export interface RimiProduct {
@@ -542,11 +549,19 @@ const mergeRowFragments = (rawLines: RimiLine[]): RimiLine[] => {
     const sorted = [...rawLines].sort((a, b) => a.yTop - b.yTop);
     const out: RimiLine[] = [];
     for (const line of sorted) {
-        if (out.length === 0) {
+        // FUSED boxes never participate in same-row joins: a two-row-tall box
+        // y-overlaps its neighbour rows, and joining glued the clean name
+        // line "Sok. sk. sojos ger. ALPRO" onto the quarantined garbage box
+        // on rimi-30-04-2026-23 — the quarantine then ate the REAL name too.
+        if (out.length === 0 || line.fusedRow) {
             out.push({ ...line });
             continue;
         }
         const last = out[out.length - 1];
+        if (last.fusedRow) {
+            out.push({ ...line });
+            continue;
+        }
         const yTopDiff = Math.abs(line.yTop - last.yTop);
         if (yTopDiff >= ROW_MERGE_YTOP_THRESHOLD_PX) {
             out.push({ ...line });
@@ -746,10 +761,18 @@ const RIMI_CYRILLIC_HOMOGLYPHS: Record<string, string> = {
     'М': 'M', 'О': 'O', 'Р': 'P', 'Т': 'T', 'Х': 'X', 'Ѕ': 'S',
     'а': 'a', 'с': 'c', 'е': 'e', 'і': 'i', 'ј': 'j', 'о': 'o', 'р': 'p', 'х': 'x', 'ѕ': 's', 'у': 'y',
 };
-const foldRimiHomoglyphs = (l: RimiLine): RimiLine =>
-    /[Ѐ-ӿ]/.test(l.text)
-        ? { ...l, text: l.text.replace(/[Ѐ-ӿ]/g, (c) => RIMI_CYRILLIC_HOMOGLYPHS[c] ?? c) }
-        : l;
+const foldRimiHomoglyphs = (l: RimiLine): RimiLine => {
+    let text = l.text;
+    if (/[Ѐ-ӿ]/.test(text)) {
+        text = text.replace(/[Ѐ-ӿ]/g, (c) => RIMI_CYRILLIC_HOMOGLYPHS[c] ?? c);
+    }
+    // "$" before an uppercase run is a garbled Š/S ("$OKOLADE" for ŠOKOLADE,
+    // BE09D63A) — no legitimate Rimi text uses the dollar sign.
+    if (text.includes('$')) {
+        text = text.replace(/\$(?=[A-ZĄČĘĖĮŠŲŪŽ]{2})/g, 'S');
+    }
+    return text === l.text ? l : { ...l, text };
+};
 
 // A fragment whose text is a bare price/amount — kept as its OWN line by the
 // row merger so the anchor detection below still sees standalone prices.
@@ -815,12 +838,39 @@ export function mergeRowFragmentsRimi(rawLines: RimiLine[]): RimiLine[] {
     const clusterable: RimiLine[] = [];
     for (const l of rawLines) {
         const h = l.yBottom - l.yTop;
+        // Two tag tiers: 1.75×+spans-two-rows (the proven signature), or a
+        // full TWO ROWS tall regardless — a fusion can consume every other
+        // line of both rows (rimi-30-04-2026-2: 2.12× box holding a Nuol row
+        // + the next name). Photo-skew singles measure ≤1.81× across the
+        // corpus, safely under the unconditional tier.
         if (
-            medH > 0 && isRimiBodyText(l)
-            && h >= 1.75 * medH && h <= 3.5 * medH
-            && spansTwoRows(l)
+            medH > 0 && isRimiBodyText(l) && h <= 3.5 * medH
+            && ((h >= 1.75 * medH && spansTwoRows(l)) || h >= 2.0 * medH)
         ) {
-            fusedOut.push({ ...l, fusedRow: true });
+            // WALL-HONORING SPLIT: a two-row fusion whose text ends in a
+            // price is [prev product's discount row][next product's name
+            // row] (rimi-30-04-2026-2: "Lazdyny riesutu aetas RiMI 0,65").
+            // Split at one row-pitch: the price goes back to the TOP half
+            // where it is printed (the previous band's tail territory), the
+            // garbled name keeps the bottom half — every band reads only
+            // what lies inside its own walls.
+            const tailM = h <= 2.6 * medH
+                ? l.text.trim().match(/^(.{4,}?)[\s,]*(\d+[.,]\s?\d{2})\s*$/)
+                : null;
+            if (tailM) {
+                const boundary = Math.round(l.yTop + medH);
+                fusedOut.push({
+                    text: tailM[2],
+                    yTop: l.yTop,
+                    yBottom: boundary,
+                    xLeft: l.xLeft,
+                    xRight: l.xRight,
+                    fusedSplitTail: true,
+                });
+                fusedOut.push({ ...l, text: tailM[1].trim(), yTop: boundary, fusedRow: true });
+            } else {
+                fusedOut.push({ ...l, fusedRow: true });
+            }
         } else {
             clusterable.push(l);
         }
@@ -875,7 +925,55 @@ export function mergeRowFragmentsRimi(rawLines: RimiLine[]): RimiLine[] {
             }
         }
         if (cl.length === 1) { out.push(cl[0]); continue; }
-        // DOUBLE-READ suppression, CLUSTER-WIDE: the engine sometimes emits
+        // SUB-ROW partition: a y-cluster on a skewed photo chains ACROSS
+        // physical rows (bboxes tilt), and treating the whole cluster as one
+        // row let the dedupe/concat below eat REAL neighbours on ios-55 —
+        // "2 vnt. X 3,49 EUR" fell to the name row above it (45% y-overlap)
+        // collapsing the multibuy, and "ALPRO, 14 %,250ml" fell to its own
+        // first name line (58%). Same-row SOLID fragments overlap ≥~85%
+        // pairwise (true double-reads 98-100%): union them at 70%. SHORT
+        // junk double-reads ("IDDO", "1rc") sag halfway into a neighbouring
+        // row and can sit at exactly 70% against it — they must never
+        // BRIDGE two rows into one, so they don't participate in the union;
+        // each attaches to the row it overlaps most (where the dedupe then
+        // eats it).
+        const clHs = cl.map((f) => f.yBottom - f.yTop).filter((v) => v > 0).sort((a, b) => a - b);
+        const clMedH = clHs.length ? clHs[Math.floor(clHs.length / 2)] : 0;
+        // Solidity reference = the TALL end of the cluster (junk can be half
+        // its fragments and drags a plain median down to its own height),
+        // clamped so one sagging outlier can't disqualify the real rows.
+        const clRefH = Math.min(clHs.length ? clHs[clHs.length - 1] : 0, 1.5 * clMedH);
+        const solidIdx = cl.map((f, idx) => idx).filter((idx) => cl[idx].yBottom - cl[idx].yTop >= 0.6 * clRefH);
+        const yOverlapOf = (a: RimiLine, b: RimiLine): number =>
+            Math.min(a.yBottom, b.yBottom) - Math.max(a.yTop, b.yTop);
+        const parent = cl.map((_, idx) => idx);
+        const findRoot = (a: number): number => (parent[a] === a ? a : (parent[a] = findRoot(parent[a])));
+        for (let ai = 0; ai < solidIdx.length; ai++) {
+            for (let bi = ai + 1; bi < solidIdx.length; bi++) {
+                const a = solidIdx[ai], b = solidIdx[bi];
+                const minH = Math.min(cl[a].yBottom - cl[a].yTop, cl[b].yBottom - cl[b].yTop);
+                if (minH > 0 && yOverlapOf(cl[a], cl[b]) >= 0.7 * minH) parent[findRoot(a)] = findRoot(b);
+            }
+        }
+        for (let s = 0; s < cl.length; s++) {
+            if (solidIdx.includes(s)) continue;
+            let best = -1, bestOv = 0;
+            for (const a of solidIdx) {
+                const ov = yOverlapOf(cl[s], cl[a]);
+                if (ov > bestOv) { bestOv = ov; best = a; }
+            }
+            if (best !== -1 && bestOv > 0) parent[findRoot(s)] = findRoot(best);
+        }
+        const byRoot = new Map<number, RimiLine[]>();
+        cl.forEach((f, idx) => {
+            const r = findRoot(idx);
+            const row = byRoot.get(r);
+            if (row) row.push({ ...f }); else byRoot.set(r, [{ ...f }]);
+        });
+        const subRows = [...byRoot.values()];
+        for (const rowFrags of subRows) {
+        if (rowFrags.length === 1) { out.push(rowFrags[0]); continue; }
+        // DOUBLE-READ suppression, per sub-row: the engine sometimes emits
         // the SAME physical text twice at near-identical coords — name rows
         // ("Virtos GIMINIŲ dešrelės," + "Virtos CIMINIŲ derelės," on
         // rimi-30-04-2026-2) AND price anchors (two "2,99 A" on ios-56, which
@@ -883,7 +981,7 @@ export function mergeRowFragmentsRimi(rawLines: RimiLine[]): RimiLine[] {
         // fragments occupying ≥70% of the same x-span cannot be side-by-side
         // text; keep the one with more content.
         const deduped: RimiLine[] = [];
-        for (const f of [...cl].sort((a, b) => a.xLeft - b.xLeft)) {
+        for (const f of [...rowFrags].sort((a, b) => a.xLeft - b.xLeft)) {
             const dup = deduped.findIndex((k) => {
                 const ov = Math.min(k.xRight, f.xRight) - Math.max(k.xLeft, f.xLeft);
                 const minW = Math.min(k.xRight - k.xLeft, f.xRight - f.xLeft);
@@ -910,6 +1008,7 @@ export function mergeRowFragmentsRimi(rawLines: RimiLine[]): RimiLine[] {
             out.push(...separate);
         } else {
             out.push(...deduped);
+        }
         }
     }
     out.push(...fusedOut);
@@ -1274,6 +1373,11 @@ export function extractPackSize(
         /(,\s*)(\d{1,3})\s+([\dOoIl]{1,2})\s*(g|ml)\b/gi,
         (_m, pre, a, b, unit) => `${pre}${a}${b} ${unit}`,
     );
+    // ", 1lkg" — a stray l between the per-kg reference "1 kg" and its unit
+    // ("Saldainiai SLYVA ŠOKOLADE, 1lkg" on BE09D63A); the D-class kg pattern
+    // would read "1l" as 11 kg. The ", 1 kg" reference suffix is the only
+    // shape this appears in, so the fold is exact.
+    preStripped = preStripped.replace(/(,\s*)1l\s*kg\b/gi, (_m, pre) => `${pre}1 kg`);
 
     // Milk-volume OCR fix: receipt prints "rieb., 2 l" (riebumas = fat
     // content, followed by litre volume) but iOS MLKit fuses the
@@ -1537,6 +1641,12 @@ export function extractPackSize(
 
 export function parseFooter(lines: RimiLine[]): RimiFooter {
     let total: number | null = null;
+    // True when the accepted Mokėti amount matched on a WHITESPACE-only
+    // separator — that leniency exists for smudged commas, but a digit-DROP
+    // garble produces the same shape with a wrong value (BE09D63A: bold
+    // "31,93" OCR'd as "3 93" → 3.93). Weak reads get cross-checked against
+    // the card slip below.
+    let totalWeakSep = false;
     let date = '';
     let time = '';
     let receiptNo = '';
@@ -1578,15 +1688,19 @@ export function parseFooter(lines: RimiLine[]): RimiFooter {
     // integer into the cents; tail is lenient because Rimi prints
     // amounts as "25,04 EUR" or "25,04 A" depending on layout.
     const AMOUNT_RE = new RegExp(
-        `^([${DIGIT_CHARS}]+)${SEPARATOR}([${DIGIT_CHARS}]{2})(?:\\b|$)`,
+        `^([${DIGIT_CHARS}]+)(${SEPARATOR})([${DIGIT_CHARS}]{2})(?:\\b|$)`,
     );
-    const parseAmount = (s: string): number | null => {
+    const parseAmountEx = (s: string): { value: number; weak: boolean } | null => {
         const m = s.trim().match(AMOUNT_RE);
         if (!m) return null;
         const intVal = parseInt(ocrDigit(m[1]), 10);
         if (isNaN(intVal)) return null;
-        return parseFloat(intVal + '.' + ocrDigit(m[2]));
+        return {
+            value: parseFloat(intVal + '.' + ocrDigit(m[3])),
+            weak: !/[.,]/.test(m[2]),
+        };
     };
+    const parseAmount = (s: string): number | null => parseAmountEx(s)?.value ?? null;
 
     for (let i = 0; i < lines.length; i++) {
         const text = lines[i].text.trim();
@@ -1598,15 +1712,16 @@ export function parseFooter(lines: RimiLine[]): RimiFooter {
         // overwriting the first canonical match.
         const moketiMatch = text.match(
             new RegExp(
-                `Mok${E_DIACRITIC_CLASS}ti\\s+([${DIGIT_CHARS}]+)${SEPARATOR}([${DIGIT_CHARS}]{2})`,
+                `Mok${E_DIACRITIC_CLASS}ti\\s+([${DIGIT_CHARS}]+)(${SEPARATOR})([${DIGIT_CHARS}]{2})`,
                 'i',
             ),
         );
         if (moketiMatch && total === null) {
             const intVal = parseInt(ocrDigit(moketiMatch[1]), 10);
-            const cents = ocrDigit(moketiMatch[2]);
+            const cents = ocrDigit(moketiMatch[3]);
             if (!isNaN(intVal)) {
                 total = parseFloat(intVal + '.' + cents);
+                totalWeakSep = !/[.,]/.test(moketiMatch[2]);
                 trackLine(lines[i], 'total');
             }
         }
@@ -1645,16 +1760,18 @@ export function parseFooter(lines: RimiLine[]): RimiFooter {
 
             let chosenCand: RimiLine | undefined;
             let chosenAmount: number | null = null;
+            let chosenWeak = false;
 
             // Pass A — same-row scan (canonical Rimi layout).
             for (let k = Math.max(0, i - 3); k <= Math.min(lines.length - 1, i + 3); k++) {
                 if (k === i) continue;
                 const cand = lines[k];
                 if (!isSameRow(cand)) continue;
-                const amount = parseAmount(cand.text);
+                const amount = parseAmountEx(cand.text);
                 if (amount !== null) {
                     chosenCand = cand;
-                    chosenAmount = amount;
+                    chosenAmount = amount.value;
+                    chosenWeak = amount.weak;
                     break;
                 }
             }
@@ -1679,10 +1796,11 @@ export function parseFooter(lines: RimiLine[]): RimiFooter {
                     const cand = lines[k];
                     if (KVITO_NR_STOP.test(cand.text.trim())) break;
                     if (VAT_TABLE_STOP.test(cand.text)) break;
-                    const amount = parseAmount(cand.text);
+                    const amount = parseAmountEx(cand.text);
                     if (amount !== null) {
                         chosenCand = cand;
-                        chosenAmount = amount;
+                        chosenAmount = amount.value;
+                        chosenWeak = amount.weak;
                         break;
                     }
                 }
@@ -1690,6 +1808,7 @@ export function parseFooter(lines: RimiLine[]): RimiFooter {
 
             if (chosenAmount !== null && chosenCand) {
                 total = chosenAmount;
+                totalWeakSep = chosenWeak;
                 trackLine(chosenCand, 'total');
             }
         }
@@ -1823,29 +1942,48 @@ export function parseFooter(lines: RimiLine[]): RimiFooter {
         }
     }
 
-    // CARD-SLIP fallback: the embedded card slip prints the charged amount
-    // as "PIRKINYS  38,09 EUR" — equal to Mokėti on card payments. Fires
-    // only when every Mokėti path failed (e.g. the bold total digits
-    // shattered into unparseable fragments: "3 8" + "09" on ios-receipt-55,
-    // "4 6" on rimi-30-04-2026-9). A READ total beats an arithmetically
-    // derived one — reconciliation can then verify instead of assume.
-    if (total === null) {
+    // CARD-SLIP total: the embedded card slip prints the charged amount as
+    // "PIRKINYS  38,09 EUR" — equal to Mokėti on card payments. The amount
+    // requires a REAL decimal separator, so it can't repeat a digit-drop
+    // garble.
+    const cardSlipTotal = (): { value: number | null; src: RimiLine } | null => {
         for (const l of lines) {
             if (!/P[Il1]RK[Il1]N[YV]S/i.test(l.text)) continue;
             const inline = l.text.match(/(\d+[.,]\s?\d{2})\s*(?:EUR)?\s*$/i);
-            if (inline) {
-                total = parseNumLoose(inline[1]);
-                trackLine(l, 'total');
-                break;
-            }
+            if (inline) return { value: parseNumLoose(inline[1]), src: l };
             const sib = lines.find((o) => o !== l
                 && Math.max(o.yTop, l.yTop) < Math.min(o.yBottom, l.yBottom)
                 && /^\d+[.,]\s?\d{2}\s*(?:EUR)?$/i.test(o.text.trim()));
-            if (sib) {
-                total = parseNumLoose(sib.text);
-                trackLine(sib, 'total');
-                break;
-            }
+            if (sib) return { value: parseNumLoose(sib.text), src: sib };
+        }
+        return null;
+    };
+
+    // WEAK-separator cross-check: a Mokėti amount that matched on
+    // whitespace alone is kept only while nothing better exists — when the
+    // card slip disagrees, the slip wins (BE09D63A: "Mokėti 3 93" → 3.93,
+    // card slip "PIRKINYS 31,93 EUR"; the bogus 3.93 tripped the gross-
+    // mismatch sanity, the total fell to the item-sum derivation and
+    // reconciliation went self-referential). The corrected value is still a
+    // READ total, so reconciliation can verify it.
+    if (total !== null && totalWeakSep) {
+        const slip = cardSlipTotal();
+        if (slip && slip.value !== null && slip.value !== total) {
+            total = slip.value;
+            trackLine(slip.src, 'total');
+        }
+    }
+
+    // Fallback lane: fires only when every Mokėti path failed (e.g. the
+    // bold total digits shattered into unparseable fragments: "3 8" + "09"
+    // on ios-receipt-55, "4 6" on rimi-30-04-2026-9). A READ total beats an
+    // arithmetically derived one — reconciliation can then verify instead
+    // of assume.
+    if (total === null) {
+        const slip = cardSlipTotal();
+        if (slip && slip.value !== null) {
+            total = slip.value;
+            trackLine(slip.src, 'total');
         }
     }
 
@@ -1918,7 +2056,7 @@ function syntheticReceiptNo(date: string, time: string, total: number): string {
  * Amounts sit either on the label line itself or in the right price column
  * within ~2 row heights (the deposit label wraps over two rows).
  */
-function rimiReceiptAdjustments(lines: RimiLine[]): number {
+function rimiReceiptAdjustments(lines: RimiLine[]): { total: number; used: Set<RimiLine> } {
     // PLAIN amounts only — adjustment values never carry a VAT letter.
     // Tolerating "N,NN A" here made the deposit sibling-search grab nearby
     // product ANCHORS (rimi-30-04-2026-12 booked 2,18 A as a deposit).
@@ -1936,7 +2074,9 @@ function rimiReceiptAdjustments(lines: RimiLine[]): number {
         // likutis recaps, so the RIMI token can be loose. Deposits reuse
         // DEPOSIT_PATTERN (ū/ü/2 classes) — the extract's band skip already
         // matches it, and a narrower regex here made the two lanes disagree.
-        const isPinigai = /Panaudot\w{0,2}\s+MANO\s+R\w{2,3}\s+pinig/i.test(l.text);
+        // `\w{0,2}pinig`: OCR doubles the leading letter ("Ppinigai" on
+        // ios-55) — the Panaudot/MANO/R stems already pin the label down.
+        const isPinigai = /Panaudot\w{0,2}\s+MANO\s+R\w{2,3}\s+\w{0,2}pinig/i.test(l.text);
         const isDeposit = DEPOSIT_PATTERN.test(l.text);
         const isRounding = /Apvalinim/i.test(l.text);
         if (!isPinigai && !isDeposit && !isRounding) continue;
@@ -1962,7 +2102,7 @@ function rimiReceiptAdjustments(lines: RimiLine[]): number {
         // deposits/rounding keep the printed sign (covers taromat refunds).
         adj += isPinigai ? -Math.abs(amount) : amount;
     }
-    return Math.round(adj * 100) / 100;
+    return { total: Math.round(adj * 100) / 100, used };
 }
 
 // ───────── band model (internal) ─────────
@@ -2003,6 +2143,9 @@ function findProductAnchors(productSlice: RimiLine[]): number[] {
             anchors.push(i);
             continue;
         }
+        // A split fused-box tail is the PREVIOUS band's recovered Galut —
+        // never an anchor (it would mint a phantom band).
+        if (line.fusedSplitTail) continue;
         if (!RELAXED_PRICE_RE.test(line.text.trim())) continue;
         if (!prev) continue;
         if (isPositivePriceLine(prev)) continue;
@@ -2103,6 +2246,12 @@ function findProductBandsInternal(productSlice: RimiLine[]): ProductBandInternal
                 lastBottom = Math.max(lastBottom, line.yBottom);
                 continue;
             }
+            // Split fused-box tail = this band's recovered Galut row —
+            // tail-eligible so the wall lands BELOW it.
+            if (line.fusedSplitTail) {
+                lastBottom = Math.max(lastBottom, cappedBottom(line));
+                continue;
+            }
             if (isDiscountLine(line)) {
                 lastBottom = Math.max(lastBottom, cappedBottom(line));
                 continue;
@@ -2165,9 +2314,20 @@ function findProductBandsInternal(productSlice: RimiLine[]): ProductBandInternal
                 firstNextTop = line.yTop;
             }
         }
-        const bottomWall = Number.isFinite(firstNextTop)
-            ? (tailBottom + firstNextTop) / 2
-            : tailBottom;
+        // Wall placement: no line CENTER can lie in the open gap
+        // (tailBottom, firstNextTop) — any center past tailBottom already
+        // bounded firstNextTop — so anywhere inside the gap assigns lines
+        // identically. HUG THE TAIL (15% into the gap) instead of the
+        // midpoint: when a printed-but-UNREAD row straddles the gap
+        // (rimi-30-04-2026-8's dropped first name line), the midpoint sliced
+        // it across two band crops; hugging leaves it visually with the NEXT
+        // band, matching how read receipts render. Negative gaps (a
+        // straddling box makes firstNextTop < tailBottom) keep the midpoint.
+        const bottomWall = !Number.isFinite(firstNextTop)
+            ? tailBottom
+            : firstNextTop > tailBottom
+                ? tailBottom + 0.15 * (firstNextTop - tailBottom)
+                : (tailBottom + firstNextTop) / 2;
         bands.push({ anchorIdx, topWall, bottomWall });
     }
     return bands;
@@ -2366,6 +2526,13 @@ function computeBandsContext(rawLines: RimiLine[]): BandsContext {
     const productBands: RimiReceiptBand[] = [];
     const productInternals: RimiBandInternal[] = [];
     const centerOf = (line: RimiLine) => (line.yTop + line.yBottom) / 2;
+    // DRAWN band geometry ≠ walls. Walls are assignment constructs living in
+    // the empty gap between bands; drawing them wall-to-wall sliced any
+    // printed-but-UNREAD row across two band crops (rimi-30-04-2026-8's
+    // dropped first name line). Draw each band down to its CONTENT hull and
+    // start the next band's crop right there — inter-band pixels always
+    // render with the band BELOW, same as on receipts where every row reads.
+    let prevDrawnBottom: number | null = null;
 
     // Visible top/bottom of the productSlice — used to clamp the
     // first band's open top wall and the last band's open bottom
@@ -2393,14 +2560,19 @@ function computeBandsContext(rawLines: RimiLine[]): BandsContext {
         }
         if (memberIdxs.length === 0) continue;
 
-        const visTop = Number.isFinite(band.topWall) ? band.topWall : sliceTop;
-        const visBottom = Number.isFinite(band.bottomWall) ? band.bottomWall : sliceBottom;
+        const contentBottom = Math.max(...memberIdxs.map((k) => productSlice[k].yBottom));
+        const visTop = prevDrawnBottom
+            ?? (Number.isFinite(band.topWall) ? band.topWall : sliceTop);
+        const visBottom = bi === internal.length - 1
+            ? Math.max(contentBottom, Math.min(sliceBottom, Number.isFinite(band.bottomWall) ? band.bottomWall : sliceBottom))
+            : contentBottom;
         productBands.push({
             kind: 'product',
             yTop: visTop,
             yBottom: visBottom,
             label: `#${bi + 1}`,
         });
+        prevDrawnBottom = visBottom;
 
         // Split members by index relative to the anchor:
         //   sliceIdx < anchorIdx  → preName (name lines, ordered as
@@ -2737,6 +2909,18 @@ export function extractRimiProduct(internal: RimiBandInternal): RimiExtractResul
             depositSeen = true;
             continue;
         }
+        // Split fused-box tail: the previous discount row's printed Galut
+        // value, restored to this band's own territory by the splitter.
+        if (entry.line.fusedSplitTail) {
+            if (finalPrice === null) {
+                const v = parseNumLoose(text);
+                if (v > 0 && v < price - 0.009) {
+                    finalPrice = v;
+                    warnings.push(`Galut. kaina ${v.toFixed(2)} recovered from a fused-box tail`);
+                }
+            }
+            continue;
+        }
         if (BARE_PRICE_RE.test(text)) continue;
         if (depositSeen) continue;
         // Only preName entries contribute to the product name. PostAnchor
@@ -2797,6 +2981,14 @@ export function extractRimiProduct(internal: RimiBandInternal): RimiExtractResul
             }
             nameText = nameText.slice(0, nameText.length - savingsInName[0].length).trim();
         }
+        // A bare trailing "EUR" with no amount in front of it is qty-row
+        // bleed from a sagging double-read ("ant ib., 500 g EUR" on
+        // ios-55) — currency never ends a name row on its own. Amounts
+        // keep theirs ("2 vnt. X 3,49 EUR" is not a name row anyway).
+        const eurTail = nameText.match(/^(.*?)[\s,]+EUR$/i);
+        if (eurTail && !/\d[.,]?\d*\s*$/.test(eurTail[1])) {
+            nameText = eurTail[1].trim();
+        }
         if (/[a-zA-Z\dąčęėįšųūžĄČĘĖĮŠŲŪŽ]/.test(nameText)) {
             nameFragments.push(nameText);
         }
@@ -2822,11 +3014,26 @@ export function extractRimiProduct(internal: RimiBandInternal): RimiExtractResul
     }
 
     let rawName = nameFragments.join(' ').trim();
+    // Cleaned fused text = the garble minus any trailing price it swallowed
+    // (that price belongs to the PREVIOUS product's discount row — see the
+    // Galut salvage in parseRimiReceipt).
+    const cleanedFused = fusedNameFragments.join(' ')
+        .replace(/\s*\d+[.,]\s?\d{2}\s*[AB]?\s*$/, '')
+        .trim();
     if (!rawName && fusedNameFragments.length) {
         // Every name line was a fused box — keep the garble over an empty
         // name (empty → skip:no-name → the product vanishes entirely).
-        rawName = fusedNameFragments.join(' ').trim();
+        rawName = cleanedFused || fusedNameFragments.join(' ').trim();
         warnings.push('name is a fused-row garble (no clean name line survived)');
+    } else if (
+        rawName && cleanedFused
+        && rawName.replace(/[^A-Za-zĄČĘĖĮŠŲŪŽąčęėįšųūž]/g, '').length < 8
+    ) {
+        // Only a short continuation survived (letters of "BASIC, 400 g" =
+        // "BASICg") — a fused box holds the real first name line; garbled
+        // beats truncated for matching (rimi-30-04-2026-2 Lazdynų).
+        rawName = `${cleanedFused} ${rawName}`;
+        warnings.push('fused-row text kept in name (clean name too short without it)');
     }
     if (!rawName) {
         return { product: null, warnings: ['skip:no-name'] };
@@ -3072,6 +3279,25 @@ export function extractRimiProduct(internal: RimiBandInternal): RimiExtractResul
             const derived = quantity !== 0
                 ? Math.round((price / quantity) * 100) / 100
                 : null;
+            // WEIGHED-QTY HEAL (mirror of the multi-corroborated anchor
+            // heal): the weighed line can garble a single leading digit of
+            // the QUANTITY while ppu and the anchor total read clean —
+            // ios-55 printed "0,390 kg X 2,49 EUR/kg" with total "0,97 A"
+            // but OCR gave "8,390 kg", minting 8.39 kg of lemons. When
+            // anchor ÷ ppu lands on a quantity that differs from the OCR
+            // read by exactly a leading-digit substitution, the receipt's
+            // own arithmetic corroborates the fix. kg only: integer vnt
+            // counts have no printed decimals to corroborate against.
+            const derivedQty = unit === 'kg' && pricePerUnit > 0
+                ? Math.round((price / pricePerUnit) * 1000) / 1000
+                : null;
+            const qtyHealOk = (): boolean => {
+                if (derivedQty === null || derivedQty <= 0) return false;
+                if (Math.abs(Math.round(derivedQty * pricePerUnit! * 100) / 100 - price) > RECONCILE_TOLERANCE_EUR) return false;
+                const e = derivedQty.toFixed(3);
+                const g = quantity.toFixed(3);
+                return e.length === g.length && e.slice(1) === g.slice(1) && e[0] !== g[0];
+            };
             if (
                 derived !== null &&
                 Math.abs(derived * quantity - price) <= RECONCILE_TOLERANCE_EUR &&
@@ -3082,6 +3308,12 @@ export function extractRimiProduct(internal: RimiBandInternal): RimiExtractResul
                         `(price=${price.toFixed(2)} ÷ qty=${quantity})`,
                 );
                 pricePerUnit = derived;
+            } else if (qtyHealOk()) {
+                warnings.push(
+                    `reconcile HEALED: qty ${quantity.toFixed(3)} → ${derivedQty!.toFixed(3)} kg ` +
+                        `(price=${price.toFixed(2)} ÷ ppu=${pricePerUnit.toFixed(2)} corroborates)`,
+                );
+                quantity = derivedQty!;
             } else {
                 warnings.push(
                     `reconcile MISMATCH: ppu=${pricePerUnit.toFixed(2)} × qty=${quantity} = ` +
@@ -3225,13 +3457,23 @@ export function parseRimiReceipt(inputLines: RimiLine[]): RimiParseResult {
     }
     lineTotalSum = round2(lineTotalSum);
 
+    // (The old cross-band "fused-box Galut salvage" post-pass is gone: the
+    // fused-box SPLITTER in mergeRowFragmentsRimi now returns the swallowed
+    // Galut value to the previous band's own territory as a fusedSplitTail
+    // line, and extractRimiProduct reads it in-band — hard walls intact.)
+
     // RECEIPT-LEVEL RECONCILIATION: Σ printed line totals + adjustments
     // (MANO RIMI pinigai / deposits / rounding) = printed Mokėti. The
     // expected total also powers the fallback below — the OLD fallback used
     // the raw item sum and wrote a WRONG total whenever wallet money was
     // spent and the Mokėti row was garbled (rimi-30-04-2026-15: printed
     // "0,44" OCR'd as "44" → fallback minted 1.62 instead of 1.62−1.18).
-    const adjustments = rimiReceiptAdjustments(rawLines);
+    // (No unlabeled-amount salvage here on purpose: the one receipt that
+    // seemed to need it — ios-55's bare "-0,33" — turned out to be a LABEL
+    // GARBLE ("Ppinigai"), fixed in the pinigai regex above. Booking bare
+    // block amounts by residual-matching can mask a dropped per-item
+    // discount as reconciled; without corpus evidence it stays out.)
+    const adjustments = rimiReceiptAdjustments(rawLines).total;
     const expectedTotal = round2(lineTotalSum + adjustments);
 
     // TOTAL SANITY (IKI-parser parity): the to-pay total must be in the
@@ -3249,7 +3491,7 @@ export function parseRimiReceipt(inputLines: RimiLine[]): RimiParseResult {
     // numbers are exact; a 1-cent mismatch means a misread digit somewhere
     // and MUST flag (the ensemble second opinion is the cheap insurance).
     footer.reconDelta = !totalDerived && footer.total !== null && products.length > 0
-        ? round2(lineTotalSum + adjustments - footer.total)
+        ? round2(lineTotalSum + adjustments - footer.total) + 0 // + 0 folds JS -0 to 0
         : null;
     footer.reconciled = footer.reconDelta !== null && Math.abs(footer.reconDelta) < 0.005;
     // The synthetic receipt-id fallback needs a total — when the total
