@@ -22,7 +22,7 @@
  *     of `1,22`) — same `[.,]\s?` pattern as the Maxima parser.
  */
 
-import type { RegionKind, LabeledRegion } from './rimiParser.js';
+import { extractPackSize, type RegionKind, type LabeledRegion } from './rimiParser.js';
 
 export interface Region {
     yTop: number;
@@ -96,7 +96,7 @@ const D = '[\\d0OoIlL]';
 // `1,22 M1` as `l,22 M1` and the anchor (with its mandatory M-suffix)
 // is specific enough that letter-for-digit swaps can't false-match a
 // name line.
-const PRICE_RE = new RegExp(`^(${D}+[.,]\\s?${D}{1,2})\\s*M\\s*[15]\\s*$`, 'i');
+const PRICE_RE = new RegExp(`^(${D}+[.,]\\s?${D}{1,2})\\s*M\\s*[15Il|]\\s*$`, 'i');
 // `0,316x3,85 1,22 M1` — inline weighable. Captures:
 //   1 = quantity (e.g. 0,316)
 //   2 = unit price (e.g. 3,85)
@@ -107,7 +107,7 @@ const PRICE_RE = new RegExp(`^(${D}+[.,]\\s?${D}{1,2})\\s*M\\s*[15]\\s*$`, 'i');
 // leading 1 reads as `l` on faded prints); the whole-line shape with
 // x-separator + M-suffix keeps that from matching name text.
 const WEIGHABLE_RE = new RegExp(
-    `^\\s*(${D}+[.,]\\s?${D}{1,3})\\s*[xX]\\s*(${D}+[.,]\\s?${D}{1,2})\\s+(${D}+[.,]\\s?${D}{1,2})\\s*M\\s*[15]\\s*$`,
+    `^\\s*(${D}+[.,]\\s?${D}{1,3})\\s*[xX]\\s*(${D}+[.,]\\s?${D}{1,2})\\s+(${D}+[.,]\\s?${D}{1,2})\\s*M\\s*[15Il|]\\s*$`,
     'i'
 );
 
@@ -121,7 +121,7 @@ const WEIGHABLE_RE = new RegExp(
 // next row's name, and the multi-buy product disappears from the
 // output (its band collapses into the next anchor's band).
 const WEIGHABLE_INT_RE = new RegExp(
-    `^\\s*(${D}+)\\s*[xX]\\s*(${D}+[.,]\\s?${D}{1,2})\\s+(${D}+[.,]\\s?${D}{1,2})\\s*M\\s*[15]\\s*$`,
+    `^\\s*(${D}+)\\s*[xX]\\s*(${D}+[.,]\\s?${D}{1,2})\\s+(${D}+[.,]\\s?${D}{1,2})\\s*M\\s*[15Il|]\\s*$`,
     'i'
 );
 // `*UŽstatas už pakuote PET` — bottle deposit. We don't surface
@@ -145,6 +145,73 @@ const RECEIPT_NO_HEADER_RE = /[KA][vouy]ito\s+(?:numeri|nr\.?)/i;
 // with the number captured. Used by parseFooter + the top-scan
 // fallback to extract the value.
 const RECEIPT_NO_CAPTURE_RE = /[KA][vouy]ito\s+(?:numeri\S*|nr\.?)\s+(\d+)/i;
+
+// ROW-RECONSTRUCTED receipt number. Norfa fragments "# Kvito numeris
+// NNNNN #" into 2-4 same-row OCR boxes, frequently OUT of x-order
+// ("numeris 378069" sorts before "# Kvito" by yTop) and sometimes
+// garbled ("nume is" for "numeris"). Joining the row's boxes in x-order
+// and matching a tolerant pattern recovers the number every time it
+// survived OCR: `num\w*` eats "numeri"/"nume", the optional short word
+// swallows a split "is", and the 4+ digit run is the number.
+const RECEIPT_NO_ROW_RE = /[KA][vouy]ito\s+num\w*(?:\s+\w{1,3})?\s+(\d{4,})/i;
+/** Same-row boxes as `seed` (≥50% y-overlap), x-sorted. */
+const sameRowBoxes = (
+    lines: NorfaLine[],
+    seedIdx: number,
+): { l: NorfaLine; idx: number }[] => {
+    const seed = lines[seedIdx];
+    return lines
+        .map((l, idx) => ({ l, idx }))
+        .filter(({ l }) => {
+            const ov = Math.min(l.yBottom, seed.yBottom) - Math.max(l.yTop, seed.yTop);
+            const minH = Math.min(l.yBottom - l.yTop, seed.yBottom - seed.yTop);
+            return minH > 0 && ov >= 0.5 * minH;
+        })
+        .sort((a, b) => a.l.xLeft - b.l.xLeft);
+};
+const findReceiptNoRow = (
+    lines: NorfaLine[],
+): { yTop: number; yBottom: number; number: string; lastIdx: number } | null => {
+    for (let i = 0; i < Math.min(lines.length, 18); i++) {
+        if (!/[KA][vouy]ito/i.test(lines[i].text)) continue;
+        const row = sameRowBoxes(lines, i);
+        const joined = row.map(({ l }) => l.text).join(' ').replace(/\s+/g, ' ').trim();
+        const m = joined.match(RECEIPT_NO_ROW_RE);
+        if (m) {
+            return {
+                yTop: Math.min(...row.map(({ l }) => l.yTop)),
+                yBottom: Math.max(...row.map(({ l }) => l.yBottom)),
+                number: m[1],
+                lastIdx: Math.max(...row.map(({ idx }) => idx)),
+            };
+        }
+    }
+    return null;
+};
+
+// ROW-RECONSTRUCTED "KVITO SUMA" total. Same fragmentation class as the
+// receipt-no row: "KVIT"(no O) + "SUMA" + "76,78" + "EUR" as four same-row
+// boxes on Pramonės-04-16, so neither box matches `^kvito suma` and both the
+// total value and its visual band were lost. `kvit\w*` tolerates the dropped
+// O; the amount is the rightmost N,NN in the joined row.
+const KVITO_SUMA_ROW_RE = /kvit\w*\s+suma\b/i;
+const findKvitoSumaRow = (
+    lines: NorfaLine[],
+): { yTop: number; yBottom: number; amount: string | null } | null => {
+    for (let i = 0; i < lines.length; i++) {
+        if (!/kvit/i.test(lines[i].text)) continue;
+        const row = sameRowBoxes(lines, i);
+        const joined = row.map(({ l }) => l.text).join(' ').replace(/\s+/g, ' ').trim();
+        if (!KVITO_SUMA_ROW_RE.test(joined)) continue;
+        const amtM = joined.match(/(\d+[.,]\s?\d{1,2})\s*(?:EUR)?\s*$/i);
+        return {
+            yTop: Math.min(...row.map(({ l }) => l.yTop)),
+            yBottom: Math.max(...row.map(({ l }) => l.yBottom)),
+            amount: amtM ? amtM[1] : null,
+        };
+    }
+    return null;
+};
 // Non-catalog checkout items (plastic bags). Same policy as other
 // parsers — skip them entirely. Two routes catch the bag rows:
 //
@@ -287,7 +354,7 @@ function dedupRepeatedText(text: string): string {
             // X,YY M[15] anchor remnant
             before = before
                 .replace(
-                    /\s+[\d0OoIlL]+[.,]\s?[\d0OoIlL]{1,2}\s*M\s*[15]\s*$/i,
+                    /\s+[\d0OoIlL]+[.,]\s?[\d0OoIlL]{1,2}\s*M\s*[15Il|]\s*$/i,
                     '',
                 )
                 .trim();
@@ -341,7 +408,32 @@ export function isNorfaReceipt(lines: string[]): boolean {
 // ───────── boundaries ─────────
 
 function findHeaderEnd(lines: NorfaLine[]): number {
+    // Row-reconstructed receipt-no row wins: it handles the multi-box,
+    // out-of-x-order, garbled ("nume is") fragmentations that the pairwise
+    // scan below can't. Consume through the row's last box so none of it
+    // leaks into the product slice (that leak drew a product band over the
+    // "# Kvito numeris" line on Pramonės-03-26).
+    const rn = findReceiptNoRow(lines);
+    if (rn) return rn.lastIdx + 1;
     for (let i = 0; i < Math.min(lines.length, 20); i++) {
+        // iOS MLKit can split the label ITSELF into two same-row boxes
+        // ("# Kvito" + "numeris 326114") — neither half matches alone, the
+        // scan fell through to the first-price fallback, and its single-
+        // line step buried the first product's (multi-fragment) name row
+        // inside the header: band #1 then had an anchor but no name and
+        // the product vanished (Pramonės-2026-01-15).
+        const next = i + 1 < lines.length ? lines[i + 1] : null;
+        const sameRowNext = next
+            && Math.max(lines[i].yTop, next.yTop) < Math.min(lines[i].yBottom, next.yBottom)
+            ? next : null;
+        if (sameRowNext && !RECEIPT_NO_HEADER_RE.test(lines[i].text)
+            && RECEIPT_NO_HEADER_RE.test(`${lines[i].text} ${sameRowNext.text}`)) {
+            let end = i + 2; // consume both label boxes
+            if (end < lines.length && /^#?\s*\d{3,}\s*#?$/.test(lines[end].text.trim())) {
+                end++; // value split into its own box too
+            }
+            return end;
+        }
         if (RECEIPT_NO_HEADER_RE.test(lines[i].text)) {
             // Header label found. On Android the label + value land
             // on the same OCR line ("# Kvito numeris 67833 #"). On
@@ -505,17 +597,24 @@ function parseFooter(lines: NorfaLine[]): NorfaFooter {
                 total = parseNum(sameLine[1]);
                 trackLine(lines[i], 'total');
             } else {
-                const neighbour = lines[i - 1]?.text ?? lines[i + 1]?.text ?? '';
-                const m = neighbour.match(/(\d+[.,]\s?\d{1,2})\s*EUR/i);
-                if (m) {
+                // Split-box layouts. The old code probed only lines[i-1]
+                // (the `??` never reached i+1 when i-1 existed) and demanded
+                // "EUR" glued to the amount — Pramonės-01-15 prints THREE
+                // boxes on the row: "KVITO SUMA" + "81, 30" + "EUR", and the
+                // total stayed null. Read the SAME-ROW amount box to the
+                // label's right; a lone EUR box may or may not exist.
+                const label = lines[i];
+                const sib = lines.find((o) => o !== label
+                    && o.xLeft >= label.xRight
+                    && Math.max(o.yTop, label.yTop) < Math.min(o.yBottom, label.yBottom)
+                    && /^(\d+[.,]\s?\d{1,2})\s*(?:EUR)?$/i.test(o.text.trim()));
+                const src = sib ?? [lines[i + 1], lines[i - 1]].find(
+                    (n) => n && /(\d+[.,]\s?\d{1,2})\s*EUR/i.test(n.text));
+                const m = src?.text.match(/(\d+[.,]\s?\d{1,2})\s*(?:EUR)?\s*$/i);
+                if (src && m) {
                     total = parseNum(m[1]);
                     trackLine(lines[i], 'total');
-                    // Track the actual neighbour we read from.
-                    if (lines[i - 1] && /(\d+[.,]\s?\d{1,2})\s*EUR/i.test(lines[i - 1].text)) {
-                        trackLine(lines[i - 1], 'total');
-                    } else {
-                        trackLine(lines[i + 1], 'total');
-                    }
+                    trackLine(src, 'total');
                 }
             }
         }
@@ -587,6 +686,14 @@ function parseFooter(lines: NorfaLine[]): NorfaFooter {
         }
     }
 
+    // Row-reconstructed KVITO-SUMA total fallback: the per-line `^kvito suma`
+    // scan above misses the fragmented "KVIT"+"SUMA"+amount+"EUR" split with a
+    // dropped O (Pramonės-04-16), leaving the total null.
+    if (total === null) {
+        const sumRow = findKvitoSumaRow(lines);
+        if (sumRow?.amount) total = parseNum(sumRow.amount);
+    }
+
     // Band the CHOSEN date/time source lines (last-match-wins, so this
     // must run after the loop — an in-loop track would band the
     // loyalty-expiry date row too).
@@ -637,20 +744,21 @@ export function parseNorfaReceipt(rawLines: NorfaLine[]): NorfaParseResult {
     // footer.lineRegions so the photo view bands it — without this
     // the receipt-no field reads but its band silently disappears.
     if (!footer.receiptNo) {
-        for (const l of rawLines) {
-            const m = l.text.match(RECEIPT_NO_CAPTURE_RE);
-            if (m) {
-                footer.receiptNo = m[1];
-                footer.lineRegions.push({
-                    kind: 'receiptNo',
-                    yTop: l.yTop,
-                    yBottom: l.yBottom,
-                    xLeft: l.xLeft,
-                    xRight: l.xRight,
-                });
-                footer.lineRegions.sort((a, b) => a.yTop - b.yTop);
-                break;
-            }
+        // Row-reconstructed capture handles the multi-box, out-of-x-order,
+        // "nume is"-garbled header fragmentations that the pairwise scan
+        // below misses (Pramonės-03-26/04-09/04-23 all fell back to a
+        // synthetic id even though the number survived OCR).
+        const rn = findReceiptNoRow(rawLines);
+        if (rn) {
+            footer.receiptNo = rn.number;
+            footer.lineRegions.push({
+                kind: 'receiptNo',
+                yTop: rn.yTop,
+                yBottom: rn.yBottom,
+                xLeft: 0,
+                xRight: 0,
+            });
+            footer.lineRegions.sort((a, b) => a.yTop - b.yTop);
         }
     }
     // Synthetic fallback id (IKI idiom): when NO printed identifier
@@ -839,7 +947,7 @@ const isPartialBuyLine = (line: NorfaLine): boolean => {
 // has no canonical anchor and gets absorbed into the next product's
 // band. Both regexes are deliberately whole-line (`^…$`) to keep the
 // glue tight — anything more than the bare fragment skips.
-const NORFA_VAT_LETTER_RE = /^\s*M\s*[15]\s*$/i;
+const NORFA_VAT_LETTER_RE = /^\s*M\s*[15Il|]\s*$/i;
 const BARE_PRICE_FRAGMENT_RE = /^\s*\d+[.,]\s?\d{1,2}\s*$/;
 
 // Fused-anchor tail regexes — match the anchor portion at the END of
@@ -853,11 +961,11 @@ const BARE_PRICE_FRAGMENT_RE = /^\s*\d+[.,]\s?\d{1,2}\s*$/;
 // to end in digits doesn't false-match), and `\s*$` requires the
 // tail to be at the literal end of the line.
 const FUSED_WEIGHABLE_TAIL_RE = new RegExp(
-    `\\s+(${D}+[.,]\\s?${D}{1,3}\\s*x\\s*${D}+[.,]\\s?${D}{1,2}\\s+${D}+[.,]\\s?${D}{1,2}\\s*M\\s*[15])\\s*$`,
+    `\\s+(${D}+[.,]\\s?${D}{1,3}\\s*x\\s*${D}+[.,]\\s?${D}{1,2}\\s+${D}+[.,]\\s?${D}{1,2}\\s*M\\s*[15Il|])\\s*$`,
     'i'
 );
 const FUSED_PRICE_TAIL_RE = new RegExp(
-    `\\s+(${D}+[.,]\\s?${D}{1,2}\\s*M\\s*[15])\\s*$`,
+    `\\s+(${D}+[.,]\\s?${D}{1,2}\\s*M\\s*[15Il|])\\s*$`,
     'i'
 );
 
@@ -993,8 +1101,82 @@ const classifyLineReason = (line: NorfaLine): NorfaLineReason => {
 const ROW_MERGE_YTOP_THRESHOLD_PX = 30;
 const ROW_MERGE_CENTER_RATIO = 0.4;
 
+/** Folded token set for the double-read dedupe. */
+const dedupeTokens = (s: string): Set<string> => {
+    const folded = s.toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '');
+    return new Set(folded.split(/[^a-z0-9]+/).filter((t) => t.length >= 2));
+};
+const letterCount = (s: string): number =>
+    (s.match(/[A-Za-zĄČĘĖĮŠŲŪŽąčęėįšųūž]/g) ?? []).length;
+
+/** Merge a same-row plain fragment into `target` in xLeft READING order.
+ *  Pairwise concat is not enough with 3+ boxes: on Pramonės-01-15 the name
+ *  row split into "*Žuvies filės kepsneliai"(x78) + "1kg"(x1622) +
+ *  "su daržovėmis,"(x1044), and yTop arrival order glued the 1kg into the
+ *  middle. Keep the fragment list and rebuild sorted by each fragment's
+ *  own xLeft. */
+const mergePlainFragment = (target: NorfaLine, line: NorfaLine): void => {
+    const frags: { text: string; xLeft: number }[] =
+        (target as { frags?: { text: string; xLeft: number }[] }).frags
+        ?? [{ text: target.text.trim(), xLeft: target.xLeft }];
+    frags.push({ text: line.text.trim(), xLeft: line.xLeft });
+    frags.sort((a, b) => a.xLeft - b.xLeft);
+    (target as { frags?: { text: string; xLeft: number }[] }).frags = frags;
+    target.text = frags.map((f) => f.text).join(' ').replace(/\s+/g, ' ').trim();
+    target.yTop = Math.min(target.yTop, line.yTop);
+    target.yBottom = Math.max(target.yBottom, line.yBottom);
+    target.xLeft = Math.min(target.xLeft, line.xLeft);
+    target.xRight = Math.max(target.xRight, line.xRight);
+};
+
 const mergeRowFragments = (rawLines: NorfaLine[]): NorfaLine[] => {
-    const sorted = [...rawLines].sort((a, b) => a.yTop - b.yTop);
+    // DOUBLE-READ dedupe pre-pass: MLKit re-reads a printed row as two
+    // heavily x-overlapping boxes offset vertically by up to ~0.9 of the
+    // row height ("'Beatos Virtuvė' juod.duon…" + "Virtuve' juod.duon…",
+    // "Fas. obuoliai CHAMPION 65+…" + "obuoliai CHAMPION 65t…" on
+    // Pramonės-01-15) — without suppression the reads CONCATENATE and the
+    // name doubles. A pair is a double-read when the boxes x-overlap
+    // (≥60% of the smaller), share tokens (≥60% of the smaller set), and
+    // touch vertically; keep the read with more LETTERS — names are
+    // letters, while jammed calc noise is digits, so the fuller name wins.
+    // Different physical rows never trip this: adjacent rows don't
+    // y-overlap on this source, and name-vs-continuation rows share few
+    // tokens.
+    // STRUCTURAL lines (standalone anchors, partial-buy rows) never
+    // participate: an anchor's tokens are a subset of a fused
+    // name+anchor read at full x-overlap ("1,89 M1" inside "Virtuve'
+    // juod.duon… 1,89 M1"), and letting the dedupe eat the anchor box
+    // cost a band its anchor — two products collapsed into one.
+    const isStructuralLine = (l: NorfaLine): boolean =>
+        isPositivePriceLine(l) || isPartialBuyLine(l);
+    const dropped = new Set<NorfaLine>();
+    for (let a = 0; a < rawLines.length; a++) {
+        const A = rawLines[a];
+        if (dropped.has(A) || isStructuralLine(A)) continue;
+        for (let b = a + 1; b < rawLines.length; b++) {
+            const B = rawLines[b];
+            if (dropped.has(B) || isStructuralLine(B)) continue;
+            const yOv = Math.min(A.yBottom, B.yBottom) - Math.max(A.yTop, B.yTop);
+            if (yOv <= 0) continue;
+            const xOv = Math.min(A.xRight, B.xRight) - Math.max(A.xLeft, B.xLeft);
+            const minW = Math.min(A.xRight - A.xLeft, B.xRight - B.xLeft);
+            if (minW <= 0 || xOv < 0.6 * minW) continue;
+            const ta = dedupeTokens(A.text);
+            const tb = dedupeTokens(B.text);
+            if (ta.size === 0 || tb.size === 0) continue;
+            let hit = 0;
+            for (const t of ta) if (tb.has(t)) hit++;
+            if (hit / Math.min(ta.size, tb.size) < 0.6) continue;
+            const dropA = letterCount(B.text) > letterCount(A.text)
+                || (letterCount(B.text) === letterCount(A.text)
+                    && B.text.trim().length > A.text.trim().length);
+            dropped.add(dropA ? A : B);
+            if (dropA) break; // A is gone — stop pairing against it
+        }
+    }
+    const kept = rawLines.filter((l) => !dropped.has(l)).map((l) => ({ ...l }));
+
+    const sorted = kept.sort((a, b) => a.yTop - b.yTop);
     const out: NorfaLine[] = [];
     for (const line of sorted) {
         if (out.length === 0) {
@@ -1031,6 +1213,24 @@ const mergeRowFragments = (rawLines: NorfaLine[]): NorfaLine[] => {
             continue;
         }
         if (!lineIsStructural && lastIsStructural) {
+            // A plain fragment arriving AFTER a structural line can still
+            // belong to the same physical row as the plain line BEFORE the
+            // structural one — "35%), 1 kg"(x384) spliced, then the weighed
+            // calc, then "nis nei"(x74): without merging, the two name
+            // fragments stay separate and the name assembles out of order
+            // ("…35%), 1 kg nis nei" instead of "…nis nei 35%), 1 kg").
+            const prevPlain = out.length >= 2 ? out[out.length - 2] : null;
+            if (prevPlain
+                && !(isPositivePriceLine(prevPlain) || isPartialBuyLine(prevPlain))) {
+                const pH = Math.min(line.yBottom - line.yTop, prevPlain.yBottom - prevPlain.yTop);
+                const pDist = Math.abs(
+                    (line.yTop + line.yBottom) / 2 - (prevPlain.yTop + prevPlain.yBottom) / 2,
+                );
+                if (pH > 0 && pDist < pH * ROW_MERGE_CENTER_RATIO) {
+                    mergePlainFragment(prevPlain, line);
+                    continue;
+                }
+            }
             out.splice(out.length - 1, 0, { ...line });
             continue;
         }
@@ -1071,17 +1271,11 @@ const mergeRowFragments = (rawLines: NorfaLine[]): NorfaLine[] => {
             continue;
         }
 
-        // Both plain text on the same row → merge by xLeft order so
-        // column boxes glue back into reading order.
-        const merged = last.xLeft <= line.xLeft
-            ? `${lastText} ${lineText}`
-            : `${lineText} ${lastText}`;
-        last.text = merged.replace(/\s+/g, ' ').trim();
-        last.yTop = Math.min(last.yTop, line.yTop);
-        last.yBottom = Math.max(last.yBottom, line.yBottom);
-        last.xLeft = Math.min(last.xLeft, line.xLeft);
-        last.xRight = Math.max(last.xRight, line.xRight);
+        // Both plain text on the same row → merge in xLeft reading order
+        // (see mergePlainFragment).
+        mergePlainFragment(last, line);
     }
+    for (const l of out) delete (l as { frags?: unknown }).frags;
 
     // Second pass: glue adjacent VAT-letter + bare-price pairs that
     // ended up separated by the structural-splice logic. MLKit
@@ -1316,17 +1510,67 @@ const computeBandsContextV2 = (rawLines: NorfaLine[]): NorfaBandsContext => {
         : 0;
     const centerOf = (line: NorfaLine) => (line.yTop + line.yBottom) / 2;
 
-    for (let bi = 0; bi < internal.length; bi++) {
-        const band = internal[bi];
+    // First pass: y-center membership against each band's walls.
+    const kept: { anchorIdx: number; topWall: number; bottomWall: number; memberIdxs: number[] }[] = [];
+    for (const band of internal) {
         const memberIdxs: number[] = [];
         for (let k = 0; k < productSlice.length; k++) {
             const c = centerOf(productSlice[k]);
             if (c > band.topWall && c <= band.bottomWall) memberIdxs.push(k);
         }
         if (memberIdxs.length === 0) continue;
+        kept.push({ anchorIdx: band.anchorIdx, topWall: band.topWall, bottomWall: band.bottomWall, memberIdxs });
+    }
 
-        const visTop = Number.isFinite(band.topWall) ? band.topWall : sliceTop;
-        const visBottom = Number.isFinite(band.bottomWall) ? band.bottomWall : sliceBottom;
+    // STRANDED-NAME reassignment (Pramonės-03-19 "*Piešt. dezodorantas…"):
+    // when a product's name row overlaps the price row of the product ABOVE
+    // it, y-center membership files that name under the previous band, so the
+    // real owner (whose only content is a bare anchor) parses name-less and is
+    // skipped. Move it down — but ONLY under strict guards so a legitimately
+    // multi-line name or an anchor's own detail row can't be torn off:
+    //   (a) the next band has NO real name of its own (it needs one),
+    //   (b) this band has ≥2 real names (it won't be left name-less),
+    //   (c) the stranded row is this band's BOTTOMMOST real name,
+    //   (d) it sits BELOW this band's anchor (a name under its own anchor is
+    //       anomalous; a name above the NEXT anchor is that product's name),
+    //   (e) and ABOVE the next band's anchor.
+    const hasLetters = /[A-Za-zĄČĘĖĮŠŲŪŽąčęėįšųūž]/;
+    const isRealNameIdx = (k: number): boolean => {
+        const l = productSlice[k];
+        return classifyLineReason(l) === 'name'
+            && !isPositivePriceLine(l) && !isPartialBuyLine(l)
+            && hasLetters.test(l.text);
+    };
+    for (let j = 0; j + 1 < kept.length; j++) {
+        const cur = kept[j];
+        const nxt = kept[j + 1];
+        const curNames = cur.memberIdxs.filter((k) => k !== cur.anchorIdx && isRealNameIdx(k));
+        const nxtNames = nxt.memberIdxs.filter((k) => k !== nxt.anchorIdx && isRealNameIdx(k));
+        if (nxtNames.length !== 0 || curNames.length < 2) continue;
+        const stranded = curNames.reduce((a, b) => (productSlice[b].yTop > productSlice[a].yTop ? b : a));
+        const sTop = productSlice[stranded].yTop;
+        if (sTop <= productSlice[cur.anchorIdx].yTop) continue;
+        if (sTop >= productSlice[nxt.anchorIdx].yTop) continue;
+        cur.memberIdxs = cur.memberIdxs.filter((k) => k !== stranded);
+        nxt.memberIdxs = [...nxt.memberIdxs, stranded].sort((a, b) => a - b);
+    }
+
+    for (let bi = 0; bi < kept.length; bi++) {
+        const band = kept[bi];
+        const { memberIdxs } = band;
+        // CONTENT-HULL crop (same as the Rimi parser): the visual band is the
+        // hull of its MEMBER lines, not the logical walls. When a name row's
+        // bbox overlaps the price row above it (tight line spacing), a
+        // wall-bounded crop chops the name's top even though membership is
+        // correct — extending to the member hull shows the full name. Adjacent
+        // crops may overlap a few px in the shared boundary; for a review tool
+        // showing full content beats a clean-but-chopping cut.
+        const memberTop = Math.min(...memberIdxs.map((k) => productSlice[k].yTop));
+        const memberBottom = Math.max(...memberIdxs.map((k) => productSlice[k].yBottom));
+        const wallTop = Number.isFinite(band.topWall) ? band.topWall : sliceTop;
+        const wallBottom = Number.isFinite(band.bottomWall) ? band.bottomWall : sliceBottom;
+        const visTop = Math.min(wallTop, memberTop);
+        const visBottom = Math.max(wallBottom, memberBottom);
         productBands.push({
             kind: 'product',
             yTop: visTop,
@@ -1361,17 +1605,19 @@ const computeBandsContextV2 = (rawLines: NorfaLine[]): NorfaBandsContext => {
     bands.push(...productBands);
 
     // Footer bands (visual only — receipt-no, datetime, total).
-    for (const line of footerSlice) {
-        const t = line.text.trim();
-        if (RECEIPT_NO_HEADER_RE.test(t) || /^\d{4,}\s*#?\s*$/.test(t)) {
-            bands.push({
-                kind: 'receipt-no',
-                yTop: line.yTop,
-                yBottom: line.yBottom,
-                label: 'nr',
-            });
-            break;
-        }
+    // Receipt-no band: the "Kvito numeris N" label can be in the HEADER
+    // (Pramonės-03-19 prints it at the top, not the footer). Row-reconstruct
+    // the whole label row (multi-box, out-of-x-order, "nume is" garble) and
+    // band its full hull — the old bare-"\d{4,}" fallback matched the "2026
+    // metų pirkinių suma" year, and the pairwise scan missed 3-4-box splits.
+    const rnBand = findReceiptNoRow(rawLines);
+    if (rnBand) {
+        bands.push({
+            kind: 'receipt-no',
+            yTop: rnBand.yTop,
+            yBottom: rnBand.yBottom,
+            label: 'nr',
+        });
     }
     // Timestamp band: prefer the fused "date + time" row (tolerant
     // separators, space-after-colon) so the loyalty-expiry date rows
@@ -1392,15 +1638,18 @@ const computeBandsContextV2 = (rawLines: NorfaLine[]): NorfaBandsContext => {
             label: 'date',
         });
     }
-    for (const line of footerSlice) {
-        if (/^kvito\s+suma/i.test(line.text.trim())) {
+    {
+        // Row-reconstructed "KVITO SUMA" band (handles the "KVIT"+"SUMA"
+        // split with a dropped O on Pramonės-04-16, which the per-line
+        // `^kvito suma` scan missed entirely).
+        const sumRow = findKvitoSumaRow(footerSlice);
+        if (sumRow) {
             bands.push({
                 kind: 'total',
-                yTop: line.yTop,
-                yBottom: line.yBottom,
+                yTop: sumRow.yTop,
+                yBottom: sumRow.yBottom,
                 label: 'sum',
             });
-            break;
         }
     }
 
@@ -1452,15 +1701,15 @@ export function traceReceiptBandsNorfa(rawLines: NorfaLine[]): string {
         );
     }
 
-    const internal = findProductBandsInternalV2(ctx.productSlice);
-    const anchorSet = new Set(internal.map((b) => b.anchorIdx));
+    // Membership comes from the FINAL productInternals (post the stranded-name
+    // reassignment), not a fresh wall recompute — otherwise the trace overlay
+    // mislabels a reassigned name row vs. what the parser actually extracted.
+    const anchorSet = new Set(ctx.productInternals.map((b) => b.anchor.sliceIdx));
     const inBand = new Map<number, number>();
-    const centerOf = (line: NorfaLine) => (line.yTop + line.yBottom) / 2;
-    for (let bi = 0; bi < internal.length; bi++) {
-        const band = internal[bi];
-        for (let k = 0; k < ctx.productSlice.length; k++) {
-            const c = centerOf(ctx.productSlice[k]);
-            if (c > band.topWall && c <= band.bottomWall) inBand.set(k, bi + 1);
+    for (let bi = 0; bi < ctx.productInternals.length; bi++) {
+        const b = ctx.productInternals[bi];
+        for (const e of [b.anchor, ...b.preName, ...b.postAnchor]) {
+            inBand.set(e.sliceIdx, bi + 1);
         }
     }
     const tag = (line: NorfaLine, sliceIdx: number): string => {
@@ -1530,6 +1779,7 @@ export function extractNorfaProduct(internal: NorfaBandInternal): NorfaExtractRe
     let quantity = 1;
     let unit = 'vnt';
     let pricePerUnit: number | null = null;
+    let intMultibuy = false;
 
     const weighMatch = anchorText.match(WEIGHABLE_RE);
     const weighIntMatch = weighMatch ? null : anchorText.match(WEIGHABLE_INT_RE);
@@ -1548,11 +1798,13 @@ export function extractNorfaProduct(internal: NorfaBandInternal): NorfaExtractRe
         }
     } else if (weighIntMatch) {
         // Integer-qty multi-buy (e.g. "2x2,15 4,30 M1"). qty is
-        // always integer here so unit is `vnt`, never `kg`.
+        // integer, so unit is `vnt` by default — but see the whole-bag
+        // weighable reclassification after the name is built.
         quantity = parseNum(weighIntMatch[1]);
         pricePerUnit = parseNum(weighIntMatch[2]);
         price = parseNum(weighIntMatch[3]);
         unit = 'vnt';
+        intMultibuy = true;
     } else {
         const priceMatch = anchorText.match(PRICE_RE);
         if (!priceMatch) {
@@ -1635,6 +1887,7 @@ export function extractNorfaProduct(internal: NorfaBandInternal): NorfaExtractRe
                     quantity = parseNum(m[1]);
                     pricePerUnit = parseNum(m[2]);
                     unit = 'vnt';
+                    intMultibuy = true; // whole-bag weighable check runs post-name
                 }
             }
             continue;
@@ -1849,6 +2102,23 @@ export function extractNorfaProduct(internal: NorfaBandInternal): NorfaExtractRe
     const tailName = sizeSuffixes.join(' ').trim();
     const name = [headName, tailName].filter(Boolean).join(' ').trim();
 
+    // WHOLE-BAG WEIGHABLE: pre-packed weighed produce bought as a whole bag
+    // prints an INTEGER qty ("Bulvės fasuotos 10kg" weighed at 10.000 kg →
+    // "10x0,37 3,70 M1"), which looks identical to a count multibuy. It is a
+    // weighable (10 kg × 0,37 €/kg), not 10 units. Reclassify ONLY when the
+    // product's OWN name carries the exact "<qty>kg" pack size AND qty ≥ 5:
+    // that pins it to a produce bag (5/10/25 kg) and rules out a 2-3× pack of
+    // a small item. Corpus scan: this fires on exactly one product (the
+    // potato) across every Norfa receipt, zero false hits. Same total either
+    // way — only qty/unit change — so a stray hit can't distort the price.
+    if (intMultibuy && quantity >= 5) {
+        const kgInName = name.match(/(\d+)\s*kg\b/i);
+        if (kgInName && parseInt(kgInName[1], 10) === quantity) {
+            unit = 'kg';
+            warnings.push(`whole-bag weighable: ${quantity} kg × ${pricePerUnit} €/kg`);
+        }
+    }
+
     if (!name) {
         return { product: null, warnings: ['skip:no-name'], foreignDiscountEur };
     }
@@ -1901,9 +2171,30 @@ export function extractNorfaProduct(internal: NorfaBandInternal): NorfaExtractRe
         ...internal.postAnchor.map((e) => e.line),
     ];
 
+    // Pack size from the name ("…, 1kg" / "…, 300g" / "…, 1l") — the
+    // matcher's size signal. Reuses the Rimi extractor (same shared
+    // module, same OCR garble classes: "lkg" reads as 1 kg). When a size
+    // WAS lifted from the name, the name DROPS it — amount/unit carry it
+    // structured, so "…, 1 kg" tails in display names are duplication.
+    // Letter floor keeps a size-only garble from emptying the name.
+    //
+    // Weighed items without a size token in the printed name ("Kepta
+    // strimėlė garstyčių marinate 0,214x6,35") default to 1 kg: the
+    // qty×€/kg calc proves the product is sold by weight, and the
+    // catalog reference for weighables is the per-kg price.
+    const pack = extractPackSize(name);
+    let displayName = name;
+    if (pack.amount != null && letterCount(pack.strippedName) >= 4) {
+        displayName = pack.strippedName;
+    }
+    if (pack.amount == null && unit === 'kg') {
+        pack.amount = 1;
+        pack.unit = 'kg';
+    }
+
     return {
         product: {
-            name,
+            name: displayName,
             price,
             promoPrice,
             quantity,
@@ -1914,6 +2205,8 @@ export function extractNorfaProduct(internal: NorfaBandInternal): NorfaExtractRe
             isWeighable: unit === 'kg',
             rawLines: allLines.map((l) => l.text),
             region: regionOf(allLines),
+            parsedAmount: pack.amount,
+            parsedUnit: pack.unit,
         },
         warnings,
         foreignDiscountEur,
