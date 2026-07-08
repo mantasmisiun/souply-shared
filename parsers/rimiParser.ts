@@ -1378,6 +1378,15 @@ export function extractPackSize(
     // would read "1l" as 11 kg. The ", 1 kg" reference suffix is the only
     // shape this appears in, so the fold is exact.
     preStripped = preStripped.replace(/(,\s*)1l\s*kg\b/gi, (_m, pre) => `${pre}1 kg`);
+    // Letter-FUSED size: OCR drops the space before the weight so it welds
+    // onto the previous word ("…baravykais500g" for "…baravykais 500 g" on
+    // Norfa-04-09). Insert a space before a 2-4 digit run that is immediately
+    // followed by g/ml, so the size patterns below can see it. Guarded to
+    // g/ml + 2-4 digits so brand-code tails ("GAR2", "RIO3") never split.
+    preStripped = preStripped.replace(
+        /([A-Za-zĄČĘĖĮŠŲŪŽąčęėįšųūž])(\d{2,4}\s?(?:g|ml)\b)/g,
+        (_m, ch, size) => `${ch} ${size}`,
+    );
 
     // Milk-volume OCR fix: receipt prints "rieb., 2 l" (riebumas = fat
     // content, followed by litre volume) but iOS MLKit fuses the
@@ -1493,6 +1502,28 @@ export function extractPackSize(
         }
     }
 
+    // COUNT×UNIT-WEIGHT pack ("20x1,5 g" = 20 tea bags × 1,5 g). The count
+    // and per-item weight multiply to the net pack weight (30 g), which is
+    // what the catalog stores. Requires a g/ml unit suffix so a bare "NxM"
+    // multibuy (qty × price, no unit) can't match. Runs before the size
+    // patterns, which would otherwise read the tail "1,5 g" as the size.
+    const COUNT_X_WEIGHT_RE = new RegExp(
+        `\\b(${D}+)\\s*[xX]\\s*(${D}+(?:[.,]${D}+)?)\\s*(g|ml)\\b`,
+        'i',
+    );
+    const cxw = preStripped.match(COUNT_X_WEIGHT_RE);
+    if (cxw) {
+        const n = parseFloat(cxw[1].replace(/,/g, '.').replace(/[Oo]/g, '0').replace(/[IlLi]/g, '1'));
+        const per = parseFloat(cxw[2].replace(/,/g, '.').replace(/[Oo]/g, '0').replace(/[IlLi]/g, '1'));
+        const unit = cxw[3].toLowerCase();
+        if (Number.isFinite(n) && Number.isFinite(per) && n > 0 && per > 0) {
+            const strippedName = preStripped
+                .replace(COUNT_X_WEIGHT_RE, ' ')
+                .replace(/\s+,\s*/g, ', ').replace(/,\s*$/g, '').replace(/\s{2,}/g, ' ').trim();
+            return { amount: Math.round(n * per * 1000) / 1000, unit, strippedName };
+        }
+    }
+
     // Dual-unit tokens like "75ml/75g" — Lithuanian solid/semi-solid
     // foods (ice cream, yogurt, pudding) print both the volume and the
     // legal net mass. EU labeling requires mass as the authoritative
@@ -1571,9 +1602,19 @@ export function extractPackSize(
         // "100c" — the g read as c ("Poesia 100c A"). \b after c blocks "cm";
         // an optional trailing VAT letter is tolerated at the end.
         { re: new RegExp(`\\b(${D}{2,4})\\s*c\\b\\.?\\s*(?:[AB]\\s*)?$`, 'i'), unit: 'g'  },
+        // Comma-delimited fused "Nl" ("pienas 3.5%, 1l, butelis" — Norfa
+        // prints the volume with no space). STRICT digits, unlike the
+        // D-class patterns below: a no-space `l` with letter-substitutes
+        // would read words like "Oil" as 1 l — the comma boundary plus
+        // real digits make the token unambiguous.
+        { re: /(?:^|,)\s*([1-9](?:[.,]\d{1,2})?)l\b\.?/i,             unit: 'l'  },
         { re: new RegExp(`\\b(${D}+[.,]${D}+)\\s*l\\b`, 'i'),         unit: 'l'  },
         { re: new RegExp(`\\b(${D}+)\\s+l\\b`, 'i'),                  unit: 'l'  },
         { re: new RegExp(`\\b(${D}+(?:[.,]${D}+)?)\\s*kg\\b`, 'i'),   unit: 'kg' },
+        // "gr" abbreviation for grams ("250gr" on Norfa-04-02). Placed
+        // before the plain-g pattern, which can't match "250gr" (no word
+        // boundary after the g) and would otherwise fall through to vnt.
+        { re: new RegExp(`\\b(${D}+(?:[.,]${D}+)?)\\s*gr\\b`, 'i'),   unit: 'g'  },
         { re: new RegExp(`\\b(${D}+(?:[.,]${D}+)?)\\s*g\\b`, 'i'),    unit: 'g'  },
         { re: new RegExp(`\\b(${D}+)\\s*rit\\b\\.?`, 'i'),            unit: 'rit' },
         { re: new RegExp(`\\b(${D}+)\\s*sk\\b`, 'i'),                  unit: 'sk' },
