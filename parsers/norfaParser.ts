@@ -526,6 +526,22 @@ function parseHeader(lines: NorfaLine[]): NorfaHeader {
                     }
                 }
                 storeAddress = storeAddress.replace(/,\s*$/, '');
+            } else {
+                // Same-row reconstruction: Norfa splits "Pramonės g. 6,
+                // Šiauliai" into a street box + a "6, Šiauliai" box that
+                // sorts FIRST by yTop (right column, higher on the page), so
+                // neither half matches the address regex alone and the store
+                // read empty (Pramonės-04-23). Join the row's boxes in
+                // x-order and re-match.
+                const row = sameRowBoxes(lines, idx);
+                if (row.length > 1) {
+                    const joined = row.map(({ l }) => l.text).join(' ').replace(/\s+/g, ' ').trim();
+                    const jm = joined.match(NORFA_ADDRESS_LINE_RE);
+                    if (jm && jm.index !== undefined) {
+                        storeAddress = joined.slice(jm.index).trim().replace(/,\s*$/, '');
+                        for (const { idx: ri } of row) trackLine(lines[ri], 'storeAddress');
+                    }
+                }
             }
         }
         if (!storeCode && /KASA\s*Nr/i.test(t)) {
