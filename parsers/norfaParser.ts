@@ -1035,7 +1035,11 @@ const PARTIAL_INT_PARTS_RE = new RegExp(
 );
 
 const splitFusedAnchorLine = (line: NorfaLine): [NorfaLine, NorfaLine] | null => {
-    const trimmed = line.text.trim();
+    // OCR doubles the decimal comma ("kiaušiniai A 5x2,,15" on 01-15) —
+    // PRICE_TOK stops at the second comma and the whole multipack tail
+    // stays inside the name (price then ships as the LINE TOTAL). Fold
+    // before tail matching; a legit name never contains ",,".
+    const trimmed = line.text.trim().replace(/,\s*,+/g, ',');
     // Already a clean anchor — nothing to split.
     if (PRICE_RE.test(trimmed)) return null;
     if (WEIGHABLE_RE.test(trimmed)) return null;

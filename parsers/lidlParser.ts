@@ -170,10 +170,13 @@ const DISCOUNT_RE = new RegExp(`^-\\s*(\\d+[.,]\\s?${D}{1,2})\\s*[A-Z]?\\s*$`);
 // X-MARKER class for the multiplier between ppu and qty: Latin x/X/k,
 // Cyrillic ka к/К AND kha х(U+0445) — Lidl thermal OCR reads the "×" as any
 // of these (the Arbuzai weighed rows use Cyrillic kha). Shared by every
-// weighable regex so extraction AND name-stripping agree.
+// weighable regex so extraction AND name-stripping agree. The recognisers
+// allow the marker DOUBLED ({1,2}) — Android's fused OCR double-reads it
+// ("0,99 xX 2,000 €/vnt.", 2025.08.18 lidl receipt), which used to defeat
+// UNIT_LINE_RE and leak the whole calc line into the product name.
 const X_MARK = 'xXkКкх×';
 const UNIT_LINE_RE = new RegExp(
-    `^\\s*(?:(\\d+[.,_]\\s?${D}{1,2})\\s*)?[>×|]?\\s*[${X_MARK}]\\s*(\\d+(?:[.,_]\\s?${D}{1,3})?)\\s*(kg|[€£]\\s*/\\s*vnt\\.?|[€£]\\s*/\\s*kg)`,
+    `^\\s*(?:(\\d+[.,_]\\s?${D}{1,2})\\s*)?[>×|]?\\s*[${X_MARK}]{1,2}\\s*(\\d+(?:[.,_]\\s?${D}{1,3})?)\\s*(kg|[€£]\\s*/\\s*vnt\\.?|[€£]\\s*/\\s*kg)`,
     'i'
 );
 // OCR-split unit line halves. Decimal optional in both (integer
@@ -182,7 +185,7 @@ const UNIT_LINE_RE = new RegExp(
 // feed extractLidlProduct's split-half recovery — without it the
 // halves leaked into the product NAME and the qty (and, for
 // weighables, the kg signal) was lost.
-const UNIT_HEAD_RE = new RegExp(`^\\s*(\\d+[.,_]\\s?${D}{1,2})\\s*[>×|]?\\s*[${X_MARK}]\\s*$`);
+const UNIT_HEAD_RE = new RegExp(`^\\s*(\\d+[.,_]\\s?${D}{1,2})\\s*[>×|]?\\s*[${X_MARK}]{1,2}\\s*$`);
 const UNIT_TAIL_RE = new RegExp(
     `^\\s*(${D}+(?:[.,_]\\s?${D}{1,3})?)\\s*(kg|[€£]\\s*/\\s*vnt\\.?|[€£]\\s*/\\s*kg)\\s*$`,
     'i'
@@ -207,7 +210,7 @@ const UNIT_ORPHAN_RE = /^\s*[€£]\s*\/\s*(?:vnt\.?|kg)\s*$/i;
 // example). More digits/separators after the captured qty still
 // abort (ambiguous longer number → leave the line alone).
 const UNIT_LENIENT_RE = new RegExp(
-    `^\\s*(\\d+[.,_]\\s?${D}{1,2})\\s*[${X_MARK}]\\s*(\\d+[.,_]\\s?${D}{1,3})(?![\\d.,])`,
+    `^\\s*(\\d+[.,_]\\s?${D}{1,2})\\s*[${X_MARK}]{1,2}\\s*(\\d+[.,_]\\s?${D}{1,3})(?![\\d.,])`,
     'i'
 );
 // Cat X — weighable-style tail with garbage PREFIX. `CEoX 0,343 kg`
@@ -216,7 +219,7 @@ const UNIT_LENIENT_RE = new RegExp(
 // in the line (differentiates from real product names ending in
 // `NNN kg`) and capture the trailing `\d+[.,]\d{1,3} (kg|€/vnt.)`.
 const UNIT_WEIGHT_LENIENT_RE = new RegExp(
-    `[${X_MARK}].*?(\\d+[.,_]\\s?${D}{1,3})\\s*(kg|[€£]\\s*/\\s*vnt\\.?|[€£]\\s*/\\s*kg)\\s*$`,
+    `[${X_MARK}]{1,2}.*?(\\d+[.,_]\\s?${D}{1,3})\\s*(kg|[€£]\\s*/\\s*vnt\\.?|[€£]\\s*/\\s*kg)\\s*$`,
     'i'
 );
 // Cat W — multi-buy qty + name-continuation smoosh: OCR merged the
@@ -335,8 +338,21 @@ function stripDiacritics(s: string): string {
 // receipt, so the fold is unambiguous:
 //   ¿ (inverted question mark U+00BF) → į (i-ogonek) — the ogonek tail reads
 //     as the inverted-? hook ("Karam.ledai su karam. ¿daru" → "…įdaru").
+// Cyrillic lookalikes → Latin (iki-parser parity): Vision emits Cyrillic
+// glyphs for visually identical Latin letters — the VAT letter "А" (U+0410)
+// killed a product's anchor outright (08.14 "9,99 А": PRICE_RE's [A-Z] is
+// ASCII-only, no anchor → "Sparč. fiksavimo spaustuvai" vanished). Lithuanian
+// receipts never print Cyrillic, so the fold is unconditional. NOTE: the
+// multiplier X_MARK class keeps its own Cyrillic entries — folding х→x/к→k
+// upstream only makes those redundant, never wrong.
+const LIDL_CYRILLIC: Record<string, string> = {
+    'А': 'A', 'В': 'B', 'Е': 'E', 'К': 'K', 'М': 'M', 'Н': 'H', 'О': 'O', 'Р': 'P', 'С': 'C', 'Т': 'T', 'Х': 'X', 'У': 'Y', 'І': 'I',
+    'а': 'a', 'е': 'e', 'о': 'o', 'р': 'p', 'с': 'c', 'у': 'y', 'х': 'x', 'і': 'i', 'ѕ': 's', 'к': 'k', 'м': 'm', 'т': 't', 'в': 'b', 'н': 'h',
+};
 function foldLidlHomoglyphs(s: string): string {
-    return s.replace(/¿/g, 'į');
+    let t = s.replace(/¿/g, 'į');
+    if (/[Ѐ-ӿ]/.test(t)) t = t.replace(/[Ѐ-ӿ]/g, (c) => LIDL_CYRILLIC[c] ?? c);
+    return t;
 }
 
 function parseNum(str: string): number {
@@ -523,7 +539,16 @@ function parseHeader(lines: LidlLine[]): LidlHeader {
  */
 function stripBarcodePrefix(name: string): string {
     const m = name.match(BARCODE_PREFIX_RE);
-    return m ? m[2].trim() : name;
+    if (!m) return name;
+    let rest = m[2].trim();
+    // SPLIT article code: OCR breaks the 7-digit code in two ("76051 02
+    // Popier.rankšluosčiai…") — the first strip leaves the tail digits on
+    // the name. Absorb a 1-3 digit continuation ONLY when base + tail =
+    // exactly the 7-digit Lidl code length, so a legit digit-leading name
+    // is never eaten.
+    const cont = rest.match(/^(\d{1,3})\s+(.+)$/);
+    if (cont && m[1].length + cont[1].length === 7) rest = cont[2].trim();
+    return rest;
 }
 
 
@@ -637,7 +662,10 @@ function parseFooter(lines: LidlLine[]): LidlFooter {
     for (let i = 0; i < lines.length; i++) {
         const t = lines[i].text.trim();
 
-        if (/^mok[eė]ti\b/i.test(t)) {
+        // Keyword tolerates the trailing i→1/l/! rot ("Mokėt1", 07.30/iOS —
+        // total lost with 46,10 printed right beside it). "Mokėta (Banko
+        // kortelė)" stays excluded: 'a' is not in the class.
+        if (/^mok[eė]t[i1lI!]\b/i.test(t)) {
             const sameLine = t.match(/(\d+[.,]\s?\d{1,2})/);
             if (sameLine) {
                 total = parseNum(sameLine[1]);
@@ -1278,8 +1306,14 @@ const mergeRowFragmentsLidlClustered = (
 
     const out: LidlLine[] = [];
     for (const cluster of clusters) {
+        // Vision reads a price's leading 0 as ')' ("),49" for 0,49 —
+        // 08.03: the melisa anchor vanished and TWO products fused into one
+        // band, losing melisa). Fold a token-leading ')' before ,dd back to
+        // 0 — no printed lidl token ever starts with ')'.
+        const foldParen = (t: string): string =>
+            t.replace(/(^|\s)\)\s?,\s?(\d{2})(?=\s|$)/g, '$10,$2');
         if (cluster.length === 1) {
-            out.push({ ...cluster[0] });
+            out.push({ ...cluster[0], text: foldParen(cluster[0].text) });
             continue;
         }
         // In-cluster dedup. MLKit on iOS occasionally emits two boxes
@@ -1325,7 +1359,13 @@ const mergeRowFragmentsLidlClustered = (
                 if (/[ĄČĘĖĮŠŲŪŽąčęėįšųūž]/.test(ch)) { score += 1.5; letters++; }
                 else if (/[A-Za-z]/.test(ch)) { score += 1; letters++; }
                 else if (/\d/.test(ch)) { score += 1; digits++; }
-                else if (/[\s.,'\-%]/.test(ch)) score += 0.5;
+                else if (/[.,'\-%]/.test(ch)) score += 0.5;
+                // Whitespace scores 0: garbled twins INJECT mid-word spaces
+                // ("Jav .Dalon. su pan. Ir sok•" = 6 spaces vs the clean
+                // read's 1) and the old +0.5 per space let the garble
+                // outscore the clean read on sheer length (07.28/iOS).
+                // Vision bullets are pure garble markers — never printed.
+                else if (ch === '•' || ch === '·') score -= 2;
                 // Special chars (`|`, `]`, etc.) contribute 0 —
                 // penalises OCR-mangled twins like "Bande]es" or
                 // "UOTTy4|" that interleave noise punctuation with
@@ -1398,6 +1438,30 @@ const mergeRowFragmentsLidlClustered = (
                 const seenNorm = normForSim(seenText);
                 const seenW = seen.xRight - seen.xLeft;
 
+                // Case (C): SINGLE-GLYPH SHARD. A 1-2 char box whose width is
+                // a sliver of a name-like box it x-overlaps is a double-read
+                // shard ("V"/"P" from 08.03 gluing onto "Varšk. surelis…").
+                // Shards start AT the name's left edge, so case (B)'s
+                // barcode protection excludes them, and (A') needs 2+
+                // letters. Barcodes are 4+ chars; the VAT column never
+                // x-overlaps names — both structurally unaffected.
+                const shardOverlap = Math.min(box.xRight, seen.xRight) - Math.max(box.xLeft, seen.xLeft);
+                const nameLikeRe = /[A-Za-zĄČĘĖĮŠŲŪŽąčęėįšųūž]{2,}/;
+                if (
+                    boxText.length <= 2 && boxW < seenW * 0.15 &&
+                    shardOverlap > 0 && nameLikeRe.test(seenText)
+                ) {
+                    dupAction = { kind: 'drop', idx: di };
+                    break;
+                }
+                if (
+                    seenText.length <= 2 && seenW < boxW * 0.15 &&
+                    shardOverlap > 0 && nameLikeRe.test(boxText)
+                ) {
+                    dupAction = { kind: 'replace', idx: di };
+                    break;
+                }
+
                 // Case (A): same-column. Both xLeft and xRight close,
                 // similar widths (>50% length ratio).
                 const xLeftDist = Math.abs(box.xLeft - seen.xLeft);
@@ -1419,12 +1483,25 @@ const mergeRowFragmentsLidlClustered = (
                     /[A-Za-zĄČĘĖĮŠŲŪŽąčęėįšųūž]{2,}/.test(seenText);
                 const sameLeftEdge = xLeftDist < 60 && bothNameLike;
                 if (sameColumn || sameLeftEdge) {
-                    // Pick the cleaner reading by quality score.
-                    if (qualityScore(boxText) > qualityScore(seenText)) {
-                        dupAction = { kind: 'replace', idx: di };
-                    } else {
-                        dupAction = { kind: 'drop', idx: di };
+                    // Pick the cleaner reading by quality score. NEAR-TIE
+                    // (Δ ≤ 1 — "Virta Liaulienne dačra" vs "Virta kiaulienos
+                    // dešra" score identically, 08.18/iOS): fall back to ROW-
+                    // CONSENSUS Y — the garbled second read drifts vertically,
+                    // while the clean read aligns with the row's other boxes
+                    // (barcode, VAT anchor). Keep the read whose yTop is
+                    // nearer the median yTop of the cluster's OTHER members.
+                    const qb = qualityScore(boxText);
+                    const qs = qualityScore(seenText);
+                    let keepBox = qb > qs;
+                    if (Math.abs(qb - qs) < 0.25) {
+                        const others = cluster.filter((c) => c !== box && c !== seen);
+                        if (others.length > 0) {
+                            const ys = others.map((c) => c.yTop).sort((x, y) => x - y);
+                            const cons = ys[Math.floor(ys.length / 2)];
+                            keepBox = Math.abs(box.yTop - cons) < Math.abs(seen.yTop - cons);
+                        }
                     }
+                    dupAction = keepBox ? { kind: 'replace', idx: di } : { kind: 'drop', idx: di };
                     break;
                 }
 
@@ -1432,12 +1509,49 @@ const mergeRowFragmentsLidlClustered = (
                 // (not at the left edge). Smaller corrupted fragment.
                 const xLeftOffset = box.xLeft - seen.xLeft;
                 const xRightOverhang = box.xRight - seen.xRight;
+                // 0.85, not 0.7: a fused barcode+name box's width includes
+                // the code prefix, so its clean name twin measured 74% and
+                // slipped through (08.24 sūrio užtepėlė doubled). Two texts
+                // overlapping 70–85% of a row's width can't be separate
+                // columns (same physical argument as the maxima/rimi gates).
                 const boxIsMidContained =
                     xLeftOffset > 50 &&
                     xRightOverhang < 20 &&
-                    boxW < seenW * 0.7;
+                    boxW < seenW * 0.85;
+                // SAME-CONTENT escape (07.30/iOS): the container can be the
+                // GARBLED read that absorbed the barcode column ("/003/05
+                // Varskes deserlas su cele gab." over the clean nested
+                // "Varškės desertas su želė gab.") — positional containment
+                // alone then drops/keeps the WRONG one. When the contained
+                // text ≈ the container's tail (aligned ≥ 0.55), they are two
+                // reads of the SAME row: pick by quality instead.
+                const tailSim = (shortN: string, longN: string): number => {
+                    if (!shortN.length) return 0;
+                    const tail = longN.slice(-shortN.length);
+                    let m = 0;
+                    for (let k = 0; k < shortN.length; k++) if (shortN[k] === tail[k]) m++;
+                    return m / shortN.length;
+                };
+                // Same-content picks compare quality DENSITY (score/char):
+                // the container absorbed the barcode column's characters, so
+                // its ABSOLUTE score wins on sheer length even though every
+                // real word is dirtier than the clean nested read.
+                const qDensity = (t: string): number =>
+                    t.length > 0 ? qualityScore(t) / t.length : 0;
+                // A container that BEGINS with a barcode-shaped run ([\d/]{4,})
+                // is a fused barcode+name SECOND READ of the row, not a wider
+                // clean read ("330544SvLeslas oz7o" over the nested clean
+                // "Sviestas 82%", 08.24 — heavy rot defeats tailSim, but no
+                // printed lidl NAME ever starts with 4+ digits). Same-content
+                // ⇒ decide by quality density either way.
+                const barcodeFused = (t: string): boolean => /^[\d/]{4,}/.test(t.trim());
                 if (boxIsMidContained) {
-                    dupAction = { kind: 'drop', idx: di };
+                    if (tailSim(boxNorm, seenNorm) >= 0.55 || barcodeFused(seenText)) {
+                        dupAction = qDensity(boxText) > qDensity(seenText)
+                            ? { kind: 'replace', idx: di } : { kind: 'drop', idx: di };
+                    } else {
+                        dupAction = { kind: 'drop', idx: di };
+                    }
                     break;
                 }
                 // Mirror: seen contained inside box.
@@ -1446,9 +1560,14 @@ const mergeRowFragmentsLidlClustered = (
                 const seenIsMidContained =
                     seenLeftOffset > 50 &&
                     seenRightOverhang < 20 &&
-                    seenW < boxW * 0.7;
+                    seenW < boxW * 0.85;
                 if (seenIsMidContained) {
-                    dupAction = { kind: 'replace', idx: di };
+                    if (tailSim(seenNorm, boxNorm) >= 0.55 || barcodeFused(boxText)) {
+                        dupAction = qDensity(boxText) > qDensity(seenText)
+                            ? { kind: 'replace', idx: di } : { kind: 'drop', idx: di };
+                    } else {
+                        dupAction = { kind: 'replace', idx: di };
+                    }
                     break;
                 }
 
@@ -1540,7 +1659,7 @@ const mergeRowFragmentsLidlClustered = (
             : deduped;
         out.push({
             text: ordered
-                .map((l) => l.text.trim())
+                .map((l) => foldParen(l.text.trim()))
                 .filter(Boolean)
                 .join(' ')
                 .replace(/\s+/g, ' ')
@@ -2209,7 +2328,7 @@ export function extractLidlProduct(internal: LidlBandInternal): LidlExtractResul
                 // 4,032 kg") has no leading letters, so it's fully consumed
                 // as before.
                 const nameHead = text
-                    .replace(new RegExp(`\\s*(?:\\d+[.,_]\\s?${D}{1,2}\\s*)?[>|]?\\s*[${X_MARK}]\\s*\\d+[.,_]\\s?${D}{3}\\s*kg\\s*$`, 'i'), '')
+                    .replace(new RegExp(`\\s*(?:\\d+[.,_]\\s?${D}{1,2}\\s*)?[>|]?\\s*[${X_MARK}]{1,2}\\s*\\d+[.,_]\\s?${D}{3}\\s*kg\\s*$`, 'i'), '')
                     .trim();
                 if (/[A-Za-zĄČĘĖĮŠŲŪŽąčęėįšųūž]{3,}/.test(nameHead)) {
                     nameLines.push(nameHead);
@@ -2299,7 +2418,7 @@ export function extractLidlProduct(internal: LidlBandInternal): LidlExtractResul
     // is untouched.
     head = head
         .replace(
-            new RegExp(`\\s*(?:\\d+[.,_]\\s?${D}{1,2}\\s*)?[>|]?\\s*[${X_MARK}]\\s*\\d+[.,_]\\s?${D}{3}\\s*kg\\s*$`, 'i'),
+            new RegExp(`\\s*(?:\\d+[.,_]\\s?${D}{1,2}\\s*)?[>|]?\\s*[${X_MARK}]{1,2}\\s*\\d+[.,_]\\s?${D}{3}\\s*kg\\s*$`, 'i'),
             '',
         )
         .trim();

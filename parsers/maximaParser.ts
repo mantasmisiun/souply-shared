@@ -142,8 +142,11 @@ const RELAXED_PRICE_RE = /^\d+[.,]\d{2}$/;
 //     tolerates OCR stray spaces inside the decimal group
 //     (`1, 100` instead of `1,100` — seen on bananas).
 const DIGIT_OR_OCR = '[\\d0OoIlL]';
+// `[>»<]?` before the X: OCR sometimes reads the separator as ">X"
+// ("12,94 >X 0,236 kg") — without the tolerance the weighed row leaked into
+// the NEXT product's name as a prefix.
 const UNIT_QTY_RE = new RegExp(
-  `(\\d+[.,]\\s?${DIGIT_OR_OCR}{1,2})\\s*[xX×]\\s*(${DIGIT_OR_OCR}+(?:[.,]\\s?${DIGIT_OR_OCR}{1,3})?)\\s*(k[gqa]|mai[sšŠ]\\.?|vnt\\.?|pak\\.?)`,
+  `(\\d+[.,]\\s?${DIGIT_OR_OCR}{1,2})\\s*[>»<]?\\s*[xX×]\\s*(${DIGIT_OR_OCR}+(?:[.,]\\s?${DIGIT_OR_OCR}{1,3})?)\\s*(k[gqa]|mai[sšŠ]\\.?|vnt\\.?|pak\\.?)`,
   'i'
 );
 
@@ -153,7 +156,7 @@ const UNIT_QTY_RE = new RegExp(
 // numeric substrings from matching. Step 2 defaults the unit to
 // `vnt` for matches against this fallback.
 const UNIT_QTY_NOUNIT_RE =
-  /^\s*(\d+[.,]\s?\d{1,2})\s*[xX×]\s*(\d+(?:[.,]\s?\d{1,3})?)\s*$/i;
+  /^\s*(\d+[.,]\s?\d{1,2})\s*[>»<]?\s*[xX×]\s*(\d+(?:[.,]\s?\d{1,3})?)\s*$/i;
 
 // ── weighed-row rescue net ──
 //
@@ -170,7 +173,7 @@ const UNIT_QTY_NOUNIT_RE =
 // q/a mis-reads UNIT_QTY_RE already tolerates. Absorbing the row keeps
 // band geometry right and routes it to step 2's rescue below.
 const UNIT_QTY_KG_LOOSE_RE =
-  /^\s*[\d0OoIlL][^\sxX×]{0,7}\s*[xX×].{0,14}?k[gqa]\b\.?\s*$/i;
+  /^\s*[\d0OoIlL][^\sxX×]{0,7}\s*[>»<]?\s*[xX×].{0,14}?k[gqa]\b\.?\s*$/i;
 
 // Step-2 rescue: pull just the printed KG QUANTITY out of a loose row
 // so €/kg can be re-derived from the receipt's own arithmetic
@@ -225,7 +228,9 @@ const FOOTER_SEP_RE = /^={10,}\s*#?\s*$/;
 // (`depozitiniai` / `depozitinės`). Missing this caused
 // burger-patty rows to absorb the PET deposit header as their
 // name prefix.
-export const DEPOSIT_LINE_RE = /\b(?:pet|skardin[eė])\s*\(depozitin[eėi][sa]?[is]?\)/i;
+// `\s*\)` — photo OCR pads the paren ("PET (depozitinis )"); the strict `)`
+// missed it and the deposit surfaced as a standalone €0.10 product.
+export const DEPOSIT_LINE_RE = /\b(?:pet|skardin[eė])\s*\(depozitin[eėi][sa]?[is]?\s*\)/i;
 
 // Checkout-only non-catalog items: disposable bags (maišelis) and
 // reusable shopping bags (maišas — "Didelis pirkinių maišas
@@ -293,7 +298,10 @@ export function mergeRowFragmentsMaxima(lines: MaximaLine[]): MaximaLine[] {
   // the cluster's top yTop caps total cluster height at the threshold.
   const clusters: MaximaLine[][] = [];
   let cur: MaximaLine[] = [lines[0]];
-  let curBbox = { yTop: lines[0].yTop, yBottom: lines[0].yBottom };
+  let curBbox = {
+    yTop: lines[0].yTop, yBottom: lines[0].yBottom,
+    xLeft: lines[0].xLeft, xRight: lines[0].xRight,
+  };
   for (let i = 1; i < lines.length; i++) {
     const line = lines[i];
     const yDiff = Math.abs(line.yTop - curBbox.yTop);
@@ -303,36 +311,124 @@ export function mergeRowFragmentsMaxima(lines: MaximaLine[]): MaximaLine[] {
     );
     const lineCenter = (line.yTop + line.yBottom) / 2;
     const clusterCenter = (curBbox.yTop + curBbox.yBottom) / 2;
+    // X-DISJOINT relaxation (kvitas 2026-03-29/iOS): Vision reads the LEFT
+    // and RIGHT halves of one printed row at drifted y ("Latai virta vi%X" +
+    // "nus ucela HEAT…", Δcenter ≈ 25px on 29px lines), failing the center
+    // test — the halves stayed separate lines and the y-sort emitted them in
+    // REVERSE reading order into the product name. Halves of one row never
+    // x-overlap; genuinely STACKED rows always do (both start at the left
+    // column) — so an x-disjoint pair inside the yTop threshold may merge on
+    // the looser full-height center distance.
+    const xOverlap =
+      Math.min(line.xRight, curBbox.xRight) - Math.max(line.xLeft, curBbox.xLeft);
+    const centerDist = Math.abs(lineCenter - clusterCenter);
     const sameRow =
       yDiff < ROW_MERGE_YTOP_THRESHOLD_PX &&
       minH > 0 &&
-      Math.abs(lineCenter - clusterCenter) < minH * ROW_MERGE_CENTER_RATIO;
+      (centerDist < minH * ROW_MERGE_CENTER_RATIO ||
+        (xOverlap <= 0 && centerDist < minH));
     if (sameRow) {
       cur.push(line);
       curBbox.yTop = Math.min(curBbox.yTop, line.yTop);
       curBbox.yBottom = Math.max(curBbox.yBottom, line.yBottom);
+      curBbox.xLeft = Math.min(curBbox.xLeft, line.xLeft);
+      curBbox.xRight = Math.max(curBbox.xRight, line.xRight);
     } else {
       clusters.push(cur);
       cur = [line];
-      curBbox = { yTop: line.yTop, yBottom: line.yBottom };
+      curBbox = { yTop: line.yTop, yBottom: line.yBottom, xLeft: line.xLeft, xRight: line.xRight };
     }
   }
   clusters.push(cur);
+  // CONTAINED-SHARD DROP (kvitas 2026-04-06 "01![{%| DD cucvDc", 2026-05-08
+  // "NATIID NL C"): Vision emits a low-quality PARTIAL second read of a row
+  // as its own short line whose box sits INSIDE the full read's box on both
+  // axes. The shard escaped the same-row cluster (center test) and used to
+  // walk into the product NAME. A genuine second name row never nests: it
+  // sits BELOW (no y-containment), and a right-column price never nests in x.
+  const contained = (a: MaximaLine, b: MaximaLine): boolean => {
+    const ah = a.yBottom - a.yTop, bh = b.yBottom - b.yTop;
+    if (!(ah > 0 && bh > ah)) return false;
+    const yOv = Math.min(a.yBottom, b.yBottom) - Math.max(a.yTop, b.yTop);
+    if (yOv < ah * 0.7) return false;
+    const aw = a.xLeft < a.xRight ? a.xRight - a.xLeft : 0;
+    const xOv = Math.min(a.xRight, b.xRight) - Math.max(a.xLeft, b.xLeft);
+    return aw > 0 && xOv >= aw * 0.6;
+  };
+  const keptClusters = clusters.filter((c) => {
+    if (c.length !== 1) return true;
+    const a = c[0];
+    return !clusters.some((other) => other !== c && other.some((b) => contained(a, b)));
+  });
 
   const out: MaximaLine[] = [];
-  for (const cluster of clusters) {
+  for (const cluster of keptClusters) {
     if (cluster.length === 1) {
       out.push(cluster[0]);
       continue;
     }
-    const sorted = cluster.slice().sort((a, b) => a.xLeft - b.xLeft);
+    // DOUBLE-READ DEDUP: same-row fragments are X-DISJOINT by construction
+    // (name left, price right, VAT letter). Two cluster members whose x-spans
+    // substantially OVERLAP are two READS of the same physical row — the
+    // Android tile/strip fusion (and the iOS ensemble) inject a second, often
+    // differently-garbled copy ("be ant ibiot ikų" + "be antibiotikų"), and
+    // concatenating both shipped DOUBLED product names. Keep the read with
+    // the fewest word-breaks (garbles inject mid-word spaces), preferring
+    // more diacritics on a tie (the higher-fidelity read).
+    const deduped: MaximaLine[] = [];
+    const quality = (l: MaximaLine): number => {
+      const tokens = l.text.trim().split(/\s+/).length;
+      const diacritics = (l.text.match(/[ąčęėįšųūžĄČĘĖĮŠŲŪŽ]/g) ?? []).length;
+      // Digits glued to letters ("NOWAC0", "ŽEMAITIJ0S") are garble reads —
+      // a tie on token count prefers the copy without them.
+      const digitGarbles = (l.text.match(/[A-Za-zĄ-Žą-ž][0O](?=[A-Za-zĄ-Žą-ž\s]|$)|\d[A-Za-zĄ-Žą-ž]/g) ?? []).length;
+      return -tokens * 100 + diacritics * 10 - digitGarbles;
+    };
+    for (const line of cluster) {
+      const w = line.xRight - line.xLeft;
+      const dupIdx = deduped.findIndex((d) => {
+        const dw = d.xRight - d.xLeft;
+        // COMPARABLE COVERAGE is required, not just overlap: a stray 36px
+        // tail re-read ("22,") x-contained inside the full 726px Sutaupėte
+        // row is NOT a double-read of it — treating containment as duplicate
+        // deleted the whole savings row (Majonezo promo lost, the orphaned
+        // "-0,30 A" polluted the next band's name). Two genuine reads of the
+        // same row have near-equal spans.
+        const ratio = Math.min(dw, w) / Math.max(dw, w);
+        if (ratio < 0.5) return false;
+        const overlap = Math.min(d.xRight, line.xRight) - Math.max(d.xLeft, line.xLeft);
+        const minW = Math.min(dw, w);
+        return minW > 0 && overlap > minW * 0.6;
+      });
+      if (dupIdx < 0) {
+        deduped.push(line);
+      } else if (quality(line) > quality(deduped[dupIdx])) {
+        deduped[dupIdx] = line;
+      }
+    }
+    if (deduped.length === 1) {
+      out.push(deduped[0]);
+      continue;
+    }
+    const sorted = deduped.slice().sort((a, b) => a.xLeft - b.xLeft);
     const joined = sorted
       .map((l) => l.text.trim())
       .filter(Boolean)
       .join(' ')
       .replace(/\s+/g, ' ')
       .trim();
-    const text = normalizeIosNumberSpacing(joined);
+    let text = normalizeIosNumberSpacing(joined);
+    // Apple Vision price-token rot (kvitas 2025-11-08: BOTH products lost for
+    // want of an anchor):
+    //  • doubled decimal separator — a split decimal re-reads its comma
+    //    ("7, ,38 A" for 7,38). A double separator never prints; fold
+    //    globally (norfa's ",,"→"," fold is the same confusion class).
+    text = text.replace(/(\d)\s*[.,]\s*[.,]\s?(\d{2})\b/g, '$1,$2');
+    //  • digit-shaped LETTER leading a price token ("S,20 A" for 5,20 — the
+    //    weight row 11,99 × 0,434 corroborates downstream). Anchored to the
+    //    ",\d\d A/B" tail so prose can never fold.
+    text = text.replace(/(^|\s)([SOZB])\s?,\s?(\d{2})(\s*[AB]\b)/g, (_m, pre, ch, cents, tail) =>
+      `${pre}${({ S: '5', O: '0', Z: '2', B: '8' } as Record<string, string>)[ch]},${cents}${tail}`);
     const bbox = {
       yTop: Math.min(...sorted.map((l) => l.yTop)),
       yBottom: Math.max(...sorted.map((l) => l.yBottom)),
@@ -820,6 +916,9 @@ export function cleanProductName(name: string): string {
   // defeat the size strip below and leave "70 g |" inside the name.
   cleaned = cleaned.replace(/[\s|\\/•·–—-]+$/g, "").trim();
   cleaned = cleaned.replace(/,?\s*\d+[\.,]?\d*\s*(g|kg|ml|l|vnt\.?)\s*$/i, "").trim();
+  // Bare piece-count suffix without digits ("ROMANESCO, vnt") — the count (1)
+  // surfaces via extractPackSize; the token is not part of the catalog name.
+  cleaned = cleaned.replace(/,\s*vnt\.?\s*$/i, "").trim();
   cleaned = cleaned.replace(/,\s*$/, "").trim();
   return cleaned;
 }
@@ -830,10 +929,29 @@ export function cleanProductName(name: string): string {
 export function extractPackSize(rawName: string): { amount: number; unit: string } | null {
   const t = rawName.replace(/[\s|\\/•·–—-]+$/g, "").trim();
   const m = t.match(/(\d+[\.,]?\d*)\s*(g|kg|ml|l)\.?\s*$/i);
-  if (!m) return null;
-  const amount = parseFloat(m[1].replace(",", "."));
-  if (!Number.isFinite(amount) || amount <= 0) return null;
-  return { amount, unit: m[2].toLowerCase() };
+  if (m) {
+    const amount = parseFloat(m[1].replace(",", "."));
+    if (Number.isFinite(amount) && amount > 0) return { amount, unit: m[2].toLowerCase() };
+  }
+  // GENERAL trailing-litre garble (same rule as the rimi/norfa extractor):
+  // the printed litre mark reads as digit 1 — ", 11" = 1 l, ", 21" = 2 l,
+  // ", 1,51" = 1,5 l. Comma-anchored, end of name, clamped to real pack
+  // sizes; corpus-dry-run validated (2026-07-12).
+  const litre = t.match(/,\s*([0-9](?:\s?,\s?\d{1,2})?)\s?1\s*$/);
+  if (litre) {
+    const v = parseFloat(litre[1].replace(/\s/g, '').replace(',', '.'));
+    if (Number.isFinite(v) && v >= 0.1 && v <= 6) return { amount: v, unit: 'l' };
+  }
+  // Piece-count suffix (", 2 vnt." / ", vnt") — cleanProductName strips it
+  // from the display name; the count surfaces here as the amount instead
+  // ("Avokadai READY TO EAT WELL DONE, 2 vnt." → 2 vnt). Comma required so a
+  // name that merely ENDS in a number never reads as a count.
+  const vnt = t.match(/,\s*(\d{1,2})?\s*vnt\.?\s*$/i);
+  if (vnt) {
+    const amount = vnt[1] ? parseInt(vnt[1], 10) : 1;
+    if (Number.isFinite(amount) && amount > 0) return { amount, unit: 'vnt' };
+  }
+  return null;
 }
 
 // ───────── band model (internal) ─────────
@@ -866,6 +984,7 @@ type TraceReason =
   | 'taisymas-amount'   // mandatory neg amount of a refund block
   | 'taisymas-qty'      // optional trailing unit-qty of a refund block
   | 'same-row'          // unclassified line at same y as last absorbed (left-column continuation)
+  | 'garble-crumb'      // tiny letter-only fragment (double-read shard) ridden over because the NEXT line belongs to this band
   | 'stop-next-anchor'  // extension stopped: next line is a new product's name
   | 'stop-footer-sep';  // extension stopped: hit the `==========` separator
 
@@ -1043,15 +1162,25 @@ function extendBand(
       last = j;
       events.push({ sliceIdx: j, reason: 'deposit-name' });
       j++;
-      if (j < lines.length && isUnitQtyLine(lines[j])) {
-        last = j;
-        events.push({ sliceIdx: j, reason: 'deposit-qty' });
-        j++;
-      }
-      if (j < lines.length && isPositivePriceLine(lines[j])) {
-        last = j;
-        events.push({ sliceIdx: j, reason: 'deposit-price' });
-        j++;
+      // The deposit's qty row and total arrive in EITHER order — the total
+      // often rides the SAME ROW as the header ("PET (depozitinis) 0,10 EUR"
+      // | "0,60") and sorts BEFORE the "0,10 X 6 vnt." row. The old strict
+      // qty-then-price order stopped at the bare total (no VAT letter →
+      // isPositivePriceLine false), so the deposit's unit-qty leaked out and
+      // became the PRODUCT's price line (AKVILĖ water shipped at €0.10/vnt).
+      // Bare right-column decimals ("0,60") count as the deposit total here.
+      for (let k = 0; k < 2 && j < lines.length; k++) {
+        if (isUnitQtyLine(lines[j])) {
+          last = j;
+          events.push({ sliceIdx: j, reason: 'deposit-qty' });
+          j++;
+        } else if (isPositivePriceLine(lines[j]) || /^[\d0OoIlL]{1,3}[.,]\s?[\d0OoIlL]{2}$/.test(lines[j].text.trim())) {
+          last = j;
+          events.push({ sliceIdx: j, reason: 'deposit-price' });
+          j++;
+        } else {
+          break;
+        }
       }
       continue;
     }
@@ -1082,6 +1211,25 @@ function extendBand(
       events.push({ sliceIdx: j, reason: 'same-row' });
       j++;
       continue;
+    }
+
+    // GARBLE CRUMB (kvitas 2026-01-19/iOS): Apple Vision double-reads the
+    // unit row's trailing "kg" as a stray "ka" shard ON ITS OWN LINE between
+    // the anchor and the product's own rows. The unclassifiable crumb used to
+    // stop extension here, orphaning the unit-qty row AND the Sutaupėte
+    // discount below it (weighed calc + promo lost). Ride over a tiny
+    // letter-only fragment (≤3 chars, no digits) ONLY when the very next
+    // line provably belongs to this band anyway — a real next-product name
+    // is never 3 letters, and its follower is a price anchor, not a
+    // unit-qty/discount row, so this can't eat into the neighbour.
+    if (/^\p{L}{1,3}$/u.test(next.text.trim()) && j + 1 < lines.length) {
+      const after = lines[j + 1];
+      if (isUnitQtyLine(after) || isDiscountLabelLine(after) || NEG_AMOUNT_RE.test(after.text.trim())) {
+        last = j;
+        events.push({ sliceIdx: j, reason: 'garble-crumb' });
+        j++;
+        continue;
+      }
     }
 
     // Anything else = the next product's name line. Stop here.
@@ -1918,7 +2066,8 @@ export function extractMaximaProduct(internal: BandInternal): ExtractResult {
   // parse, the deposit count is used as VERIFICATION only (warn on mismatch).
   {
     const depositQtyEntry = internal.postAnchor.find((e) => e.reason === 'deposit-qty');
-    const dm = depositQtyEntry?.line.text.match(/\d+[.,]\d{2}\s*[XxХ]\s*(\d{1,2})\s*vnt/i);
+    // `\s?` after the decimal comma: OCR pads it ("0, 10 X 6 vnt.").
+    const dm = depositQtyEntry?.line.text.match(/[\d0OoIlL]+[.,]\s?[\d0OoIlL]{2}\s*[XxХ]\s*(\d{1,2})\s*vnt/i);
     const depositCount = dm ? parseInt(dm[1], 10) : null;
     if (depositCount != null && depositCount >= 2) {
       if (!unitQtyEntry && quantity === 1 && unit === 'vnt') {
@@ -2413,6 +2562,31 @@ export function parseMaximaReceipt(
     footer.receiptNo =
       `${footer.date.replace(/-/g, '')}-${footer.time.replace(/:/g, '')}-` +
       `${Math.round(footer.total * 100)}-maxima-receipt`;
+  }
+
+  // AMOUNT/UNIT display rules (user-confirmed on the 2026-07 truth review),
+  // applied to EVERY product regardless of which constructor built it:
+  //  · weighed rows display as "1 kg" — the €/kg price pairs with a 1 kg
+  //    amount (same convention the Rimi/Lidl parsers ship);
+  //  · a ", vnt" / ", N vnt" NAME SUFFIX is a piece-count, not part of the
+  //    catalog name ("Avokadai READY TO EAT WELL DONE, 2 vnt.",
+  //    "NAUJA! Žiedinis kopūstas ROMANESCO, vnt") — strip it from the name
+  //    and surface it as the amount instead.
+  for (const p of products) {
+    if (p.unit === 'kg') {
+      p.parsedAmount = 1;
+      p.parsedUnit = 'kg';
+      continue;
+    }
+    const vntSuffix = p.name.match(/,\s*(\d{1,2})?\s*vnt\.?\s*$/i);
+    if (vntSuffix) {
+      const stripped = p.name.slice(0, vntSuffix.index).replace(/[\s,]+$/, '').trim();
+      if (stripped.length >= 3) {
+        p.name = stripped;
+        p.parsedAmount = vntSuffix[1] ? parseInt(vntSuffix[1], 10) : 1;
+        p.parsedUnit = 'vnt';
+      }
+    }
   }
 
   return { header, products, footer };
