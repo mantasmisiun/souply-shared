@@ -46,6 +46,14 @@ export interface Region {
     yBottom: number;
     xLeft: number;
     xRight: number;
+    // Optional skew: top/bottom Y at the band's LEFT vs RIGHT edge, so the photo
+    // overlay can draw a parallelogram that follows a tilted receipt. Absent →
+    // render as the axis-aligned rectangle. Currently produced only by the IKI
+    // photographed (thermal) parser.
+    yLeftTop?: number;
+    yRightTop?: number;
+    yLeftBottom?: number;
+    yRightBottom?: number;
 }
 
 /**
@@ -66,7 +74,8 @@ export type RegionKind =
     | 'date'
     | 'time'
     | 'dateTime'
-    | 'receiptNo';
+    | 'receiptNo'
+    | 'skipped';
 
 /** A `Region` with the logical field it covers. Used in
  *  `header.lineRegions` / `footer.lineRegions` post-Phase-6. */
@@ -81,6 +90,19 @@ export interface RimiLine {
     yBottom: number;
     xLeft: number;
     xRight: number;
+    /** Marked by mergeRowFragmentsRimi: this box is ~2 printed rows tall — the
+     *  OCR engine FUSED two physical rows into one garbled line (346px
+     *  app-share wrapper PDFs). Such a box is a fusion, not a fragment: it is
+     *  excluded from row-clustering (it y-overlaps BOTH rows and would glue
+     *  them together) and its text is quarantined from product names. */
+    fusedRow?: boolean;
+    /** The TOP-half remnant of a split fused box: a two-row fusion whose text
+     *  ends in a price is [previous product's discount row][next product's
+     *  name row] — the price physically belongs to the TOP row (the previous
+     *  band's Galut. kaina). The split keeps every band's content inside its
+     *  own walls: this line is tail-eligible for the band above, never an
+     *  anchor, and extractRimiProduct reads it as a recovered Galut. */
+    fusedSplitTail?: boolean;
 }
 
 export interface RimiProduct {
@@ -100,6 +122,12 @@ export interface RimiProduct {
      *  name-similarity alone returns the wrong pack at confidence 1.0). */
     parsedAmount?: number | null;
     parsedUnit?: string | null;
+    /** True when the line is sold by weight (unit === 'kg'), false for
+     *  per-piece rows. IKI-parser parity: drives the server resolver to
+     *  keep a weighable catalog SP instead of falling through to a
+     *  garbled same-name orphan. The processing coordinator threads it
+     *  through unchanged — the parser only EMITs the field. */
+    isWeighable?: boolean;
 }
 
 export interface RimiHeader {
@@ -122,6 +150,21 @@ export interface RimiFooter {
     time: string;
     receiptNo: string;
     totalSavings: number | null;
+    /** RECEIPT-LEVEL RECONCILIATION (set by parseRimiReceipt, not parseFooter):
+     *  Σ printed line totals (Galut-aware, pre-normalization) + receipt-level
+     *  adjustments (Panaudoti MANO RIMI pinigai, Užstatas deposits,
+     *  Apvalinimas) must equal the printed Mokėti total. This is the
+     *  arithmetic self-verification the Phase-5 ensemble arbitrates on —
+     *  without it every Rimi parse looks flagged and engine quality is
+     *  judged blind. `reconciled` is only ever true against a total READ
+     *  from the receipt (never against the derived fallback). */
+    reconciled?: boolean;
+    reconDelta?: number | null;
+    /** Fused/mixed-read events the row merger saw in this parse — >0 means
+     *  some physical row was read twice or vertically fused, i.e. names may
+     *  carry bleed even when the arithmetic reconciles. Gates the photo
+     *  section re-OCR alongside `reconciled === false`. */
+    ocrSuspects?: number;
     rawText: string;
     region: Region;
     /** Per-field source-line bboxes tagged with their `kind` — total,
@@ -153,7 +196,7 @@ const RELAXED_PRICE_RE = /^\d+[.,]\d{2}$/;
 // about the comma between Galut and kaina, and stuffs whitespace
 // into decimal numbers (`1, 10`).
 const DISCOUNT_RE =
-    /Nuo[li]\s*\.?\s*-(\d+[.,]\s?\d{2})\s+Gal[uūü]t\s*[.,]?\s*k?aina\s*(\d+[.,]\s?\d{2})/i;
+    /Nuo[li]\s*\.?\s*-(\d+[.,]\s?\d{2})\s+Gal[uūü]t\s*[.,:;]?\s*k?aina\s*(\d+[.,]\s?\d{2})/i;
 
 // Half-discount fragments — MLKit splits the discount row at the
 // column gap on some receipts, leaving each half on its own OCR
@@ -162,12 +205,17 @@ const DISCOUNT_RE =
 // (lets stray leading/trailing chars still match), and OCR digit
 // confusions (`O`/`o` → `0`, `I`/`l` → `1`) inside the amount.
 const NUOL_FRAGMENT_RE = /Nuo[li]\s*\.?\s*-\s*[\dOoIl]+[.,]\s?[\dOoIl]{1,2}/i;
-const GALUT_FRAGMENT_RE = /Gal[uūü]t\s*[.,]?\s*k?aina\s*[\dOoIl]+[.,]\s?[\dOoIl]{1,2}/i;
+const GALUT_FRAGMENT_RE = /Gal[uūü]t\s*[.,:;]?\s*k?aina\s*[\dOoIl]+[.,]\s?[\dOoIl]{1,2}/i;
 
-// Weighable: `0,340 kg X 7,59 EUR/kg`. `E?UR` tolerates an iOS-MLKit
-// pattern where the leading `E` of `EUR` is dropped — observed on
-// receipt 55 as "0,978 kg X 1,69UR/K_3. 1", which otherwise fails the
-// weight-line classifier and the entire row drops to unit=vnt qty=1.
+// Weighable: `0,340 kg X 7,59 EUR/kg`. `[EF]?UR` tolerates two OCR
+// patterns on the currency token:
+//   - the leading `E` of `EUR` dropped entirely — observed on receipt
+//     55 as "0,978 kg X 1,69UR/K_3. 1", which otherwise fails the
+//     weight-line classifier and the entire row drops to unit=vnt qty=1.
+//   - E↔F thermal-print confusion ("FUR" for "EUR") — the E's bottom
+//     bar fades on thermal paper and MLKit reads F. Same class as the
+//     IKI parser's T_EUR (`[EÉĖÈÊF]...`); diacritic variants are
+//     already collapsed by normalizeForNumberRegex's stripDiacritics.
 // "UR" preceded by `\d+[.,]\d{1,2}\s*` has no plausible false-positive
 // shape in product names.
 //
@@ -176,18 +224,43 @@ const GALUT_FRAGMENT_RE = /Gal[uūü]t\s*[.,]?\s*k?aina\s*[\dOoIl]+[.,]\s?[\dOoI
 // as "0,494 kg? X 7,99 EUR/kg" where MLKit inserted a "?" after kg.
 // Pre-fix that row was misclassified as preName and glued into the
 // product name with unit/quantity/ppu all lost.
-const WEIGHT_RE = /(\d+[.,]\s?\d{1,3})\s*kg[^xX×]*[xX×]\s*(\d+[.,]\s?\d{1,2})\s*(?:E?UR|€)/i;
+const WEIGHT_RE = /(\d+[.,]\s?\d{1,3})\s*kg[^xX×]*[xX×]\s*(\d+[.,]\s?\d{1,2})\s*(?:[EF]?UR|€)/i;
 
 // Fallback for weighable lines where MLKit dropped the `kg` between
 // the quantity and the X — observed on receipt 56 band 10 salmon as
 // "0,524 .24 x 23,99 EUR/kg". The `EUR/kg` suffix is the unique
 // signature that disambiguates "weighable" from "multi-buy" when the
 // `kg` token between qty and X is missing; multi-buy lines never carry
-// a `/kg` rate suffix. Tried only after WEIGHT_RE fails.
-const WEIGHT_RATE_ONLY_RE = /(\d+[.,]\s?\d{1,3})\s*[^xX×]*[xX×]\s*(\d+[.,]\s?\d{1,2})\s*(?:E?UR|€)\s*\/\s*kg/i;
+// a `/kg` rate suffix. Tried only after WEIGHT_RE fails. Currency
+// class shares WEIGHT_RE's `[EF]?UR` OCR tolerance.
+const WEIGHT_RATE_ONLY_RE = /(\d+[.,]\s?\d{1,3})\s*[^xX×]*[xX×]\s*(\d+[.,]\s?\d{1,2})\s*(?:[EF]?UR|€)\s*\/\s*kg/i;
 
-// Multi-buy: `2 vnt X 1,99 EUR`.
-const MULTI_RE = /(\d+)\s*vnt\s*\.?\s*[xX×]\s*(\d+[.,]\s?\d{1,2})\s*(?:EUR)?/i;
+// Weighed-line HINT: the row is weight-SHAPED ("… kg × …" body or a
+// "… EUR/kg" rate suffix) but too OCR-garbled for WEIGHT_RE /
+// WEIGHT_RATE_ONLY_RE to extract numbers from (e.g. a letter inside
+// the €/kg rate that the digit fold doesn't cover: "0,978 kg X 1,b9
+// EUR/kg"). Used by extractRimiProduct's price-poisoning guard: a
+// band with a kg hint but no recoverable €/kg must NOT fall back to
+// unit=vnt with the anchor line total as its price — that total is
+// for a FRACTION of a kg and would poison the per-unit reference
+// price ("show it, never write price"). Neither alternative has a
+// plausible false-positive shape inside product names ("kg" directly
+// followed by an ×, or a currency-slash-kg rate suffix).
+// The third alternative catches the fully-mushed skew garble: "46g429 EUKG"
+// (printed "0,406 kg X 4,29 EUR/kg", ios-55 paprikos) — digits+g+digits with
+// the EUR/kg marker collapsed into one EUKG token. No Lithuanian word ends in
+// "EUKG", so the token alone is a safe weighed signal.
+const WEIGHT_HINT_RE = /\bkg\b[^xX×]{0,10}[xX×]|(?:[EF]?UR|€)\s*\/\s*kg\b|\bE[UO]?KG\b/i;
+
+// Multi-buy: `2 vnt X 1,99 EUR`. The X tolerates one junk char after it —
+// photo OCR reads "2 vnt. x*2,69 EUR" (rimi-30-04-2026-2 p11 leaked the whole
+// multi line into the product name and lost its quantity).
+// Qty tolerates the 2→z rot ("z vnt.x • 1,09 EUR", rimi-30-04-2026-3/iOS —
+// the multibuy collapsed to 1 vnt at the line-total price) and the marker
+// class includes the Vision bullet '•' alongside '*'/'·'. z is the ONLY
+// letter admitted: it has a single digit reading (2), unlike o/l/s.
+const MULTI_RE = /(\d+|[zZ])\s*vnt\s*\.?\s*[xX×]\s*[*·•]?\s*(\d+[.,]\s?\d{1,2})\s*(?:EUR)?/i;
+const foldMultiQty = (s: string): number => parseInt(s.replace(/[zZ]/g, '2'), 10);
 
 // Fused weight/multi anchor: MLKit occasionally emits the row's right-
 // column anchor (`X,YY A`) and the row's left-column weight/multi
@@ -232,8 +305,22 @@ const FOOTER_SIGNAL_RE =
 //   1. "Kvito Nr. X/Y/Z Kasa NNNN" — canonical compact form.
 //   2. "Kvito numeris XXXXX" — VMI verification block fallback.
 //   3. "BANKO KVITO NR. NNNNN" — bank slip, NOT the receipt no.
-const RECEIPT_NO_KVITO_NR_RE = /^Kvito\s+Nr\.?\b/i;
-const RECEIPT_NO_KVITO_NUMERIS_RE = /^Kvito\s+numeris\b/i;
+//
+// Stem tolerance (IKI-parser parity, T_RECEIPTNO_RE): thermal OCR
+// garbles the "Kvito" stem one glyph at a time — `K`↔`A` (lost
+// left stroke), `v`→`o`/`u`/`y`, and drops the `r` of "Nr." — so
+// `[KA][vouy]ito` + `Nr?` accepts "Avito N. 80/162", "Kyito Nr,"
+// etc. Guards that keep the widened stem from misfiring:
+//   - the Nr-form's lookahead `(?=[\s\d]|$)` rejects "Kvito
+//     numeris …" (an `n` alone would satisfy `Nr?`, but the next
+//     char is `u`, not whitespace/digit) so the numeris path still
+//     owns that layout;
+//   - parseFooter additionally requires ≥1 digit in the captured
+//     tail, so a fully-garbled footer row can't mint a junk id.
+const RECEIPT_NO_KVITO_NR_RE = /^[KA][vouy]ito\s+Nr?[.,]?(?=[\s\d]|$)/i;
+// Prefix stripper for the Nr form — must mirror RECEIPT_NO_KVITO_NR_RE.
+const RECEIPT_NO_KVITO_NR_STRIP_RE = /^[KA][vouy]ito\s+Nr?[.,]?\s*/i;
+const RECEIPT_NO_KVITO_NUMERIS_RE = /^[KA][vouy]ito\s+numeris\b/i;
 const BANKO_KVITO_RE = /^BANKO\s+KVITO/i;
 
 // LAIKAS line — date/time anchor.
@@ -284,13 +371,22 @@ const ADDRESS_FALLBACK_RE =
 // `1` for `i`/`l` and `0` for `o` inside Lithuanian street names
 // (`Gegužių` → `Geguž1ų`, `Tilžės` → `T1lžės`). The matcher's
 // Levenshtein on the normalised form absorbs single-char diffs.
+//
+// MLKit also sometimes splits a single street word across a space
+// (`Zarasų` → `Zar asų`), which would otherwise truncate the street
+// name to the first fragment and break the suffix anchor. The
+// `(?:\s+[a-z…]+){0,2}` tail re-attaches up to two lowercase
+// continuation fragments before the suffix; the matcher then strips
+// whitespace, so `Zar asų g.` normalises to the same key as `Zarasų g.`.
 const STREET_PREFIX_RE =
-    /([A-ZĄČĘĖĮŠŲŪŽ][a-ząčęėįšųūž\d]+)\s*[,]?\s*\b(g|pr|al|pl|a)\b\.?/;
+    /([A-ZĄČĘĖĮŠŲŪŽ][a-ząčęėįšųūž\d]+(?:\s+[a-ząčęėįšųūž\d]+){0,2})\s*[,]?\s*\b(g|pr|al|pl|a)\b\.?/;
 
 // CITY_TAIL_RE picks out the "30, Šiauliai" component independent
-// of which OCR line it lands on.
+// of which OCR line it lands on. The house number admits a single
+// trailing letter (`5A`, `12B`) — common in Lithuanian addresses and
+// otherwise dropped, which left the street-only fallback to match on.
 const CITY_TAIL_RE =
-    /\b(\d+(?:[-/]\d+)?)\s*,\s*([A-ZĄČĘĖĮŠŲŪŽ][a-ząčęėįšųūž]+)/;
+    /\b(\d+[A-Za-z]?(?:[-/]\d+)?)\s*,\s*([A-ZĄČĘĖĮŠŲŪŽ][a-ząčęėįšųūž]+)/;
 
 // Store-name heuristic. Rimi prints "UAB RIMI LIETUVA, T709" or
 // "RIMI LIETUVA UAB, T709" — UAB + RIMI on the same line.
@@ -299,7 +395,15 @@ const STORE_NAME_RE = /\bUAB\b.*\bRIMI\b|\bRIMI\b.*\bUAB\b/i;
 // Bag-deposit row — `Užstatas - vienkartinė plastiko pakuotė
 // 0,10`. Used by both V1's product-name filter and V2's band
 // absorption logic.
-export const DEPOSIT_PATTERN = /[uūü]žstat/i;
+//
+// `[žz2]` widening (IKI-parser parity): OCR reads the ž caron
+// inconsistently — plain `z` ("Uzstatas") when the caron fades,
+// `2` when the caron fuses with the z body. Without the class a
+// garbled deposit row fails the filter and mints a phantom
+// "Uzstatas…" product. No Lithuanian grocery word contains
+// `u[žz2]stat` other than the deposit, so the class adds no
+// false-positive surface.
+export const DEPOSIT_PATTERN = /[uūü][žz2]stat/i;
 
 // Deposit-name continuation keyword. Rimi's full deposit row
 // reads "Užstatas - vienkartinė {metalinė|plastiko|popierinė}
@@ -334,7 +438,7 @@ const BARE_PRICE_RE = /^\s*[\dOoIl]+\s*[.,]\s*[\dOoIl]{2}\s*$/;
 // Android batch test as "Rimi maišasA". Without it the \b boundary
 // fails between `as` and `A` (both word chars) and the skip leaks
 // through.
-export const NON_CATALOG_PATTERN = /\b(?:vienkartinis|didelis|pirkini[uų])?\s*(?:plastikinis|popierinis)?\s*(?:m|rn|nn|n)ai[sšžz](?:elis|as)[A-Z]?\b/i;
+export const NON_CATALOG_PATTERN = /\b(?:vienkartinis|didelis|pirkini[uų])?\s*(?:plastikinis|popierinis)?\s*[A-Za-z]?(?:m|rn|nn|n)ai[sšžz](?:elis|as)[A-Z]?\b/i;
 
 // ───────── helpers ─────────
 
@@ -356,6 +460,9 @@ function parseNumLoose(str: string): number {
             .replace(/[IilL]/g, '1'),
     );
 }
+
+/** Round to 2 decimal places (money math). */
+const round2 = (n: number): number => Math.round(n * 100) / 100;
 
 /** Bounding region that covers all given lines. Empty input returns zeros. */
 function regionOf(lines: RimiLine[]): Region {
@@ -448,15 +555,84 @@ const isPriceLikeFragment = (line: RimiLine): boolean => {
     return POSITIVE_PRICE_RE.test(t) || BARE_PRICE_FRAGMENT_RE.test(t);
 };
 
+// ── double-read similarity + quality (same approach as maximaParser) ──
+// Insertion-tolerant: the old position-aligned char match collapsed when a
+// read injected ONE mid-word space ("Atšal dyta…" vs "Atšaldyta…" — every
+// later position mismatches), so Android fusion double-reads fell through to
+// the column-fragment CONCAT and shipped doubled/garbled names. Folded
+// levenshtein sees those as ~identical.
+const foldForDup = (t: string): string =>
+    t.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]+/g, '');
+const dupSimilarity = (a: string, b: string): number => {
+    const fa = foldForDup(a);
+    const fb = foldForDup(b);
+    if (fa === fb) return 1;
+    if (!fa.length || !fb.length) return 0;
+    let prev = new Array(fb.length + 1).fill(0).map((_, j) => j);
+    for (let i = 1; i <= fa.length; i++) {
+        const cur = [i];
+        for (let j = 1; j <= fb.length; j++) {
+            cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (fa[i - 1] === fb[j - 1] ? 0 : 1));
+        }
+        prev = cur;
+    }
+    return 1 - prev[fb.length] / Math.max(fa.length, fb.length);
+};
+/** Which of two double-reads to keep: fewer word-breaks (garbles inject
+ *  mid-word spaces), then more Lithuanian diacritics, then fewer digits glued
+ *  to letters ("k1gabaliukai", "0BUOLIUKAI"). */
+const readQuality = (t: string): number => {
+    const tokens = t.trim().split(/\s+/).length;
+    const diacritics = (t.match(/[ąčęėįšųūžĄČĘĖĮŠŲŪŽ]/g) ?? []).length;
+    const digitGarbles = (t.match(/[A-Za-zĄ-Žą-ž][0O](?=[A-Za-zĄ-Žą-ž\s]|$)|\d[A-Za-zĄ-Žą-ž]/g) ?? []).length;
+    return -tokens * 100 + diacritics * 10 - digitGarbles;
+};
+
+// Fused/mixed-read counter for the CURRENT parse (module-scoped; parsing is
+// synchronous and single-threaded — parseRimiReceipt resets it on entry and
+// publishes it as footer.ocrSuspects).
+let rimiOcrSuspects = 0;
+
 const mergeRowFragments = (rawLines: RimiLine[]): RimiLine[] => {
-    const sorted = [...rawLines].sort((a, b) => a.yTop - b.yTop);
+    let sorted = [...rawLines].sort((a, b) => a.yTop - b.yTop);
+    // STRADDLER DOUBLE-READ DROP (ios-receipt-56 "Kvadratini34sodG"): Vision
+    // re-reads a printed row as a garbled box ~2 rows TALL, y-straddling the
+    // neighbouring rows. The straddler y-overlaps the previous band's last
+    // rows, so the band planner pulled it — and the CLEAN nested read with
+    // it — into the wrong band (the "Kvadratinis sodo" name row leaked into
+    // band 10 and product 11 shipped as "lovelis, …"). When a much SHORTER
+    // clean read of the same text sits inside the tall box (x-overlapping,
+    // dupSimilarity > 0.7), drop the straddler and keep the per-row read.
+    sorted = sorted.filter((a) => {
+        const ah = a.yBottom - a.yTop;
+        if (ah <= 0) return true;
+        return !sorted.some((b) => {
+            if (b === a) return false;
+            const bh = b.yBottom - b.yTop;
+            if (!(bh > 0 && bh <= ah * 0.6)) return false;
+            const yOv = Math.min(a.yBottom, b.yBottom) - Math.max(a.yTop, b.yTop);
+            if (yOv < bh * 0.7) return false;
+            const xOv = Math.min(a.xRight, b.xRight) - Math.max(a.xLeft, b.xLeft);
+            const minW = Math.min(a.xRight - a.xLeft, b.xRight - b.xLeft);
+            if (!(minW > 0 && xOv >= minW * 0.6)) return false;
+            return dupSimilarity(a.text.trim(), b.text.trim()) > 0.7;
+        });
+    });
     const out: RimiLine[] = [];
     for (const line of sorted) {
-        if (out.length === 0) {
+        // FUSED boxes never participate in same-row joins: a two-row-tall box
+        // y-overlaps its neighbour rows, and joining glued the clean name
+        // line "Sok. sk. sojos ger. ALPRO" onto the quarantined garbage box
+        // on rimi-30-04-2026-23 — the quarantine then ate the REAL name too.
+        if (out.length === 0 || line.fusedRow) {
             out.push({ ...line });
             continue;
         }
         const last = out[out.length - 1];
+        if (last.fusedRow) {
+            out.push({ ...line });
+            continue;
+        }
         const yTopDiff = Math.abs(line.yTop - last.yTop);
         if (yTopDiff >= ROW_MERGE_YTOP_THRESHOLD_PX) {
             out.push({ ...line });
@@ -553,21 +729,16 @@ const mergeRowFragments = (rawLines: RimiLine[]): RimiLine[] => {
         const minW = Math.min(lastW, lineW);
         const xOverlapRatio = minW > 0 ? xOverlap / minW : 0;
 
-        // Position-aligned char-overlap as a cheap similarity proxy.
-        // OCR duplicate variants typically differ by 1-2 character
-        // substitutions at the same position (e.g. "UŽspaudžiami" vs
-        // "UŽspaudžiani"), which scores ~95% here. Two genuinely
-        // different texts score below ~50% even when lengths align.
-        let positionMatches = 0;
-        const minLen = Math.min(lastText.length, lineText.length);
-        for (let k = 0; k < minLen; k++) {
-            if (lastText[k] === lineText[k]) positionMatches++;
-        }
-        const maxLen = Math.max(lastText.length, lineText.length);
-        const textSim = maxLen > 0 ? positionMatches / maxLen : 0;
+        // Insertion-tolerant similarity (folded levenshtein — see helpers
+        // above). COMPARABLE COVERAGE required too: a tiny stray tail
+        // re-read contained inside a full row is NOT its duplicate (the
+        // maxima dedup regression class).
+        const widthRatio = Math.max(lastW, lineW) > 0 ? minW / Math.max(lastW, lineW) : 0;
+        const textSim = dupSimilarity(lastText, lineText);
 
-        if (xOverlapRatio > 0.5 && textSim > 0.7) {
-            // Duplicate — keep the first-seen reading, expand bounds.
+        if (xOverlapRatio > 0.5 && widthRatio >= 0.5 && textSim > 0.7) {
+            // Duplicate — keep the cleaner reading, expand bounds.
+            if (readQuality(lineText) > readQuality(lastText)) last.text = lineText;
             last.yTop = Math.min(last.yTop, line.yTop);
             last.yBottom = Math.max(last.yBottom, line.yBottom);
             last.xLeft = Math.min(last.xLeft, line.xLeft);
@@ -628,7 +799,12 @@ const normalizeForNumberRegex = (s: string): string =>
 
 const isWeightOrMultiLine = (line: RimiLine): boolean => {
     const t = normalizeForNumberRegex(line.text);
-    return WEIGHT_RE.test(t) || WEIGHT_RATE_ONLY_RE.test(t) || MULTI_RE.test(t);
+    // WEIGHT_HINT_RE: a weight-SHAPED row too garbled for the strict
+    // regexes still classifies as weight/multi so (a) band-tail
+    // absorption keeps it with ITS product instead of leaking it into
+    // the next band's preName, and (b) a bare price following it can't
+    // become a relaxed anchor.
+    return WEIGHT_RE.test(t) || WEIGHT_RATE_ONLY_RE.test(t) || MULTI_RE.test(t) || WEIGHT_HINT_RE.test(t);
 };
 
 const isDiscountLine = (line: RimiLine): boolean => {
@@ -644,9 +820,361 @@ const isDepositLine = (line: RimiLine): boolean =>
 
 // ───────── detection ─────────
 
+// MLKit reads Lithuanian glyphs as CYRILLIC homoglyphs on PDF renders — fold
+// to Latin at entry (IKI/Maxima parity; visually-identical pairs only).
+const RIMI_CYRILLIC_HOMOGLYPHS: Record<string, string> = {
+    'А': 'A', 'В': 'B', 'С': 'C', 'Е': 'E', 'Н': 'H', 'І': 'I', 'Ј': 'J', 'К': 'K',
+    'М': 'M', 'О': 'O', 'Р': 'P', 'Т': 'T', 'Х': 'X', 'Ѕ': 'S',
+    'а': 'a', 'с': 'c', 'е': 'e', 'і': 'i', 'ј': 'j', 'о': 'o', 'р': 'p', 'х': 'x', 'ѕ': 's', 'у': 'y',
+};
+const foldRimiHomoglyphs = (l: RimiLine): RimiLine => {
+    let text = l.text;
+    if (/[Ѐ-ӿ]/.test(text)) {
+        text = text.replace(/[Ѐ-ӿ]/g, (c) => RIMI_CYRILLIC_HOMOGLYPHS[c] ?? c);
+    }
+    // "$" before an uppercase run is a garbled Š/S ("$OKOLADE" for ŠOKOLADE,
+    // BE09D63A) — no legitimate Rimi text uses the dollar sign.
+    if (text.includes('$')) {
+        text = text.replace(/\$(?=[A-ZĄČĘĖĮŠŲŪŽ]{2})/g, 'S');
+    }
+    return text === l.text ? l : { ...l, text };
+};
+
+// A fragment whose text is a bare price/amount — kept as its OWN line by the
+// row merger so the anchor detection below still sees standalone prices.
+const PRICE_SHAPE_FRAGMENT_RE = /^-?\s?\d+[.,]\s?\d{2}\s*[AB]?\s*$/;
+const DISCOUNT_CTX_FRAGMENT_RE = /nuol|galut|kaina/i;
+
+/**
+ * Same-row fragment merger (Maxima/IKI parity — Rimi never had one, and the
+ * 300-dpi PDF OCR splits rows constantly): "X 4,99 EUR" + "3 vnt." fragments
+ * of one multi-buy row, "Nuol." + "-1,30 Galut. kaina" + "1,39" thirds of one
+ * discount row, "2" + "l" halves of a litre mark. Clusters lines whose
+ * y-ranges overlap ≥55% of the shorter line, then joins each cluster's
+ * fragments x-sorted — EXCEPT bare price fragments ("1,69 A"), which stay
+ * separate so anchors keep working, unless a same-row sibling carries
+ * Nuol/Galut/kaina context (then the price is the discount's value, not an
+ * anchor, and must merge into the discount line).
+ */
+/** Body-text test shared by the fused-row detector: ≥8 chars + a space keeps
+ *  logo art, bare prices and stray letters out of both the median and the
+ *  candidates. Mirrors utils/parseEnsemble.countFusedRows on the app side. */
+const isRimiBodyText = (l: RimiLine): boolean =>
+    l.text.trim().length >= 8 && l.text.trim().includes(' ');
+
+export function mergeRowFragmentsRimi(rawLines: RimiLine[]): RimiLine[] {
+    if (rawLines.length <= 1) return rawLines.slice();
+    // STRADDLER DOUBLE-READ DROP (ios-receipt-56 "Kvadratini34sodG"): Vision
+    // re-reads a printed row as a garbled box ~2 rows tall whose y-span
+    // straddles the neighbour rows. It is spaceless, so the fused-row tagger
+    // below never sees it (isRimiBodyText requires a space); it then chain-
+    // joined the previous band's Nuol/Galut rows to the next product's name
+    // row, and the cluster dedup kept the GARBLE (fewer tokens) — the clean
+    // "Kvadratinis sodo" read was deleted and band 11 shipped as "lovelis,…".
+    // When a much SHORTER read nests inside the tall box (x-overlapping,
+    // dupSimilarity > 0.7 on folded text), the tall box is the second read of
+    // that row — drop it outright; the per-row reads carry the content.
+    rawLines = rawLines.filter((l) => {
+        const h = l.yBottom - l.yTop;
+        if (h <= 0) return true;
+        const straddled = rawLines.some((b) => {
+            if (b === l) return false;
+            const bh = b.yBottom - b.yTop;
+            if (!(bh > 0 && bh <= h * 0.6)) return false;
+            const yOv = Math.min(l.yBottom, b.yBottom) - Math.max(l.yTop, b.yTop);
+            if (yOv < bh * 0.7) return false;
+            const xOv = Math.min(l.xRight, b.xRight) - Math.max(l.xLeft, b.xLeft);
+            const minW = Math.min(l.xRight - l.xLeft, b.xRight - b.xLeft);
+            if (!(minW > 0 && xOv >= minW * 0.6)) return false;
+            return dupSimilarity(l.text.trim(), b.text.trim()) > 0.7;
+        });
+        if (straddled) rimiOcrSuspects++;
+        return !straddled;
+    });
+    if (rawLines.length <= 1) return rawLines.slice();
+    // FUSED-ROW pre-pass: a body line ~2× the receipt's median row height is
+    // the OCR engine's fusion of two printed rows (low-res wrapper PDFs). It
+    // y-overlaps BOTH rows, so feeding it to the clustering below glues two
+    // physical rows into one merged line — the "name hijack" mechanic
+    // (0AE04F24: "RIMI SMART, 1 l"+"be glitimo BARILLA" → one 104px box that
+    // dragged the next product's name into the previous band). A fusion is
+    // not a fragment: tag it, keep it out of clustering, let the band walls
+    // place it alone. The 3.5× cap keeps decorative blocks out.
+    const bodyHs = rawLines
+        .filter(isRimiBodyText)
+        .map((l) => l.yBottom - l.yTop)
+        .filter((h) => h > 0)
+        .sort((a, b) => a - b);
+    const medH = bodyHs.length >= 8 ? bodyHs[Math.floor(bodyHs.length / 2)] : 0;
+    // Height alone is NOT enough: a skewed photo row is also ~2× median
+    // (ios-receipt-55 false-tagged two legit rows). A true fusion must
+    // additionally SPAN TWO ROWS: at least two other lines each mostly
+    // inside the candidate's y-range while being y-disjoint from EACH OTHER.
+    const spansTwoRows = (c: RimiLine): boolean => {
+        const inside = rawLines.filter((o) => {
+            if (o === c) return false;
+            const oh = o.yBottom - o.yTop;
+            if (oh <= 0) return false;
+            const ov = Math.min(o.yBottom, c.yBottom) - Math.max(o.yTop, c.yTop);
+            return ov >= 0.6 * oh;
+        });
+        for (let a = 0; a < inside.length; a++) {
+            for (let b = a + 1; b < inside.length; b++) {
+                const la = inside[a], lb = inside[b];
+                const ov = Math.min(la.yBottom, lb.yBottom) - Math.max(la.yTop, lb.yTop);
+                const minH = Math.min(la.yBottom - la.yTop, lb.yBottom - lb.yTop);
+                if (ov < 0.3 * minH) return true;
+            }
+        }
+        return false;
+    };
+    const fusedOut: RimiLine[] = [];
+    const clusterable: RimiLine[] = [];
+    for (const l of rawLines) {
+        const h = l.yBottom - l.yTop;
+        // Two tag tiers: 1.75×+spans-two-rows (the proven signature), or a
+        // full TWO ROWS tall regardless — a fusion can consume every other
+        // line of both rows (rimi-30-04-2026-2: 2.12× box holding a Nuol row
+        // + the next name). Photo-skew singles measure ≤1.81× across the
+        // corpus, safely under the unconditional tier.
+        if (
+            medH > 0 && isRimiBodyText(l) && h <= 3.5 * medH
+            && ((h >= 1.75 * medH && spansTwoRows(l)) || h >= 2.0 * medH)
+        ) {
+            // WALL-HONORING SPLIT: a two-row fusion whose text ends in a
+            // price is [prev product's discount row][next product's name
+            // row] (rimi-30-04-2026-2: "Lazdyny riesutu aetas RiMI 0,65").
+            // Split at one row-pitch: the price goes back to the TOP half
+            // where it is printed (the previous band's tail territory), the
+            // garbled name keeps the bottom half — every band reads only
+            // what lies inside its own walls.
+            const tailM = h <= 2.6 * medH
+                ? l.text.trim().match(/^(.{4,}?)[\s,]*(\d+[.,]\s?\d{2})\s*$/)
+                : null;
+            if (tailM) {
+                const boundary = Math.round(l.yTop + medH);
+                fusedOut.push({
+                    text: tailM[2],
+                    yTop: l.yTop,
+                    yBottom: boundary,
+                    xLeft: l.xLeft,
+                    xRight: l.xRight,
+                    fusedSplitTail: true,
+                });
+                fusedOut.push({ ...l, text: tailM[1].trim(), yTop: boundary, fusedRow: true });
+                rimiOcrSuspects++;
+            } else {
+                fusedOut.push({ ...l, fusedRow: true });
+                rimiOcrSuspects++;
+            }
+        } else {
+            clusterable.push(l);
+        }
+    }
+    if (clusterable.length === 0) return fusedOut.sort((a, b) => a.yTop - b.yTop || a.xLeft - b.xLeft);
+    const sorted = clusterable.sort((a, b) => a.yTop - b.yTop || a.xLeft - b.xLeft);
+    const clusters: RimiLine[][] = [];
+    let cur: RimiLine[] = [sorted[0]];
+    let top = sorted[0].yTop;
+    let bottom = sorted[0].yBottom;
+    for (let i = 1; i < sorted.length; i++) {
+        const l = sorted[i];
+        const overlap = Math.min(l.yBottom, bottom) - Math.max(l.yTop, top);
+        const minH = Math.min(l.yBottom - l.yTop, bottom - top);
+        if (minH > 0 && overlap >= minH * 0.55) {
+            cur.push(l);
+            top = Math.min(top, l.yTop);
+            bottom = Math.max(bottom, l.yBottom);
+        } else {
+            clusters.push(cur);
+            cur = [l];
+            top = l.yTop;
+            bottom = l.yBottom;
+        }
+    }
+    clusters.push(cur);
+
+    const out: RimiLine[] = [];
+    for (const rawCl of clusters) {
+        if (rawCl.length === 1) { out.push(rawCl[0]); continue; }
+        // Reunite a SPLIT anchor first: a lone VAT letter ("A"/"B") fuses with
+        // the nearest bare-price fragment to its LEFT ("1,98" + "A" → "1,98 A")
+        // — otherwise the letter would merge into the TEXT side and the price,
+        // stripped of its VAT letter, stops being an anchor (rimi-11-05 JUNGA
+        // lost its band to the neighbour).
+        const cl: RimiLine[] = [];
+        const vatLetters = rawCl.filter((f) => /^[AB]$/.test(f.text.trim()));
+        const rest = rawCl.filter((f) => !vatLetters.includes(f));
+        for (const f of rest) cl.push({ ...f });
+        for (const v of vatLetters) {
+            let best: RimiLine | null = null;
+            for (const f of cl) {
+                if (!/^-?\s?\d+[.,]\s?\d{2}\s*$/.test(f.text.trim())) continue;
+                if (f.xLeft > v.xLeft) continue;
+                if (!best || f.xLeft > best.xLeft) best = f;
+            }
+            if (best) {
+                best.text = `${best.text.trim()} ${v.text.trim()}`;
+                best.xRight = Math.max(best.xRight, v.xRight);
+            } else {
+                cl.push({ ...v });
+            }
+        }
+        if (cl.length === 1) { out.push(cl[0]); continue; }
+        // SUB-ROW partition: a y-cluster on a skewed photo chains ACROSS
+        // physical rows (bboxes tilt), and treating the whole cluster as one
+        // row let the dedupe/concat below eat REAL neighbours on ios-55 —
+        // "2 vnt. X 3,49 EUR" fell to the name row above it (45% y-overlap)
+        // collapsing the multibuy, and "ALPRO, 14 %,250ml" fell to its own
+        // first name line (58%). Same-row SOLID fragments overlap ≥~85%
+        // pairwise (true double-reads 98-100%): union them at 70%. SHORT
+        // junk double-reads ("IDDO", "1rc") sag halfway into a neighbouring
+        // row and can sit at exactly 70% against it — they must never
+        // BRIDGE two rows into one, so they don't participate in the union;
+        // each attaches to the row it overlaps most (where the dedupe then
+        // eats it).
+        const clHs = cl.map((f) => f.yBottom - f.yTop).filter((v) => v > 0).sort((a, b) => a - b);
+        const clMedH = clHs.length ? clHs[Math.floor(clHs.length / 2)] : 0;
+        // Solidity reference = the TALL end of the cluster (junk can be half
+        // its fragments and drags a plain median down to its own height),
+        // clamped so one sagging outlier can't disqualify the real rows.
+        const clRefH = Math.min(clHs.length ? clHs[clHs.length - 1] : 0, 1.5 * clMedH);
+        const solidIdx = cl.map((f, idx) => idx).filter((idx) => cl[idx].yBottom - cl[idx].yTop >= 0.6 * clRefH);
+        const yOverlapOf = (a: RimiLine, b: RimiLine): number =>
+            Math.min(a.yBottom, b.yBottom) - Math.max(a.yTop, b.yTop);
+        const parent = cl.map((_, idx) => idx);
+        const findRoot = (a: number): number => (parent[a] === a ? a : (parent[a] = findRoot(parent[a])));
+        for (let ai = 0; ai < solidIdx.length; ai++) {
+            for (let bi = ai + 1; bi < solidIdx.length; bi++) {
+                const a = solidIdx[ai], b = solidIdx[bi];
+                const minH = Math.min(cl[a].yBottom - cl[a].yTop, cl[b].yBottom - cl[b].yTop);
+                if (minH > 0 && yOverlapOf(cl[a], cl[b]) >= 0.7 * minH) parent[findRoot(a)] = findRoot(b);
+            }
+        }
+        for (let s = 0; s < cl.length; s++) {
+            if (solidIdx.includes(s)) continue;
+            let best = -1, bestOv = 0;
+            for (const a of solidIdx) {
+                const ov = yOverlapOf(cl[s], cl[a]);
+                if (ov > bestOv) { bestOv = ov; best = a; }
+            }
+            if (best !== -1 && bestOv > 0) parent[findRoot(s)] = findRoot(best);
+        }
+        const byRoot = new Map<number, RimiLine[]>();
+        cl.forEach((f, idx) => {
+            const r = findRoot(idx);
+            const row = byRoot.get(r);
+            if (row) row.push({ ...f }); else byRoot.set(r, [{ ...f }]);
+        });
+        const subRows = [...byRoot.values()];
+        for (const rowFrags of subRows) {
+        if (rowFrags.length === 1) { out.push(rowFrags[0]); continue; }
+        // DOUBLE-READ suppression, per sub-row: the engine sometimes emits
+        // the SAME physical text twice at near-identical coords — name rows
+        // ("Virtos GIMINIŲ dešrelės," + "Virtos CIMINIŲ derelės," on
+        // rimi-30-04-2026-2) AND price anchors (two "2,99 A" on ios-56, which
+        // minted a phantom band holding only the next discount line). Two
+        // fragments occupying ≥70% of the same x-span cannot be side-by-side
+        // text; keep the one with more content.
+        const deduped: RimiLine[] = [];
+        // Stacked-but-DIFFERENT content (a tilted qty row 100% x-overlapping
+        // the name row above it) must NOT be deduped or concatenated — it is
+        // its own physical row. Emitted directly to `out` past the row-concat.
+        const stacked: RimiLine[] = [];
+        for (const f of [...rowFrags].sort((a, b) => a.xLeft - b.xLeft)) {
+            const dup = deduped.findIndex((k) => {
+                const ov = Math.min(k.xRight, f.xRight) - Math.max(k.xLeft, f.xLeft);
+                const minW = Math.min(k.xRight - k.xLeft, f.xRight - f.xLeft);
+                return minW > 0 && ov >= 0.7 * minW;
+            });
+            if (dup === -1) { deduped.push({ ...f }); continue; }
+            const k = deduped[dup];
+            const wK = k.xRight - k.xLeft;
+            const wF = f.xRight - f.xLeft;
+            const widthRatio = Math.min(wK, wF) / Math.max(wK, wF);
+            if (widthRatio < 0.5) {
+                // Tiny fragment contained in a full row = partial re-read of a
+                // SEGMENT of it — the full row already carries the content.
+                if (wF > wK) deduped[dup] = { ...f };
+                continue;
+            }
+            if (dupSimilarity(k.text, f.text) > 0.7) {
+                // True double-read → keep the cleaner reading.
+                if (readQuality(f.text) > readQuality(k.text)) deduped[dup] = { ...f };
+                continue;
+            }
+            // Comparable spans, dissimilar text: EITHER two different
+            // physical rows stacked by tilt, OR a mixed garble re-read of the
+            // same row. Distinguish by ROW TYPE: a qty/price-shaped text
+            // ("3 JVnt,g", "… X 4,99 EUR") next to a name-shaped one is a
+            // REAL row that must survive (the old longest-text keep silently
+            // ATE the multibuy qty row — BARILLA shipped at the 3-pack line
+            // total €14,97); two name-shaped dissimilar reads are competing
+            // garbles of one row — keep the longer (old behavior).
+            const qtyish = (t: string) => /\d\s*[JIl1|]?[Vv]nt\b|\bEUR\b|k[gq]\s*[xX×]|[xX×]\s*[\d,]/i.test(t);
+            rimiOcrSuspects++; // dissimilar overlapping reads = mixed-read row
+            if (qtyish(k.text) !== qtyish(f.text)) stacked.push({ ...f });
+            else if (f.text.trim().length > k.text.trim().length) deduped[dup] = { ...f };
+        }
+        for (const st of stacked) out.push(st);
+        if (deduped.length === 1) { out.push(deduped[0]); continue; }
+        const hasDiscountCtx = deduped.some((f) => DISCOUNT_CTX_FRAGMENT_RE.test(f.text));
+        const separate = hasDiscountCtx
+            ? []
+            : deduped.filter((f) => PRICE_SHAPE_FRAGMENT_RE.test(f.text.trim()));
+        const mergeable = deduped.filter((f) => !separate.includes(f));
+        if (mergeable.length >= 2) {
+            const xs = [...mergeable].sort((a, b) => a.xLeft - b.xLeft);
+            out.push({
+                text: xs.map((f) => f.text.trim()).filter(Boolean).join(' '),
+                yTop: Math.min(...xs.map((f) => f.yTop)),
+                yBottom: Math.max(...xs.map((f) => f.yBottom)),
+                xLeft: Math.min(...xs.map((f) => f.xLeft)),
+                xRight: Math.max(...xs.map((f) => f.xRight)),
+            });
+            out.push(...separate);
+        } else {
+            out.push(...deduped);
+        }
+        }
+    }
+    out.push(...fusedOut);
+    out.sort((a, b) => a.yTop - b.yTop || a.xLeft - b.xLeft);
+    return out;
+}
+
+/** OCR ZERO-GARBLE fold for price rows: a leading digit read as a letter turns
+ *  "0,65 A" into "O,65" and the row stops anchoring — the band walls collapse
+ *  and TWO products merge into one (rimi-30-04-2026-13 product 13). Folded
+ *  ONLY when the ENTIRE text is a price shape with the letter in the leading
+ *  slot — a name can never match (letters follow the digits). Same O→0 / l→1
+ *  confusion classes the rest of the file already folds via ocrDigit. */
+const PRICE_LEAD_GARBLE_RE = /^[OoIl](?=[.,]\s?\d{2}\s*[AB]?\s*$)/;
+const foldPriceLeadGarble = (l: RimiLine): RimiLine => {
+    const t = l.text.trim();
+    if (!PRICE_LEAD_GARBLE_RE.test(t)) return l;
+    const digit = /^[Oo]/.test(t) ? '0' : '1';
+    return { ...l, text: digit + t.slice(1) };
+};
+
+/** Single entry-normalisation for every public Rimi entry point. */
+const normalizeRimiLines = (rawLines: RimiLine[]): RimiLine[] =>
+    mergeRowFragmentsRimi(rawLines.map(foldRimiHomoglyphs).map(foldPriceLeadGarble));
+
 export function isRimiReceipt(lines: string[]): boolean {
     const first15 = lines.slice(0, 15).join(' ').toUpperCase();
-    return first15.includes('RIMI');
+    if (first15.includes('RIMI')) return true;
+    // FALLBACKS: the header name can fail OCR entirely (logo print, crop,
+    // glare). Any of these tokens is Rimi-specific WHEREVER it appears:
+    // the company PVM code, the loyalty programme, the domain, the
+    // support e-mail domain.
+    const all = lines.join(' ').toUpperCase();
+    return (
+        all.includes('LT237153113') ||
+        all.includes('MANO RIMI') ||
+        all.includes('RIMI.LT') ||
+        all.includes('RIMIBALTIC')
+    );
 }
 
 // ───────── section boundaries ─────────
@@ -902,7 +1430,7 @@ const WEIGHT_LINE_FRAGMENT_RE =
 // from numeric tokens in product names. `[^xX×]{0,20}` absorbs stray OCR
 // fragments (e.g. the `.27` price fragment) between the weight qty and the `X`.
 const WEIGHT_LINE_RATE_FRAGMENT_RE =
-    /\d[\dOoIlL.,]*[^xX×]{0,20}[xX×]\s*[\dOoIlL.,]+\s*(?:E?UR|€)?\s*\/\s*kg\b/gi;
+    /\d[\dOoIlL.,]*[^xX×]{0,20}[xX×]\s*[\dOoIlL.,]+\s*(?:[EF]?UR|€)?\s*\/\s*kg\b/gi;
 
 /**
  * Detect and extract a pack-size token from the product name.
@@ -959,6 +1487,78 @@ export function extractPackSize(
     // Lithuanian grocery names never use underscores, so this is always
     // noise. Replace before unit patterns so `\s*g\b` can match.
     preStripped = preStripped.replace(/_/g, ' ');
+    // Size-unit g read as 9 ("…, 400 9" for "…, 400 g" — same glyph skeleton
+    // on thermal prints). Comma-anchored size position only; the greedy digit
+    // run keeps a real number ("…, 199") intact, and a following digit/comma
+    // ("400 9x…" numeric run) blocks the fold.
+    preStripped = preStripped.replace(
+        /(,\s*)(\d{2,4})\s*9(?![\d,.])/g,
+        (_m, pre, num) => `${pre}${num} g `,
+    );
+    // Size-unit g read as q ("Užkandžių duonelė, 450 q" on norfa-04-09) —
+    // maxima's unit-qty rows already tolerate k[gqa]; same confusion class.
+    // Comma-anchored trailing size position only.
+    preStripped = preStripped.replace(
+        /(,\s*)(\d{2,4})\s*q\b\.?\s*$/i,
+        (_m, pre, num) => `${pre}${num} g`,
+    );
+    // Decimal split as dot+space ("Rauginti kopūstai, 0. 8 kg" — the comma
+    // read as a dot and the halves separated): rejoin to "0,8 kg" so the
+    // size doesn't parse as "8 kg" with a stray "0." left in the name.
+    preStripped = preStripped.replace(
+        /(,\s*)(\d)[.]\s+(\d)\s*(kg|l)\b/gi,
+        (_m, pre, a, b, unit) => `${pre}${a},${b} ${unit}`,
+    );
+    // OCR splits a size's digit run: "POPHOUSE, 18 0g" for a printed "180g",
+    // "SMART, 2 5kg" for "2,5kg", "milteliai, 3 Og" for "30 g". Rejoin at a
+    // comma-preceded size position only. kg/l get a DECIMAL join (2,5 kg packs
+    // exist, 25 kg ones don't); g/ml concatenate. The tail fragment accepts the
+    // OCR digit class (O→0 etc.), normalised by the size patterns below.
+    preStripped = preStripped.replace(
+        /(,\s*)(\d)[\s,]+([\dOoIl])\s*(kg|l)\b/gi,
+        (_m, pre, a, b, unit) => `${pre}${a},${b} ${unit}`,
+    );
+    preStripped = preStripped.replace(
+        /(,\s*)(\d{1,3})\s+([\dOoIl]{1,2})\s*(g|ml)\b/gi,
+        (_m, pre, a, b, unit) => `${pre}${a}${b} ${unit}`,
+    );
+    // ", 1lkg" — a stray l between the per-kg reference "1 kg" and its unit
+    // ("Saldainiai SLYVA ŠOKOLADE, 1lkg" on BE09D63A); the D-class kg pattern
+    // would read "1l" as 11 kg. The ", 1 kg" reference suffix is the only
+    // shape this appears in, so the fold is exact.
+    preStripped = preStripped.replace(/(,\s*)1l\s*kg\b/gi, (_m, pre) => `${pre}1 kg`);
+    // Letter-FUSED size: OCR drops the space before the weight so it welds
+    // onto the previous word ("…baravykais500g" for "…baravykais 500 g" on
+    // Norfa-04-09). Insert a space before a 2-4 digit run that is immediately
+    // followed by g/ml, so the size patterns below can see it. Guarded to
+    // g/ml + 2-4 digits so brand-code tails ("GAR2", "RIO3") never split.
+    preStripped = preStripped.replace(
+        /([A-Za-zĄČĘĖĮŠŲŪŽąčęėįšųūž])(\d{2,4}\s?(?:g|ml)\b)/g,
+        (_m, ch, size) => `${ch} ${size}`,
+    );
+    // Digit-FUSED litre at the trailing end ("SENELIO KOMPOSTAS 5L", iki
+    // receipt-394): the splitter above is g/ml-only and every litre pattern
+    // below needs the space. Trailing-end anchored so a mid-name digit+L
+    // brand code never splits; decimal forms pass through too ("1,5L").
+    preStripped = preStripped.replace(/\b(\d{1,2})([lL])\b\s*$/, '$1 l');
+
+    // FUSED litre after a PERCENT token ("PIEMENĖLIO pienas 3.5%, 11,
+    // butelis" = 1 l; "Pienas DVARO 2,5 %, 21 plast.but." = 2 l; "Apelsinų
+    // nekt. ELMENHORSTER 50%, 11" = 1 l). Corpus dry-run (2026-07-12, all
+    // chains, both platforms): EVERY %-anchored ", N1" run is a litre mark —
+    // the fat/juice percentage anchors the position, mid-name included. A
+    // following digit aborts (a longer number is not a litre mark).
+    const pctLitre = preStripped.match(/%\s*,\s*([1-5])1\b(?!\s*\d)/);
+    if (pctLitre) {
+        const num = parseInt(pctLitre[1], 10);
+        const strippedName = preStripped
+            .replace(/%(\s*,\s*)[1-5]1\b/, '%')
+            .replace(/\s{2,}/g, ' ')
+            .replace(/,\s*,/g, ',')
+            .replace(/[,;]\s*$/g, '')
+            .trim();
+        return { amount: num, unit: 'l', strippedName };
+    }
 
     // Milk-volume OCR fix: receipt prints "rieb., 2 l" (riebumas = fat
     // content, followed by litre volume) but iOS MLKit fuses the
@@ -969,7 +1569,9 @@ export function extractPackSize(
     // position so non-milk products with "rieb., 21 mėn" (matured-cheese
     // age) etc. don't false-trigger.
     const DAIRY_RE = /\b(?:pien|kefyr|r[uū]gpien|grietin|jogurt)/i;
-    const MILK_LITRE_OCR_RE = /(rieb\.[^,]*,\s*)([1-9])1\b\s*(?![A-Za-zĄČĘĖĮŠŲŪŽąčęėįšųūž])/i;
+    // `\s?` between the digit and the litre-mark-read-as-1: the row merger can
+    // reassemble a fragment-split "2 l" as "2 1" (space preserved).
+    const MILK_LITRE_OCR_RE = /(rieb\.[^,]*[,\s]\s*)([1-9])\s?1\b\s*(?![A-Za-zĄČĘĖĮŠŲŪŽąčęėįšųūž])/i;
     // Some milk receipts don't print the "rieb." abbreviation — the fat
     // percentage is followed directly by the volume:
     //   "ROKIŠKIO NAMINIS pienas 2,5%, 1 l" → OCR'd "...2,5%, 1 1"
@@ -1072,6 +1674,28 @@ export function extractPackSize(
         }
     }
 
+    // COUNT×UNIT-WEIGHT pack ("20x1,5 g" = 20 tea bags × 1,5 g). The count
+    // and per-item weight multiply to the net pack weight (30 g), which is
+    // what the catalog stores. Requires a g/ml unit suffix so a bare "NxM"
+    // multibuy (qty × price, no unit) can't match. Runs before the size
+    // patterns, which would otherwise read the tail "1,5 g" as the size.
+    const COUNT_X_WEIGHT_RE = new RegExp(
+        `\\b(${D}+)\\s*[xX]\\s*(${D}+(?:[.,]${D}+)?)\\s*(g|ml)\\b`,
+        'i',
+    );
+    const cxw = preStripped.match(COUNT_X_WEIGHT_RE);
+    if (cxw) {
+        const n = parseFloat(cxw[1].replace(/,/g, '.').replace(/[Oo]/g, '0').replace(/[IlLi]/g, '1'));
+        const per = parseFloat(cxw[2].replace(/,/g, '.').replace(/[Oo]/g, '0').replace(/[IlLi]/g, '1'));
+        const unit = cxw[3].toLowerCase();
+        if (Number.isFinite(n) && Number.isFinite(per) && n > 0 && per > 0) {
+            const strippedName = preStripped
+                .replace(COUNT_X_WEIGHT_RE, ' ')
+                .replace(/\s+,\s*/g, ', ').replace(/,\s*$/g, '').replace(/\s{2,}/g, ' ').trim();
+            return { amount: Math.round(n * per * 1000) / 1000, unit, strippedName };
+        }
+    }
+
     // Dual-unit tokens like "75ml/75g" — Lithuanian solid/semi-solid
     // foods (ice cream, yogurt, pudding) print both the volume and the
     // legal net mass. EU labeling requires mass as the authoritative
@@ -1123,11 +1747,68 @@ export function extractPackSize(
     //      / "Atl" false positives — those have no whitespace before
     //      the `l`. Tried after the decimal variant so the decimal
     //      version takes precedence when both could match.
+    // Trailing ", N 1" (or ", I 1") — the litre mark read as digit 1 at the
+    // very END of the name ("ALPRO PLANT PROTEIN, I 1" = 1 l, "pienas …, 2 1"
+    // = 2 l). Comma-preceded + end-anchored, so ordinary numbers can't match.
+    const TRAILING_LITRE_AS_ONE_RE = /,\s*([1-9OoIl])\s+1\s*$/;
+    {
+        const t = preStripped.match(TRAILING_LITRE_AS_ONE_RE);
+        if (t) {
+            const num = parseInt(t[1].replace(/[Oo]/, '0').replace(/[Il]/, '1'), 10);
+            if (Number.isFinite(num) && num >= 1 && num <= 9) {
+                const strippedName = preStripped
+                    .replace(TRAILING_LITRE_AS_ONE_RE, '')
+                    .replace(/[,;]\s*$/g, '')
+                    .trim();
+                return { amount: num, unit: 'l', strippedName };
+            }
+        }
+    }
+
+    // GENERAL trailing-litre garble (cross-chain — norfa imports this
+    // extractor): the printed litre mark reads as digit 1, so names end in
+    // ", 11" (1 l), ", 21" (2 l) or ", 1,51" (1,5 l). The specialized dairy/
+    // sub-litre/drink rules above run first; this is the catch-all. Guards:
+    // comma-anchored, END of name, value clamped to real pack sizes
+    // (0.1–6 l) — corpus dry-run (2026-07-12): 13 correct conversions,
+    // zero legit names corrupted.
+    const GENERAL_TRAILING_LITRE_RE = /,\s*([0-9](?:\s?,\s?\d{1,2})?)\s?1\s*$/;
+    {
+        const t = preStripped.match(GENERAL_TRAILING_LITRE_RE);
+        if (t) {
+            const num = parseFloat(t[1].replace(/\s/g, '').replace(',', '.'));
+            if (Number.isFinite(num) && num >= 0.1 && num <= 6) {
+                const strippedName = preStripped
+                    .replace(GENERAL_TRAILING_LITRE_RE, '')
+                    .replace(/[,;]\s*$/g, '')
+                    .trim();
+                return { amount: num, unit: 'l', strippedName };
+            }
+        }
+    }
+
     const patterns: Array<{ re: RegExp; unit: string }> = [
         { re: new RegExp(`\\b(${D}+(?:[.,]${D}+)?)\\s*ml\\b`, 'i'),  unit: 'ml' },
+        // "400 9" — the g read as 9 at 300 dpi (kvitas 26117700 BARILLA).
+        // Trailing-end + comma-preceded size position only, so a real number
+        // sequence in a name can't false-match.
+        { re: new RegExp(`,\\s*(${D}{2,4})\\s+9\\s*$`, 'i'),          unit: 'g'  },
+        // "100c" — the g read as c ("Poesia 100c A"). \b after c blocks "cm";
+        // an optional trailing VAT letter is tolerated at the end.
+        { re: new RegExp(`\\b(${D}{2,4})\\s*c\\b\\.?\\s*(?:[AB]\\s*)?$`, 'i'), unit: 'g'  },
+        // Comma-delimited fused "Nl" ("pienas 3.5%, 1l, butelis" — Norfa
+        // prints the volume with no space). STRICT digits, unlike the
+        // D-class patterns below: a no-space `l` with letter-substitutes
+        // would read words like "Oil" as 1 l — the comma boundary plus
+        // real digits make the token unambiguous.
+        { re: /(?:^|,)\s*([1-9](?:[.,]\d{1,2})?)l\b\.?/i,             unit: 'l'  },
         { re: new RegExp(`\\b(${D}+[.,]${D}+)\\s*l\\b`, 'i'),         unit: 'l'  },
         { re: new RegExp(`\\b(${D}+)\\s+l\\b`, 'i'),                  unit: 'l'  },
         { re: new RegExp(`\\b(${D}+(?:[.,]${D}+)?)\\s*kg\\b`, 'i'),   unit: 'kg' },
+        // "gr" abbreviation for grams ("250gr" on Norfa-04-02). Placed
+        // before the plain-g pattern, which can't match "250gr" (no word
+        // boundary after the g) and would otherwise fall through to vnt.
+        { re: new RegExp(`\\b(${D}+(?:[.,]${D}+)?)\\s*gr\\b`, 'i'),   unit: 'g'  },
         { re: new RegExp(`\\b(${D}+(?:[.,]${D}+)?)\\s*g\\b`, 'i'),    unit: 'g'  },
         { re: new RegExp(`\\b(${D}+)\\s*rit\\b\\.?`, 'i'),            unit: 'rit' },
         { re: new RegExp(`\\b(${D}+)\\s*sk\\b`, 'i'),                  unit: 'sk' },
@@ -1137,7 +1818,20 @@ export function extractPackSize(
         { re: new RegExp(`\\b(${D}+)\\s*sl\\b\\.?`, 'i'),              unit: 'sl' },
     ];
     for (const { re, unit } of patterns) {
-        const m = preStripped.match(re);
+        // First ACCEPTABLE match, not just the first match: a pure-substitute
+        // letter-run earlier in the string ("užkand.ig") must not shadow a
+        // real size later ("165g") — scan all matches for this unit.
+        const g = new RegExp(re.source, re.flags.includes('g') ? re.flags : re.flags + 'g');
+        let m: RegExpMatchArray | null = null;
+        for (const cand of preStripped.matchAll(g)) {
+            if (!/\d/.test(cand[1]) && unit === 'g') continue;
+            // zero-amounts ("18 0g" matching just "0g") must not shadow a real
+            // size either — normalise and require > 0 before accepting.
+            const probe = parseFloat(cand[1].replace(/,/g, '.').replace(/[Oo]/g, '0').replace(/[IlLi]/g, '1'));
+            if (!Number.isFinite(probe) || probe <= 0) continue;
+            m = cand as RegExpMatchArray;
+            break;
+        }
         if (!m) continue;
         // Wider OCR fold than parseNumLoose (which only handles I/l/L,
         // missing lowercase `i`). `i kg` on Rimi receipts reads `i`
@@ -1148,11 +1842,32 @@ export function extractPackSize(
             .replace(/[IlLi]/g, '1');
         const num = parseFloat(normalisedDigits);
         if (!Number.isFinite(num) || num <= 0) continue;
+
+        // WALL-HONORING NAME CUT — text-level twin of the fused-box
+        // splitter: a rimi name ENDS at its comma-anchored size token
+        // ("…, 400 g"), so anything after it in the assembled string is
+        // next-row bleed from a vertically fused read ("…, 400 g menys 0LD"
+        // on 5EEA). Cut comma+size+tail when the size is comma-anchored and
+        // the tail isn't itself another size token (mid-string sizes without
+        // a comma — "SOMAT 990ml 55sk" — keep the token-only strip).
+        let wallCut: string | null = null;
+        const matchStart = m.index ?? 0;
+        const tail = preStripped.slice(matchStart + m[0].length);
+        let wb = matchStart - 1;
+        while (wb >= 0 && /\s/.test(preStripped[wb])) wb--;
+        if (
+            wb >= 0 && preStripped[wb] === ',' && tail.trim().length > 0 &&
+            !/^\s*[\dOoIl]+[.,]?[\dOoIl]*\s*(g|gr|ml|kg|l|rit|sk|lap|pak|vnt|sl)\b/i.test(tail) &&
+            // A parenthesized tail is deliberate print, not row bleed —
+            // "Rauginti kopūstai, 0,8 kg ( Kvedaro)" keeps its annotation.
+            !/^\s*\(/.test(tail)
+        ) {
+            wallCut = preStripped.slice(0, wb);
+        }
         // Strip the matched token + collapse adjacent whitespace and
         // dangling commas so the cleaned name doesn't double-count the
         // numeric token in name-similarity scoring.
-        const strippedName = preStripped
-            .replace(re, ' ')
+        const strippedName = (wallCut ?? preStripped.replace(re, ' '))
             .replace(/\s+,\s*/g, ', ')
             .replace(/,\s*$/g, '')
             .replace(/\s{2,}/g, ' ')
@@ -1181,6 +1896,12 @@ export function extractPackSize(
 
 export function parseFooter(lines: RimiLine[]): RimiFooter {
     let total: number | null = null;
+    // True when the accepted Mokėti amount matched on a WHITESPACE-only
+    // separator — that leniency exists for smudged commas, but a digit-DROP
+    // garble produces the same shape with a wrong value (BE09D63A: bold
+    // "31,93" OCR'd as "3 93" → 3.93). Weak reads get cross-checked against
+    // the card slip below.
+    let totalWeakSep = false;
     let date = '';
     let time = '';
     let receiptNo = '';
@@ -1222,15 +1943,19 @@ export function parseFooter(lines: RimiLine[]): RimiFooter {
     // integer into the cents; tail is lenient because Rimi prints
     // amounts as "25,04 EUR" or "25,04 A" depending on layout.
     const AMOUNT_RE = new RegExp(
-        `^([${DIGIT_CHARS}]+)${SEPARATOR}([${DIGIT_CHARS}]{2})(?:\\b|$)`,
+        `^([${DIGIT_CHARS}]+)(${SEPARATOR})([${DIGIT_CHARS}]{2})(?:\\b|$)`,
     );
-    const parseAmount = (s: string): number | null => {
+    const parseAmountEx = (s: string): { value: number; weak: boolean } | null => {
         const m = s.trim().match(AMOUNT_RE);
         if (!m) return null;
         const intVal = parseInt(ocrDigit(m[1]), 10);
         if (isNaN(intVal)) return null;
-        return parseFloat(intVal + '.' + ocrDigit(m[2]));
+        return {
+            value: parseFloat(intVal + '.' + ocrDigit(m[3])),
+            weak: !/[.,]/.test(m[2]),
+        };
     };
+    const parseAmount = (s: string): number | null => parseAmountEx(s)?.value ?? null;
 
     for (let i = 0; i < lines.length; i++) {
         const text = lines[i].text.trim();
@@ -1242,15 +1967,16 @@ export function parseFooter(lines: RimiLine[]): RimiFooter {
         // overwriting the first canonical match.
         const moketiMatch = text.match(
             new RegExp(
-                `Mok${E_DIACRITIC_CLASS}ti\\s+([${DIGIT_CHARS}]+)${SEPARATOR}([${DIGIT_CHARS}]{2})`,
+                `Mok${E_DIACRITIC_CLASS}ti\\s+([${DIGIT_CHARS}]+)(${SEPARATOR})([${DIGIT_CHARS}]{2})`,
                 'i',
             ),
         );
         if (moketiMatch && total === null) {
             const intVal = parseInt(ocrDigit(moketiMatch[1]), 10);
-            const cents = ocrDigit(moketiMatch[2]);
+            const cents = ocrDigit(moketiMatch[3]);
             if (!isNaN(intVal)) {
                 total = parseFloat(intVal + '.' + cents);
+                totalWeakSep = !/[.,]/.test(moketiMatch[2]);
                 trackLine(lines[i], 'total');
             }
         }
@@ -1265,11 +1991,11 @@ export function parseFooter(lines: RimiLine[]): RimiFooter {
         //   C) MLKit DROPPED the integer half of the amount entirely
         //      (observed on a PDFium-rendered Rimi receipt: the bold
         //      "6,89" was OCR'd as just "89" with no separator, so
-        //      parseAmount can't recover it). Fall back to the FIRST
-        //      parseable amount further down the footer — typically
-        //      the VAT row's Suma-su-PVM column, which equals total.
-        //      The forward scan is bounded so unrelated content
-        //      below the footer can't false-positive.
+        //      parseAmount can't recover it). The forward scan is
+        //      bounded by the Kvito-Nr AND the VAT-table header — the
+        //      VAT columns are not reliably ordered, so an unreadable
+        //      total heals via the PIRKINYS card-slip lane or the
+        //      reconciliation-derived expected total instead.
         //
         // Uses TOTAL_LABEL_RE (word-boundary, not strict end-anchor)
         // so OCR-trailing tokens like "Mokėti EUR" / "Mokėti :" still
@@ -1289,16 +2015,18 @@ export function parseFooter(lines: RimiLine[]): RimiFooter {
 
             let chosenCand: RimiLine | undefined;
             let chosenAmount: number | null = null;
+            let chosenWeak = false;
 
             // Pass A — same-row scan (canonical Rimi layout).
             for (let k = Math.max(0, i - 3); k <= Math.min(lines.length - 1, i + 3); k++) {
                 if (k === i) continue;
                 const cand = lines[k];
                 if (!isSameRow(cand)) continue;
-                const amount = parseAmount(cand.text);
+                const amount = parseAmountEx(cand.text);
                 if (amount !== null) {
                     chosenCand = cand;
-                    chosenAmount = amount;
+                    chosenAmount = amount.value;
+                    chosenWeak = amount.weak;
                     break;
                 }
             }
@@ -1309,14 +2037,25 @@ export function parseFooter(lines: RimiLine[]): RimiFooter {
             // (definitive end of the total/payment block) so
             // unrelated amounts further down can't slip in.
             if (chosenAmount === null) {
-                const KVITO_NR_STOP = /^Kvito\s+Nr/i;
+                const KVITO_NR_STOP = /^[KA][vouy]ito\s+Nr?/i;
+                // VAT-table stop: the tax breakdown follows the payment
+                // block and its columns (Be PVM / PVM suma / Suma su PVM)
+                // are NOT reliably ordered — the forward scan used to grab
+                // the FIRST parseable number and took "Be PVM" for the
+                // total (rimi-30-04-2026-15: 0,36 instead of 0,44). With
+                // the reconciliation-derived fallback in parseRimiReceipt a
+                // missing total now heals arithmetically, so stopping here
+                // strictly beats guessing a column.
+                const VAT_TABLE_STOP = /Mokestis|Suma\s+su\s+PV[MH]|Be\s+PV[MH]|PV[MH]\s+suma/i;
                 for (let k = i + 1; k <= Math.min(lines.length - 1, i + 10); k++) {
                     const cand = lines[k];
                     if (KVITO_NR_STOP.test(cand.text.trim())) break;
-                    const amount = parseAmount(cand.text);
+                    if (VAT_TABLE_STOP.test(cand.text)) break;
+                    const amount = parseAmountEx(cand.text);
                     if (amount !== null) {
                         chosenCand = cand;
-                        chosenAmount = amount;
+                        chosenAmount = amount.value;
+                        chosenWeak = amount.weak;
                         break;
                     }
                 }
@@ -1324,6 +2063,7 @@ export function parseFooter(lines: RimiLine[]): RimiFooter {
 
             if (chosenAmount !== null && chosenCand) {
                 total = chosenAmount;
+                totalWeakSep = chosenWeak;
                 trackLine(chosenCand, 'total');
             }
         }
@@ -1417,21 +2157,31 @@ export function parseFooter(lines: RimiLine[]): RimiFooter {
         // receiptNo doesn't contain stray letters (and so DB lookups
         // that compare against fresh OCR output still match).
         if (!receiptNo && !BANKO_KVITO_RE.test(text) && RECEIPT_NO_KVITO_NR_RE.test(text)) {
-            const tail = text.replace(/^Kvito\s+Nr\.?\s*/i, '');
+            const tail = text.replace(RECEIPT_NO_KVITO_NR_STRIP_RE, '');
             const cleaned = ocrDigit(
                 tail
-                    .replace(/\s*Kasa\s+\d+.*$/i, '')
+                    // Ka[sg]a + optional glue: OCR reads 'Kasa 0038' as
+                    // 'Kaga 0038' (s→g) or glues it ('…/26948Kaga0038') —
+                    // both used to survive into the receipt id.
+                    .replace(/\s*Ka[sg]a\s*\d*.*$/i, '')
                     .replace(/\s+/g, '')
                     .trim(),
             );
-            if (cleaned) {
+            // Require ≥1 digit (post-ocrDigit fold) — the widened
+            // [KA][vouy]ito stem admits more garbled lines, and a
+            // digitless tail would otherwise mint a junk id that
+            // poisons dedup. Digitless → fall through to the numeris
+            // form / synthetic fallback instead.
+            if (cleaned && /\d/.test(cleaned)) {
                 receiptNo = cleaned;
                 trackLine(lines[i], 'receiptNo');
             }
         }
 
         if (!receiptNo && !BANKO_KVITO_RE.test(text) && RECEIPT_NO_KVITO_NUMERIS_RE.test(text)) {
-            const m = text.match(/^Kvito\s+numeris\s+(\d+)/i);
+            // Digit class admits the O/o/I/l OCR confusions —
+            // normalised right below via ocrDigit, same as the Nr form.
+            const m = text.match(/^[KA][vouy]ito\s+numeris\s+([\dOoIl]+)/i);
             if (m) {
                 receiptNo = ocrDigit(m[1]);
                 trackLine(lines[i], 'receiptNo');
@@ -1450,6 +2200,83 @@ export function parseFooter(lines: RimiLine[]): RimiFooter {
         }
     }
 
+    // CARD-SLIP total: the embedded card slip prints the charged amount as
+    // "PIRKINYS  38,09 EUR" — equal to Mokėti on card payments. The amount
+    // requires a REAL decimal separator, so it can't repeat a digit-drop
+    // garble.
+    const cardSlipTotal = (): { value: number | null; src: RimiLine } | null => {
+        for (const l of lines) {
+            if (!/P[Il1]RK[Il1]N[YV]S/i.test(l.text)) continue;
+            const inline = l.text.match(/(\d+[.,]\s?\d{2})\s*(?:EUR)?\s*$/i);
+            if (inline) return { value: parseNumLoose(inline[1]), src: l };
+            const sib = lines.find((o) => o !== l
+                && Math.max(o.yTop, l.yTop) < Math.min(o.yBottom, l.yBottom)
+                && /^\d+[.,]\s?\d{2}\s*(?:EUR)?$/i.test(o.text.trim()));
+            if (sib) return { value: parseNumLoose(sib.text), src: sib };
+        }
+        return null;
+    };
+
+    // WEAK-separator cross-check: a Mokėti amount that matched on
+    // whitespace alone is kept only while nothing better exists — when the
+    // card slip disagrees, the slip wins (BE09D63A: "Mokėti 3 93" → 3.93,
+    // card slip "PIRKINYS 31,93 EUR"; the bogus 3.93 tripped the gross-
+    // mismatch sanity, the total fell to the item-sum derivation and
+    // reconciliation went self-referential). The corrected value is still a
+    // READ total, so reconciliation can verify it.
+    if (total !== null && totalWeakSep) {
+        const slip = cardSlipTotal();
+        if (slip && slip.value !== null && slip.value !== total) {
+            total = slip.value;
+            trackLine(slip.src, 'total');
+        }
+    }
+
+    // Fallback lane: fires only when every Mokėti path failed (e.g. the
+    // bold total digits shattered into unparseable fragments: "3 8" + "09"
+    // on ios-receipt-55, "4 6" on rimi-30-04-2026-9). A READ total beats an
+    // arithmetically derived one — reconciliation can then verify instead
+    // of assume.
+    if (total === null) {
+        const slip = cardSlipTotal();
+        if (slip && slip.value !== null) {
+            total = slip.value;
+            trackLine(slip.src, 'total');
+        }
+    }
+
+    // LAST RESORT (cash receipt, IKI-parser parity): total = Grynieji
+    // (cash tendered) − Grąža (change). When the payment block is too
+    // scrambled to read a "Mokėti" total but the cash + change rows
+    // survived, this still recovers it. Only when BOTH are cleanly
+    // present and cash ≥ change.
+    if (total === null) {
+        const amtIn = (re: RegExp): number | null => {
+            for (const l of lines) {
+                if (!re.test(stripDiacritics(l.text))) continue;
+                const m = l.text.match(/(\d+[.,]\s?\d{2})/);
+                if (m) return parseNumLoose(m[1]);
+            }
+            return null;
+        };
+        const cash = amtIn(/Grynie/i);
+        const change = amtIn(/Gr[aą][zž]a/i);
+        if (cash !== null && change !== null && cash >= change) {
+            total = round2(cash - change);
+        }
+    }
+
+    // Synthetic receipt-id fallback (IKI-parser parity): when the
+    // printed "Kvito Nr." row was too garbled to survive OCR, a
+    // missing receiptNo bails the WHOLE scan downstream. Date + time
+    // + total identify the purchase just as uniquely — the same
+    // receipt photographed again yields the same synthetic id, so
+    // backend dedup still works. Only minted when all three parts
+    // are present; a partial key would collide across receipts.
+    if (!receiptNo && date && time && total !== null) {
+        receiptNo = syntheticReceiptNo(date, time, total);
+    }
+
     lineRegions.sort((a, b) => a.yTop - b.yTop);
     return {
         total,
@@ -1461,6 +2288,81 @@ export function parseFooter(lines: RimiLine[]): RimiFooter {
         region: regionOf(lines),
         lineRegions,
     };
+}
+
+/**
+ * Deterministic fallback receipt id from date + time + total —
+ * `${YYYYMMDD}-${HHMMSS}-${cents}-rimi-receipt`. Shared by
+ * parseFooter (printed id garbled) and parseRimiReceipt (total only
+ * recovered by the item-sum fallback) so both paths mint the SAME id
+ * for the same receipt.
+ */
+function syntheticReceiptNo(date: string, time: string, total: number): string {
+    return `${date.replace(/-/g, '')}-${time.replace(/:/g, '')}-${Math.round(total * 100)}-rimi-receipt`;
+}
+
+/**
+ * RECEIPT-LEVEL adjustments between the item sum and the Mokėti total —
+ * the three row kinds that move money without being products:
+ *   • "Panaudoti MANO RIMI pinigai  -0,14" — loyalty wallet spend (negative)
+ *   • "Užstatas - vienkartinė … pakuotė  0,20" — container deposit (positive;
+ *     a taromat refund prints negative and the printed sign is kept)
+ *   • "Apvalinimas ±0,0x" — cash rounding (signed)
+ * The SUTEIKTOS NUOLAIDOS block also RE-LISTS per-product discounts — those
+ * are already inside each product's Galut. kaina and must NOT be booked
+ * (rimi-30-04-2026-13 double-count trap), hence label-matching only.
+ * Amounts sit either on the label line itself or in the right price column
+ * within ~2 row heights (the deposit label wraps over two rows).
+ */
+function rimiReceiptAdjustments(lines: RimiLine[]): { total: number; used: Set<RimiLine> } {
+    // PLAIN amounts only — adjustment values never carry a VAT letter.
+    // Tolerating "N,NN A" here made the deposit sibling-search grab nearby
+    // product ANCHORS (rimi-30-04-2026-12 booked 2,18 A as a deposit).
+    const priceShaped = (t: string) => /^-?\s?\d+[.,]\s?\d{2}\s*$/.test(t.trim());
+    const val = (t: string): number | null => {
+        const m = t.replace(/\s+/g, '').replace(',', '.').match(/-?\d+\.\d{2}/);
+        return m ? parseFloat(m[0]) : null;
+    };
+    const used = new Set<RimiLine>();
+    let adj = 0;
+    for (const l of lines) {
+        // Homoglyph-tolerant labels (garble gate): "RIMI"→"Rini"/"RlMl" is in
+        // this corpus (rimi-30-04-2026-2: "Uždirbti MANO Rini pinigai") — the
+        // "Panaudot…" stem is what distinguishes spend from the Uždirbti/
+        // likutis recaps, so the RIMI token can be loose. Deposits reuse
+        // DEPOSIT_PATTERN (ū/ü/2 classes) — the extract's band skip already
+        // matches it, and a narrower regex here made the two lanes disagree.
+        // `\w{0,2}pinig`: OCR doubles the leading letter ("Ppinigai" on
+        // ios-55) — the Panaudot/MANO/R stems already pin the label down.
+        // `MANO\w?`: OCR doubles the trailing letter too ("MANOo RIMI" on
+        // 5EEA — the missed −0,61 spend broke that receipt's reconciliation).
+        const isPinigai = /Panaudot\w{0,2}\s+MANO\w?\s+R\w{2,3}\s+\w{0,2}pinig/i.test(l.text);
+        const isDeposit = DEPOSIT_PATTERN.test(l.text);
+        const isRounding = /Apvalinim/i.test(l.text);
+        if (!isPinigai && !isDeposit && !isRounding) continue;
+        const rowH = Math.max(1, l.yBottom - l.yTop);
+        // 1) amount on the label line itself
+        const inline = l.text.match(/(-?\s?\d+[.,]\s?\d{2})\s*$/);
+        let amount = inline ? val(inline[1]) : null;
+        // 2) right-column sibling within ~2 rows below the label top (the
+        //    deposit label wraps: "Užstatas - vienkartinė / metalinė pakuotė"
+        //    with the 0,20 beside the SECOND row)
+        if (amount == null) {
+            let best: RimiLine | null = null;
+            for (const o of lines) {
+                if (o === l || used.has(o) || !priceShaped(o.text)) continue;
+                if (o.xLeft < l.xRight) continue;
+                if (o.yTop < l.yTop - rowH || o.yTop > l.yTop + 2.4 * rowH) continue;
+                if (!best || Math.abs(o.yTop - l.yTop) < Math.abs(best.yTop - l.yTop)) best = o;
+            }
+            if (best) { used.add(best); amount = val(best.text); }
+        }
+        if (amount == null) continue;
+        // pinigai is always a deduction even when OCR dropped the minus;
+        // deposits/rounding keep the printed sign (covers taromat refunds).
+        adj += isPinigai ? -Math.abs(amount) : amount;
+    }
+    return { total: Math.round(adj * 100) / 100, used };
 }
 
 // ───────── band model (internal) ─────────
@@ -1501,6 +2403,9 @@ function findProductAnchors(productSlice: RimiLine[]): number[] {
             anchors.push(i);
             continue;
         }
+        // A split fused-box tail is the PREVIOUS band's recovered Galut —
+        // never an anchor (it would mint a phantom band).
+        if (line.fusedSplitTail) continue;
         if (!RELAXED_PRICE_RE.test(line.text.trim())) continue;
         if (!prev) continue;
         if (isPositivePriceLine(prev)) continue;
@@ -1582,6 +2487,14 @@ function findProductBandsInternal(productSlice: RimiLine[]): ProductBandInternal
         let depositSeen = false;
         let depositWraps = 0;
         let depositTotalAbsorbed = false;
+        // A tail line's bbox can be INFLATED by fused/skewed OCR fragments (a
+        // 90 px discount bbox against ~50 px rows, rimi-30-04-2026-5) — taking
+        // its raw yBottom pushes the wall past the NEXT product's first name
+        // line and sweeps it into this band. Cap each tail contribution to a
+        // row-and-a-bit measured off this band's own anchor height.
+        const anchorRowH = Math.max(20, anchor.yBottom - anchor.yTop);
+        const cappedBottom = (line: RimiLine) =>
+            Math.min(line.yBottom, line.yTop + 1.2 * anchorRowH);
 
         for (let k = anchorIdx + 1; k < productSlice.length; k++) {
             const line = productSlice[k];
@@ -1593,12 +2506,18 @@ function findProductBandsInternal(productSlice: RimiLine[]): ProductBandInternal
                 lastBottom = Math.max(lastBottom, line.yBottom);
                 continue;
             }
+            // Split fused-box tail = this band's recovered Galut row —
+            // tail-eligible so the wall lands BELOW it.
+            if (line.fusedSplitTail) {
+                lastBottom = Math.max(lastBottom, cappedBottom(line));
+                continue;
+            }
             if (isDiscountLine(line)) {
-                lastBottom = Math.max(lastBottom, line.yBottom);
+                lastBottom = Math.max(lastBottom, cappedBottom(line));
                 continue;
             }
             if (isWeightOrMultiLine(line)) {
-                lastBottom = Math.max(lastBottom, line.yBottom);
+                lastBottom = Math.max(lastBottom, cappedBottom(line));
                 continue;
             }
             // Deposit continuation: wrap text like "metalinė pakuotė".
@@ -1655,9 +2574,20 @@ function findProductBandsInternal(productSlice: RimiLine[]): ProductBandInternal
                 firstNextTop = line.yTop;
             }
         }
-        const bottomWall = Number.isFinite(firstNextTop)
-            ? (tailBottom + firstNextTop) / 2
-            : tailBottom;
+        // Wall placement: no line CENTER can lie in the open gap
+        // (tailBottom, firstNextTop) — any center past tailBottom already
+        // bounded firstNextTop — so anywhere inside the gap assigns lines
+        // identically. HUG THE TAIL (15% into the gap) instead of the
+        // midpoint: when a printed-but-UNREAD row straddles the gap
+        // (rimi-30-04-2026-8's dropped first name line), the midpoint sliced
+        // it across two band crops; hugging leaves it visually with the NEXT
+        // band, matching how read receipts render. Negative gaps (a
+        // straddling box makes firstNextTop < tailBottom) keep the midpoint.
+        const bottomWall = !Number.isFinite(firstNextTop)
+            ? tailBottom
+            : firstNextTop > tailBottom
+                ? tailBottom + 0.15 * (firstNextTop - tailBottom)
+                : (tailBottom + firstNextTop) / 2;
         bands.push({ anchorIdx, topWall, bottomWall });
     }
     return bands;
@@ -1856,6 +2786,13 @@ function computeBandsContext(rawLines: RimiLine[]): BandsContext {
     const productBands: RimiReceiptBand[] = [];
     const productInternals: RimiBandInternal[] = [];
     const centerOf = (line: RimiLine) => (line.yTop + line.yBottom) / 2;
+    // DRAWN band geometry ≠ walls. Walls are assignment constructs living in
+    // the empty gap between bands; drawing them wall-to-wall sliced any
+    // printed-but-UNREAD row across two band crops (rimi-30-04-2026-8's
+    // dropped first name line). Draw each band down to its CONTENT hull and
+    // start the next band's crop right there — inter-band pixels always
+    // render with the band BELOW, same as on receipts where every row reads.
+    let prevDrawnBottom: number | null = null;
 
     // Visible top/bottom of the productSlice — used to clamp the
     // first band's open top wall and the last band's open bottom
@@ -1883,14 +2820,19 @@ function computeBandsContext(rawLines: RimiLine[]): BandsContext {
         }
         if (memberIdxs.length === 0) continue;
 
-        const visTop = Number.isFinite(band.topWall) ? band.topWall : sliceTop;
-        const visBottom = Number.isFinite(band.bottomWall) ? band.bottomWall : sliceBottom;
+        const contentBottom = Math.max(...memberIdxs.map((k) => productSlice[k].yBottom));
+        const visTop = prevDrawnBottom
+            ?? (Number.isFinite(band.topWall) ? band.topWall : sliceTop);
+        const visBottom = bi === internal.length - 1
+            ? Math.max(contentBottom, Math.min(sliceBottom, Number.isFinite(band.bottomWall) ? band.bottomWall : sliceBottom))
+            : contentBottom;
         productBands.push({
             kind: 'product',
             yTop: visTop,
             yBottom: visBottom,
             label: `#${bi + 1}`,
         });
+        prevDrawnBottom = visBottom;
 
         // Split members by index relative to the anchor:
         //   sliceIdx < anchorIdx  → preName (name lines, ordered as
@@ -1958,7 +2900,8 @@ function computeBandsContext(rawLines: RimiLine[]): BandsContext {
  * Step 1: locate every region we want to band on the receipt +
  * surface per-product typed content for step 2.
  */
-export function findReceiptBandsRimi(rawLines: RimiLine[]): RimiReceiptBandPlan {
+export function findReceiptBandsRimi(inputLines: RimiLine[]): RimiReceiptBandPlan {
+    const rawLines = normalizeRimiLines(inputLines);
     const ctx = computeBandsContext(rawLines);
     return { bands: ctx.bands, productInternals: ctx.productInternals };
 }
@@ -1976,7 +2919,8 @@ const fmtY = (line: RimiLine): string =>
  * the receipt. Two sections: a band summary, then a per-OCR-line
  * dump with the classification each products-slice line received.
  */
-export function traceReceiptBandsRimi(rawLines: RimiLine[]): string {
+export function traceReceiptBandsRimi(inputLines: RimiLine[]): string {
+    const rawLines = normalizeRimiLines(inputLines);
     const ctx = computeBandsContext(rawLines);
     const out: string[] = [];
     out.push(
@@ -2039,6 +2983,15 @@ export function traceReceiptBandsRimi(rawLines: RimiLine[]): string {
 export interface RimiExtractResult {
     product: RimiProduct | null;
     warnings: string[];
+    /** Printed line total of a deliberately SKIPPED band (bag / deposit-only /
+     *  non-catalog) — the item is not emitted as a product but its money IS in
+     *  the printed Mokėti (78B94F81: the 0,01 bag broke reconciliation by one
+     *  cent). parseRimiReceipt adds this to the reconciliation sum. */
+    skippedLineTotal?: number;
+    /** Printed anchor total of a weighed-no-ppu product whose price was
+     *  ZEROED by the poison guard — the €/kg is unrecoverable but the line's
+     *  money is known and belongs in the reconciliation sum. */
+    zeroedLineTotal?: number;
 }
 
 const RECONCILE_TOLERANCE_EUR = 0.02;
@@ -2078,7 +3031,16 @@ export function extractRimiProduct(internal: RimiBandInternal): RimiExtractResul
     let savings: number | null = null;
     let finalPrice: number | null = null;
     let depositSeen = false;
+    // Weighed-hint state: a weight-SHAPED line was seen but every
+    // weight regex failed on it (WEIGHT_HINT_RE). Drives the price-
+    // poisoning guard after the loop; hintKgQty keeps the printed kg
+    // quantity when at least that half of the garbled line survived,
+    // so €/kg can be re-derived from the anchor total.
+    let weighedHint = false;
+    let hintKgQty: number | null = null;
+    let hintText: string | null = null;
     const nameFragments: string[] = [];
+    const fusedNameFragments: string[] = [];
 
     const allEntries: Array<{ entry: RimiBandLineEntry; isPreName: boolean }> = [
         ...internal.preName.map((e) => ({ entry: e, isPreName: true })),
@@ -2103,7 +3065,7 @@ export function extractRimiProduct(internal: RimiBandInternal): RimiExtractResul
             continue;
         }
         const galutFragment = text.match(
-            /Gal[uūü]t\s*[.,]?\s*k?aina\s*([\dOoIl]+[.,]\s?[\dOoIl]{1,2})/i,
+            /Gal[uūü]t\s*[.,:;]?\s*k?aina\s*([\dOoIl]+[.,]\s?[\dOoIl]{1,2})/i,
         );
         if (galutFragment && finalPrice === null) {
             finalPrice = parseNumLoose(galutFragment[1]);
@@ -2171,9 +3133,47 @@ export function extractRimiProduct(internal: RimiBandInternal): RimiExtractResul
         }
         const multiMatch = stripped.match(MULTI_RE);
         if (multiMatch && pricePerUnit === null) {
-            quantity = parseInt(multiMatch[1], 10);
+            quantity = foldMultiQty(multiMatch[1]);
             pricePerUnit = parseNumLoose(multiMatch[2]);
             unit = 'vnt';
+            continue;
+        }
+        // MULTI-HINT rescue (mirrors the weighed-hint below): the row is
+        // multi-buy-SHAPED ("3 JVnt,g" — a garbled "3 vnt. X 4,99" whose
+        // unit price OCR ate) but MULTI_RE can't parse it. Salvage the COUNT
+        // and re-derive €/unit from the band's own line total when it
+        // divides to exact cents — without this the product shipped with
+        // price = the line TOTAL (€14,97 for a 3-pack of €4,99 BARILLA) and
+        // broke the receipt's reconciliation.
+        const multiHint = stripped.match(/^(\d{1,2})\s*[JIl1|]?[Vv]nt\b/);
+        if (multiHint && pricePerUnit === null && quantity === 1) {
+            const n = parseInt(multiHint[1], 10);
+            if (n >= 2 && n <= 24 && price > 0) {
+                const per = Math.round((price / n) * 100) / 100;
+                if (per > 0 && Math.abs(per * n - price) < 0.005) {
+                    quantity = n;
+                    pricePerUnit = per;
+                    unit = 'vnt';
+                    continue;
+                }
+            }
+        }
+        // Weighed-hint capture: the row is weight-SHAPED ("kg ×" body
+        // or "EUR/kg" rate suffix) but too garbled for any weight
+        // regex above (e.g. a non-foldable letter inside the €/kg
+        // digits: "0,978 kg X 1,b9 EUR/kg"). Remember the hint, try
+        // to salvage the printed kg quantity for €/kg re-derivation,
+        // and NEVER let the fragment into the displayed name.
+        if (WEIGHT_HINT_RE.test(stripped)) {
+            weighedHint = true;
+            if (hintKgQty === null) {
+                const km = stripped.match(/(\d+[.,]\s?\d{1,3})\s*kg\b/i);
+                if (km) {
+                    const q = parseNumLoose(km[1]);
+                    if (q > 0) hintKgQty = q;
+                }
+            }
+            if (hintText === null) hintText = stripped;
             continue;
         }
         if (
@@ -2189,6 +3189,18 @@ export function extractRimiProduct(internal: RimiBandInternal): RimiExtractResul
             depositSeen = true;
             continue;
         }
+        // Split fused-box tail: the previous discount row's printed Galut
+        // value, restored to this band's own territory by the splitter.
+        if (entry.line.fusedSplitTail) {
+            if (finalPrice === null) {
+                const v = parseNumLoose(text);
+                if (v > 0 && v < price - 0.009) {
+                    finalPrice = v;
+                    warnings.push(`Galut. kaina ${v.toFixed(2)} recovered from a fused-box tail`);
+                }
+            }
+            continue;
+        }
         if (BARE_PRICE_RE.test(text)) continue;
         if (depositSeen) continue;
         // Only preName entries contribute to the product name. PostAnchor
@@ -2200,6 +3212,17 @@ export function extractRimiProduct(internal: RimiBandInternal): RimiExtractResul
         // left-column wraps land in preName via the splice, so this no
         // longer drops anything that should have been in the name.
         if (!isPreName) continue;
+        // FUSED-ROW QUARANTINE: this box is two printed rows OCR'd into one
+        // garbled string (see RimiLine.fusedRow). Its text is part-this-
+        // product, part-next-product and part-noise — letting it into the
+        // name poisons matching (guaranteed orphan). Excluded unless it is
+        // the ONLY name source (a garbled name still beats an empty one,
+        // which would get prod-hidden).
+        if (entry.line.fusedRow) {
+            fusedNameFragments.push(text);
+            warnings.push(`fused-row quarantined from name: "${text.slice(0, 40)}"`);
+            continue;
+        }
         // Include slices that carry product text (letters) OR pure-digit
         // size hints (e.g. "%, 1 1" — the OCR-mangled volume slot on
         // milk receipts where the size hint is on its own slice with no
@@ -2225,8 +3248,12 @@ export function extractRimiProduct(internal: RimiBandInternal): RimiExtractResul
         // Strip a trailing "…WORD.? -N,NN" savings fragment that leaked
         // when OCR mangled "Nuol. -N,NN" beyond classifier recognition
         // (e.g. "RIP. -1,92" read where the receipt printed "Nuol. -1,92").
+        // Cents are EXACTLY two digits: printed Nuol amounts always are, and
+        // one-digit tolerance made a produce GRADE token + a wrapped size
+        // digit ("…C2-3, 1" on ios-55 citrinos) read as savings 3,10 — a
+        // phantom discount on a discount-less product.
         const savingsInName = nameText.match(
-            /(?:^|\s+)\S{1,8}\.?\s*-\s*([\dOoIl]+[.,]\s?[\dOoIl]{1,2})\s*$/i,
+            /(?:^|\s+)\S{1,8}\.?\s*-\s*([\dOoIl]+[.,]\s?[\dOoIl]{2})\s*$/i,
         );
         if (savingsInName) {
             if (savings === null) {
@@ -2234,19 +3261,107 @@ export function extractRimiProduct(internal: RimiBandInternal): RimiExtractResul
             }
             nameText = nameText.slice(0, nameText.length - savingsInName[0].length).trim();
         }
+        // A bare trailing "EUR" with no amount in front of it is qty-row
+        // bleed from a sagging double-read ("ant ib., 500 g EUR" on
+        // ios-55) — currency never ends a name row on its own. Amounts
+        // keep theirs ("2 vnt. X 3,49 EUR" is not a name row anyway).
+        const eurTail = nameText.match(/^(.*?)[\s,]+EUR$/i);
+        if (eurTail && !/\d[.,]?\d*\s*$/.test(eurTail[1])) {
+            nameText = eurTail[1].trim();
+        }
+        // Garbled MULTIBUY row bled into a name fragment ("…FUSILLI, 3
+        // JVnt,g EUR" — the qty row's X and unit price OCR-eaten, so
+        // MULTI_RE never saw it, and the row merger gled the shards onto the
+        // name): salvage the count, derive €/unit from the band's own line
+        // total when it divides to exact cents, and cut the junk from the
+        // name. GARBLE EVIDENCE required (mangled Vnt casing/prefix like
+        // "JVnt", or g/EUR junk right after) — a clean ", 2 vnt." pack
+        // descriptor in a legit name never fires this.
+        const nameMultiHint = nameText.match(/(?:^|[\s,])([2-9]|1\d)\s*(?:[JIl1|][Vv]nt|[Vv]nt\b\s*[,.]?\s*(?:[g9]\b|E[UŲ]R))/);
+        if (nameMultiHint && quantity === 1 && pricePerUnit === null && price > 0) {
+            const n = parseInt(nameMultiHint[1], 10);
+            const per = Math.round((price / n) * 100) / 100;
+            if (per > 0 && Math.abs(per * n - price) < 0.005) {
+                quantity = n;
+                pricePerUnit = per;
+                unit = 'vnt';
+                // Everything from the hint on is qty-row junk, not name.
+                nameText = nameText.slice(0, nameMultiHint.index ?? 0).replace(/[\s,]+$/, '').trim();
+                warnings.push('multibuy salvaged from garbled qty bleed: ' + n + ' × €' + per.toFixed(2));
+                if (!nameText) continue;
+            }
+        }
+        // A stray standalone currency fragment never belongs in a name.
+        if (/^E[UŲ]R\.?$/i.test(nameText.trim())) continue;
         if (/[a-zA-Z\dąčęėįšųūžĄČĘĖĮŠŲŪŽ]/.test(nameText)) {
             nameFragments.push(nameText);
         }
     }
 
-    const rawName = nameFragments.join(' ').trim();
+    // MULTI-CORROBORATED ANCHOR HEAL: the anchor total sometimes garbles a
+    // single LEADING digit while the multi-buy line reads clean — ios-56
+    // printed "2,78 A" for "2 vnt. X 1,39 EUR" but OCR gave "0,78A". When
+    // ppu × qty differs from the anchor by exactly a leading-digit
+    // substitution, the receipt's own arithmetic corroborates the fix
+    // (Maxima-parser parity: broken-tail cents solve). Never fires when a
+    // Galut. kaina is present (the promo lane owns that math).
+    if (pricePerUnit !== null && quantity > 1 && finalPrice === null) {
+        const expected = Math.round(pricePerUnit * quantity * 100) / 100;
+        if (Math.abs(expected - price) > 0.009) {
+            const expStr = expected.toFixed(2);
+            const gotStr = price.toFixed(2);
+            if (expStr.length === gotStr.length && expStr.slice(1) === gotStr.slice(1) && expStr[0] !== gotStr[0]) {
+                warnings.push(`anchor HEALED ${gotStr} → ${expStr} (${pricePerUnit.toFixed(2)} × ${quantity} corroborates)`);
+                price = expected;
+            }
+        }
+    }
+
+    let rawName = nameFragments.join(' ').trim();
+    // Cleaned fused text = the garble minus any trailing price it swallowed
+    // (that price belongs to the PREVIOUS product's discount row — see the
+    // Galut salvage in parseRimiReceipt).
+    const cleanedFused = fusedNameFragments.join(' ')
+        .replace(/\s*\d+[.,]\s?\d{2}\s*[AB]?\s*$/, '')
+        .trim();
+    if (!rawName && fusedNameFragments.length) {
+        // Every name line was a fused box — keep the garble over an empty
+        // name (empty → skip:no-name → the product vanishes entirely).
+        rawName = cleanedFused || fusedNameFragments.join(' ').trim();
+        warnings.push('name is a fused-row garble (no clean name line survived)');
+    } else if (
+        rawName && cleanedFused
+        && rawName.replace(/[^A-Za-zĄČĘĖĮŠŲŪŽąčęėįšųūž]/g, '').length < 8
+    ) {
+        // Only a short continuation survived (letters of "BASIC, 400 g" =
+        // "BASICg") — a fused box holds the real first name line; garbled
+        // beats truncated for matching (rimi-30-04-2026-2 Lazdynų).
+        rawName = `${cleanedFused} ${rawName}`;
+        warnings.push('fused-row text kept in name (clean name too short without it)');
+    }
     if (!rawName) {
         return { product: null, warnings: ['skip:no-name'] };
     }
+    // Skipped-but-PAID bands surface their printed total for reconciliation —
+    // the bag's 0,01 is in the Mokėti even though no product is emitted.
+    // Deposit-only bands deliberately DON'T (rimiReceiptAdjustments books
+    // every Užstatas line once; adding here would double-count).
+    const paidSkipTotal = (finalPrice != null && finalPrice > 0 ? finalPrice : price) || 0;
     if (NON_CATALOG_PATTERN.test(rawName)) {
         return {
             product: null,
             warnings: [`skip:non-catalog "${rawName.slice(0, 60)}"`],
+            skippedLineTotal: paidSkipTotal,
+        };
+    }
+    // FUZZY bag fallback: heavy OCR garble ("Rimi maigagA" for "Rimi maišelis")
+    // defeats the pattern above, but a "mai…"-stem token combined with a
+    // bag-priced anchor (≤ €0.60) is unambiguous — no real product is both.
+    if (/\bmai[sšžzg]\w{0,6}\b/i.test(rawName) && price <= 0.6) {
+        return {
+            product: null,
+            warnings: [`skip:non-catalog fuzzy-bag "${rawName.slice(0, 60)}" (price ${price.toFixed(2)})`],
+            skippedLineTotal: paidSkipTotal,
         };
     }
     if (DEPOSIT_PATTERN.test(rawName)) {
@@ -2263,6 +3378,84 @@ export function extractRimiProduct(internal: RimiBandInternal): RimiExtractResul
     // SPs of the right pack size when multiple same-named variants exist.
     let { amount: parsedAmount, unit: parsedUnit, strippedName: nameAfterPackExtract } =
         extractPackSize(rawName);
+
+    // WEIGHED PRICE-POISONING GUARD (IKI-parser parity, "show it,
+    // never write price"): the band carries a kg signal but ALL of
+    // the weight regexes failed, so no €/kg was established. Two
+    // kg-signal sources:
+    //   - weighedHint: a weight-SHAPED line was seen in the band but
+    //     was too garbled to parse (receipt-55/56 shapes);
+    //   - a bare ", kg" name tail with no pack-size digits ("Švieži
+    //     kalakutų filė, kg") — the per-kg reference suffix — when
+    //     OCR dropped the weight row entirely. Fixed packs print a
+    //     digit before kg ("1 kg") which extractPackSize captures
+    //     and strips, so they never reach this test.
+    // Recovery first: when the printed kg quantity survived on the
+    // hint line, €/kg = anchor total ÷ qty. When unrecoverable the
+    // item must NOT fall back to unit=vnt with the anchor line total
+    // as its price — that total is for a FRACTION of a kg and would
+    // poison the per-unit reference price. Keep the item (unit 'kg'
+    // so it still SHOWS on the receipt) but zero its price and null
+    // its €/kg → the server's price ingestion skips `price <= 0` and
+    // never writes a reference price.
+    let weighedNoPpu = false;
+    const bareKgTail =
+        parsedAmount === null && /,\s*kg\s*$/i.test(nameAfterPackExtract);
+    if (pricePerUnit === null && (weighedHint || bareKgTail)) {
+        if (hintKgQty !== null && hintKgQty > 0) {
+            const derived = round2(price / hintKgQty);
+            if (derived > 0 && derived < 1000) {
+                pricePerUnit = derived;
+                quantity = hintKgQty;
+                unit = 'kg';
+                warnings.push(
+                    `weighed RECOVERED: €/kg=${derived.toFixed(2)} (price=${price.toFixed(2)} ÷ kg=${hintKgQty})`,
+                );
+            }
+        }
+        // GARBLED-PPU recovery (ios-55 paprikos): the mushed hint line still
+        // CONTAINS the printed €/kg digits right before the EUKG marker —
+        // "46g429 EUKG" ← "0,406 kg X 4,29 EUR/kg". Take the 3-4 digit run
+        // before the marker as X,XX / XX,XX, derive qty = anchor ÷ €/kg, and
+        // accept ONLY with corroboration: the qty is a plausible weighed
+        // amount AND the hint's LEADING digits appear (in order) inside the
+        // derived qty's digits ("46" ⊆ "0406"). Both numbers come from the
+        // printed line — this is recovery, not fabrication.
+        if (pricePerUnit === null && hintText !== null && price > 0) {
+            const ppuM = hintText.match(/(\d{3,4})\s*E[UO]?KG\b/i);
+            if (ppuM) {
+                const d = ppuM[1];
+                const ppuCand = parseFloat(`${d.slice(0, d.length - 2)}.${d.slice(-2)}`);
+                if (ppuCand > 0) {
+                    const qtyCand = Math.round((price / ppuCand) * 1000) / 1000;
+                    const leadM = hintText.match(/^\D*(\d+)/);
+                    const leadDigits = leadM ? leadM[1] : '';
+                    const qtyDigits = qtyCand.toFixed(3).replace(/\D/g, '');
+                    const isSubseq = (needle: string, hay: string): boolean => {
+                        let i = 0;
+                        for (const ch of hay) if (ch === needle[i]) i++;
+                        return i >= needle.length;
+                    };
+                    if (qtyCand >= 0.02 && qtyCand <= 25 && leadDigits.length >= 2 && isSubseq(leadDigits, qtyDigits)) {
+                        pricePerUnit = ppuCand;
+                        quantity = qtyCand;
+                        unit = 'kg';
+                        warnings.push(
+                            `weighed RECOVERED from garble: €/kg=${ppuCand.toFixed(2)}, kg=${qtyCand} (anchor ${price.toFixed(2)} corroborates "${hintText.slice(0, 24)}")`,
+                        );
+                    }
+                }
+            }
+        }
+        if (pricePerUnit === null) {
+            weighedNoPpu = true;
+            unit = 'kg';
+            if (hintKgQty !== null && hintKgQty > 0) quantity = hintKgQty;
+            warnings.push(
+                'weighed NO-PPU: kg signal but €/kg unrecoverable — price zeroed (never a unit reference)',
+            );
+        }
+    }
 
     // Inference layer: when extractPackSize returned null we still have
     // two high-confidence guesses we can make from receipt-line context.
@@ -2326,10 +3519,22 @@ export function extractRimiProduct(internal: RimiBandInternal): RimiExtractResul
         const expected = price - savings!;
         const delta = Math.abs(expected - finalPrice!);
         if (delta > RECONCILE_TOLERANCE_EUR) {
-            warnings.push(
-                `reconcile MISMATCH: price=${price.toFixed(2)} − savings=${savings!.toFixed(2)} = ` +
-                    `${expected.toFixed(2)} but Galut.kaina=${finalPrice!.toFixed(2)} (Δ=${delta.toFixed(2)})`,
-            );
+            // Galut. kaina is the PRINTED final price — when it's plausible it
+            // wins and the mismatch means the Nuol AMOUNT was misread (OCR digit
+            // garble, kvitas rimi-30-04-2026 p1: "-0,50" for a real "-0,90").
+            // A NOTE, not a WARN: the committed value is trustworthy, and the
+            // batch UI flags WARN-prefixed lines as issues.
+            if (finalPrice! > 0 && finalPrice! < price) {
+                warnings.push(
+                    `Nuol amount likely misread (price ${price.toFixed(2)} − savings ${savings!.toFixed(2)} ≠ ` +
+                        `Galut ${finalPrice!.toFixed(2)}) — printed Galut. kaina committed`,
+                );
+            } else {
+                warnings.push(
+                    `reconcile MISMATCH: price=${price.toFixed(2)} − savings=${savings!.toFixed(2)} = ` +
+                        `${expected.toFixed(2)} but Galut.kaina=${finalPrice!.toFixed(2)} (Δ=${delta.toFixed(2)})`,
+                );
+            }
         }
     } else if (savingsCaptured && !finalPriceCaptured) {
         finalPrice = Math.round((price - savings!) * 100) / 100;
@@ -2343,7 +3548,21 @@ export function extractRimiProduct(internal: RimiBandInternal): RimiExtractResul
         );
     }
 
-    const promoPrice = finalPrice;
+    // DISCOUNT PLAUSIBILITY CLAMP (IKI-parser parity): a discount can
+    // never exceed the line total, and a promo can never exceed the
+    // base price — paid must satisfy 0 ≤ Galut.kaina ≤ price. A
+    // violation means the discount row was mis-attributed or OCR-
+    // mangled, so DROP the discount (keep the base price) rather than
+    // ship a negative or inflated promo. Weighed-no-ppu items carry no
+    // promo at all — their price is zeroed, so a promo would be
+    // nonsensical (same rule as IKI's weighedNoPpu).
+    let promoPrice = weighedNoPpu ? null : finalPrice;
+    if (promoPrice !== null && (promoPrice < 0 || promoPrice > price)) {
+        warnings.push(
+            `discount DROPPED: implausible Galut.kaina=${promoPrice.toFixed(2)} vs price=${price.toFixed(2)}`,
+        );
+        promoPrice = null;
+    }
 
     // ppu × qty reconcile + self-heal. Receipts print the price-per-
     // unit in the middle column (`2 vnt. X 4,99 EUR` or `0,690 kg X
@@ -2364,6 +3583,25 @@ export function extractRimiProduct(internal: RimiBandInternal): RimiExtractResul
             const derived = quantity !== 0
                 ? Math.round((price / quantity) * 100) / 100
                 : null;
+            // WEIGHED-QTY HEAL (mirror of the multi-corroborated anchor
+            // heal): the weighed line can garble a single leading digit of
+            // the QUANTITY while ppu and the anchor total read clean —
+            // ios-55 printed "0,390 kg X 2,49 EUR/kg" with total "0,97 A"
+            // but OCR gave "8,390 kg", minting 8.39 kg of lemons. When
+            // anchor ÷ ppu lands on a quantity that differs from the OCR
+            // read by exactly a leading-digit substitution, the receipt's
+            // own arithmetic corroborates the fix. kg only: integer vnt
+            // counts have no printed decimals to corroborate against.
+            const derivedQty = unit === 'kg' && pricePerUnit > 0
+                ? Math.round((price / pricePerUnit) * 1000) / 1000
+                : null;
+            const qtyHealOk = (): boolean => {
+                if (derivedQty === null || derivedQty <= 0) return false;
+                if (Math.abs(Math.round(derivedQty * pricePerUnit! * 100) / 100 - price) > RECONCILE_TOLERANCE_EUR) return false;
+                const e = derivedQty.toFixed(3);
+                const g = quantity.toFixed(3);
+                return e.length === g.length && e.slice(1) === g.slice(1) && e[0] !== g[0];
+            };
             if (
                 derived !== null &&
                 Math.abs(derived * quantity - price) <= RECONCILE_TOLERANCE_EUR &&
@@ -2374,6 +3612,12 @@ export function extractRimiProduct(internal: RimiBandInternal): RimiExtractResul
                         `(price=${price.toFixed(2)} ÷ qty=${quantity})`,
                 );
                 pricePerUnit = derived;
+            } else if (qtyHealOk()) {
+                warnings.push(
+                    `reconcile HEALED: qty ${quantity.toFixed(3)} → ${derivedQty!.toFixed(3)} kg ` +
+                        `(price=${price.toFixed(2)} ÷ ppu=${pricePerUnit.toFixed(2)} corroborates)`,
+                );
+                quantity = derivedQty!;
             } else {
                 warnings.push(
                     `reconcile MISMATCH: ppu=${pricePerUnit.toFixed(2)} × qty=${quantity} = ` +
@@ -2394,17 +3638,29 @@ export function extractRimiProduct(internal: RimiBandInternal): RimiExtractResul
     return {
         product: {
             name,
-            price,
+            // Weighed-no-ppu: price 0 (not the fraction-of-kg line
+            // total) — the server skips price<=0 writes, so the item
+            // shows on the receipt without minting a reference price.
+            price: weighedNoPpu ? 0 : price,
             promoPrice,
             quantity,
             unit,
-            pricePerUnit,
+            pricePerUnit: weighedNoPpu ? null : pricePerUnit,
+            // Priced per kg → weighable (per-piece rows emit false).
+            // Threaded to the server matcher by the coordinator.
+            isWeighable: unit === 'kg',
             rawLines,
             region,
             parsedAmount,
             parsedUnit,
         },
         warnings,
+        // The MONEY is still known even when the €/kg isn't — the anchor is
+        // the printed line total. Reconciliation books it via this side
+        // channel so a weighed-no-ppu item doesn't fail the whole receipt's
+        // arithmetic (price stays 0: the poison guard is about REFERENCE
+        // prices, not about the receipt's own books).
+        zeroedLineTotal: weighedNoPpu && price > 0 ? price : undefined,
     };
 }
 
@@ -2412,7 +3668,8 @@ export function extractRimiProduct(internal: RimiBandInternal): RimiExtractResul
  * Per-band extraction trace, copy-paste-friendly. Companion to
  * `traceReceiptBandsRimi` for step 2.
  */
-export function traceRimiExtract(rawLines: RimiLine[]): string {
+export function traceRimiExtract(inputLines: RimiLine[]): string {
+    const rawLines = normalizeRimiLines(inputLines);
     const ctx = computeBandsContext(rawLines);
     const out: string[] = [];
     out.push(`bands=${ctx.productInternals.length}`);
@@ -2475,14 +3732,81 @@ export function traceRimiExtract(rawLines: RimiLine[]): string {
  * trace and reconcile self-check; the normalization happens once
  * at this boundary.
  */
-export function parseRimiReceipt(rawLines: RimiLine[]): RimiParseResult {
+
+/**
+ * DISCOUNT-SECTION PACK-SIZE CORROBORATION — the SUTEIKTOS NUOLAIDOS block
+ * RE-LISTS discounted products' full names, printed in a denser, usually
+ * cleaner region than the product rows (whose sizes pass through name-wrap
+ * OCR hazards). Treat that re-list as a SECOND READ of the same text — the
+ * ensemble graft principle (graftRicherFields) applied to the receipt's own
+ * redundancy — and corroborate each product's pack size against it:
+ *   · product has NO size, section copy parses one   → adopt it
+ *   · same NUMBER, different unit ("75 l" vs "75 ml" — the m dropped on the
+ *     product row, rimi-30-04-2026 Colgate)           → adopt the section unit
+ * Matching uses the same char/token similarity the truth comparator uses;
+ * NOTHING here touches prices — sizes are display metadata only.
+ */
+function healPackSizesFromDiscountSection(lines: RimiLine[], products: RimiProduct[]): void {
+    const start = lines.findIndex((l) => /SUTE[IK]+T?OS\s+NUOLAID/i.test(l.text));
+    if (start < 0) return;
+    const texts: string[] = [];
+    for (let i = start + 1; i < lines.length; i++) {
+        const t = lines[i].text.trim();
+        if (/MOK[EĖ]JIMAS|PARDAVIMAS|BANKO\s+KVITO|J[uū]s\s+sutaup|LAIKAS/i.test(t)) break;
+        if (/^-?\s?[\dOoIl]+[.,]\s?[\dOoIl]{2}\s*$/.test(t)) continue;       // amount column
+        if (/Panaudot|Kitos\s+akcij|Apvalinim/i.test(t)) continue;             // adjustment labels
+        if (t.length < 4) continue;
+        texts.push(t);
+    }
+    if (texts.length === 0) return;
+    // Candidate copies: each line alone + joined with its successor (names
+    // wrap over two section rows: "Dantų pasta cOLGATE CAVITY" +
+    // "PROT.WHITEN. 75 ml").
+    const candidates: string[] = [...texts];
+    for (let i = 0; i + 1 < texts.length; i++) candidates.push(`${texts[i]} ${texts[i + 1]}`);
+
+    for (const p of products) {
+        if (!p.name) continue;
+        let best: { amount: number; unit: string } | null = null;
+        let bestSim = 0;
+        for (const cand of candidates) {
+            const size = extractPackSize(cand);
+            if (size.amount === null || size.unit === null) continue;
+            const sim = dupSimilarity(p.name, size.strippedName);
+            if (sim > bestSim) { bestSim = sim; best = { amount: size.amount, unit: size.unit }; }
+        }
+        if (!best || bestSim < 0.7) continue;
+        if (p.parsedAmount == null) {
+            p.parsedAmount = best.amount;
+            p.parsedUnit = best.unit;
+        } else if (
+            Math.abs(p.parsedAmount - best.amount) < 0.001 &&
+            p.parsedUnit !== best.unit
+        ) {
+            p.parsedUnit = best.unit;
+        }
+    }
+}
+
+export function parseRimiReceipt(inputLines: RimiLine[]): RimiParseResult {
+    rimiOcrSuspects = 0;
+    const rawLines = normalizeRimiLines(inputLines);
     const ctx = computeBandsContext(rawLines);
     const header = parseHeader(rawLines.slice(0, ctx.headerEnd));
     const footer = parseFooter(rawLines.slice(ctx.footerStart));
     const products: RimiProduct[] = [];
+    // Printed line totals BEFORE per-unit normalization — Galut-aware and
+    // exact (no ×qty re-multiplication rounding), the left side of the
+    // receipt-level reconciliation equation. Weighed-no-ppu items contribute
+    // 0, which correctly FAILS reconciliation (the parse has a hole).
+    let lineTotalSum = 0;
     for (const internal of ctx.productInternals) {
-        const { product } = extractRimiProduct(internal);
+        const { product, skippedLineTotal, zeroedLineTotal } = extractRimiProduct(internal);
+        if (skippedLineTotal) lineTotalSum += skippedLineTotal;
+        if (zeroedLineTotal) lineTotalSum += zeroedLineTotal;
         if (!product) continue;
+        const printedLineTotal = (product.promoPrice != null ? product.promoPrice : product.price) ?? 0;
+        if (printedLineTotal > 0) lineTotalSum += printedLineTotal;
         if (product.pricePerUnit !== null && product.quantity > 0) {
             product.price = product.pricePerUnit;
             if (product.promoPrice !== null) {
@@ -2492,10 +3816,61 @@ export function parseRimiReceipt(rawLines: RimiLine[]): RimiParseResult {
         }
         products.push(product);
     }
+    lineTotalSum = round2(lineTotalSum);
+
+    // (The old cross-band "fused-box Galut salvage" post-pass is gone: the
+    // fused-box SPLITTER in mergeRowFragmentsRimi now returns the swallowed
+    // Galut value to the previous band's own territory as a fusedSplitTail
+    // line, and extractRimiProduct reads it in-band — hard walls intact.)
+
+    // RECEIPT-LEVEL RECONCILIATION: Σ printed line totals + adjustments
+    // (MANO RIMI pinigai / deposits / rounding) = printed Mokėti. The
+    // expected total also powers the fallback below — the OLD fallback used
+    // the raw item sum and wrote a WRONG total whenever wallet money was
+    // spent and the Mokėti row was garbled (rimi-30-04-2026-15: printed
+    // "0,44" OCR'd as "44" → fallback minted 1.62 instead of 1.62−1.18).
+    // (No unlabeled-amount salvage here on purpose: the one receipt that
+    // seemed to need it — ios-55's bare "-0,33" — turned out to be a LABEL
+    // GARBLE ("Ppinigai"), fixed in the pinigai regex above. Booking bare
+    // block amounts by residual-matching can mask a dropped per-item
+    // discount as reconciled; without corpus evidence it stays out.)
+    const adjustments = rimiReceiptAdjustments(rawLines).total;
+    const expectedTotal = round2(lineTotalSum + adjustments);
+
+    // TOTAL SANITY (IKI-parser parity): the to-pay total must be in the
+    // ballpark of the expected total. A garbled payment block can leave the
+    // total missing OR pin it to a stray tiny value. Only fires on a gross
+    // mismatch (< half), so a correctly-read total is never overwritten.
+    let totalDerived = false;
+    if (expectedTotal > 0 && (footer.total === null || footer.total < expectedTotal * 0.5)) {
+        footer.total = expectedTotal;
+        totalDerived = true;
+    }
+
+    // Reconciled ONLY against a total actually read off the receipt — a
+    // derived total would be self-fulfilling. Strict tolerance: the printed
+    // numbers are exact; a 1-cent mismatch means a misread digit somewhere
+    // and MUST flag (the ensemble second opinion is the cheap insurance).
+    footer.reconDelta = !totalDerived && footer.total !== null && products.length > 0
+        ? round2(lineTotalSum + adjustments - footer.total) + 0 // + 0 folds JS -0 to 0
+        : null;
+    footer.reconciled = footer.reconDelta !== null && Math.abs(footer.reconDelta) < 0.005;
+    // The synthetic receipt-id fallback needs a total — when the total
+    // only became available via the item-sum fallback above, mint the
+    // id here with the exact same key parseFooter would have used.
+    if (!footer.receiptNo && footer.date && footer.time && footer.total !== null) {
+        footer.receiptNo = syntheticReceiptNo(footer.date, footer.time, footer.total);
+    }
+
+    healPackSizesFromDiscountSection(rawLines, products);
+
+    footer.ocrSuspects = rimiOcrSuspects;
+
     return { header, products, footer };
 }
 
-export function parseRimiHeaderOnly(rawLines: RimiLine[]): RimiHeader {
+export function parseRimiHeaderOnly(inputLines: RimiLine[]): RimiHeader {
+    const rawLines = normalizeRimiLines(inputLines);
     const headerEnd = findHeaderEnd(rawLines);
     return parseHeader(rawLines.slice(0, headerEnd));
 }

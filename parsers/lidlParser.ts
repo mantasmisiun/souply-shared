@@ -51,6 +51,20 @@ export interface LidlProduct {
     quantity: number;
     unit: string;
     pricePerUnit: number | null;
+    // A by-WEIGHT line (sold per kg) is weighable. Set on EVERY product
+    // (true for unit==='kg', false per-piece) so the server resolver
+    // keeps a weighable catalog SP instead of treating the missing flag
+    // as a form mismatch — same contract as ikiParser's IkiProduct.
+    isWeighable?: boolean;
+    /** Pack-size reference for the matcher (rimiParser parity: field
+     *  `parsedAmount`/`parsedUnit`). A weighable line (`unit === 'kg'`)
+     *  is priced per 1 kg, so the catalog's weighable SP is stored as
+     *  `amount: 1, unit: 'kg'` — emit that here so the receipt shows
+     *  "1 kg" and the matcher prefers the weighable variant over a
+     *  same-name fixed-pack sibling. Null for per-piece lines (Lidl
+     *  prints no in-name pack size). */
+    parsedAmount?: number | null;
+    parsedUnit?: string | null;
     rawLines: string[];
     region: Region;
 }
@@ -153,16 +167,27 @@ const DISCOUNT_RE = new RegExp(`^-\\s*(\\d+[.,]\\s?${D}{1,2})\\s*[A-Z]?\\s*$`);
 // the optional noise just absorbs OCR drift. Without this the
 // unit-line classifies as 'name', leaks into the product name,
 // and qty stays 1 (so a multi-buy of 6 reads as quantity=1).
+// X-MARKER class for the multiplier between ppu and qty: Latin x/X/k,
+// Cyrillic ka к/К AND kha х(U+0445) — Lidl thermal OCR reads the "×" as any
+// of these (the Arbuzai weighed rows use Cyrillic kha). Shared by every
+// weighable regex so extraction AND name-stripping agree. The recognisers
+// allow the marker DOUBLED ({1,2}) — Android's fused OCR double-reads it
+// ("0,99 xX 2,000 €/vnt.", 2025.08.18 lidl receipt), which used to defeat
+// UNIT_LINE_RE and leak the whole calc line into the product name.
+const X_MARK = 'xXkКкх×';
 const UNIT_LINE_RE = new RegExp(
-    `^\\s*(?:(\\d+[.,_]\\s?${D}{1,2})\\s*)?[>×|]?\\s*[xkXК]\\s*(\\d+(?:[.,_]\\s?${D}{1,3})?)\\s*(kg|[€£]\\s*/\\s*vnt\\.?|[€£]\\s*/\\s*kg)`,
+    `^\\s*(?:(\\d+[.,_]\\s?${D}{1,2})\\s*)?[>×|]?\\s*[${X_MARK}]{1,2}\\s*(\\d+(?:[.,_]\\s?${D}{1,3})?)\\s*(kg|[€£]\\s*/\\s*vnt\\.?|[€£]\\s*/\\s*kg)`,
     'i'
 );
 // OCR-split unit line halves. Decimal optional in both (integer
 // quantities like `x 2 €/vnt.` happen). Same `>` tolerance as
-// UNIT_LINE_RE.
-const UNIT_HEAD_RE = new RegExp(`^\\s*\\d+[.,_]\\s?${D}{1,2}\\s*[>×|]?\\s*[xkXК]\\s*$`);
+// UNIT_LINE_RE. Capture groups (head: ppu; tail: qty + unit suffix)
+// feed extractLidlProduct's split-half recovery — without it the
+// halves leaked into the product NAME and the qty (and, for
+// weighables, the kg signal) was lost.
+const UNIT_HEAD_RE = new RegExp(`^\\s*(\\d+[.,_]\\s?${D}{1,2})\\s*[>×|]?\\s*[${X_MARK}]{1,2}\\s*$`);
 const UNIT_TAIL_RE = new RegExp(
-    `^\\s*${D}+(?:[.,_]\\s?${D}{1,3})?\\s*(kg|[€£]\\s*/\\s*vnt\\.?|[€£]\\s*/\\s*kg)\\s*$`,
+    `^\\s*(${D}+(?:[.,_]\\s?${D}{1,3})?)\\s*(kg|[€£]\\s*/\\s*vnt\\.?|[€£]\\s*/\\s*kg)\\s*$`,
     'i'
 );
 // Orphan unit suffix — `€/vnt.` / `£/vnt.` / `€/kg` WITHOUT leading
@@ -178,9 +203,14 @@ const UNIT_ORPHAN_RE = /^\s*[€£]\s*\/\s*(?:vnt\.?|kg)\s*$/i;
 // unit `0,35 × 10,000` + garbage `yimo spaustuvai 4`). UNIT_LINE_RE
 // fails (no clean suffix) so the whole string leaks into name.
 // With UNIT_LENIENT_RE we still capture unit price + quantity from
-// the prefix and drop the trailing garbage.
+// the prefix and drop the trailing garbage. The qty terminator is
+// `(?![\d.,])` rather than `\b` — the garbage is usually glued
+// straight onto the digits ("10,000yimo": digit→letter is NOT a \b
+// boundary, so the old \b could never match its own motivating
+// example). More digits/separators after the captured qty still
+// abort (ambiguous longer number → leave the line alone).
 const UNIT_LENIENT_RE = new RegExp(
-    `^\\s*(\\d+[.,_]\\s?${D}{1,2})\\s*[xkXК]\\s*(\\d+[.,_]\\s?${D}{1,3})\\b`,
+    `^\\s*(\\d+[.,_]\\s?${D}{1,2})\\s*[${X_MARK}]{1,2}\\s*(\\d+[.,_]\\s?${D}{1,3})(?![\\d.,])`,
     'i'
 );
 // Cat X — weighable-style tail with garbage PREFIX. `CEoX 0,343 kg`
@@ -189,7 +219,7 @@ const UNIT_LENIENT_RE = new RegExp(
 // in the line (differentiates from real product names ending in
 // `NNN kg`) and capture the trailing `\d+[.,]\d{1,3} (kg|€/vnt.)`.
 const UNIT_WEIGHT_LENIENT_RE = new RegExp(
-    `[xXкК×].*?(\\d+[.,_]\\s?${D}{1,3})\\s*(kg|[€£]\\s*/\\s*vnt\\.?|[€£]\\s*/\\s*kg)\\s*$`,
+    `[${X_MARK}]{1,2}.*?(\\d+[.,_]\\s?${D}{1,3})\\s*(kg|[€£]\\s*/\\s*vnt\\.?|[€£]\\s*/\\s*kg)\\s*$`,
     'i'
 );
 // Cat W — multi-buy qty + name-continuation smoosh: OCR merged the
@@ -218,6 +248,12 @@ const BARCODE_ONLY_RE = new RegExp(
 // word (`UŽstatas` → `1>statas` / `o02000 1>statas`). The `\W?`
 // between the lead char and `stat` tolerates that.
 const DEPOSIT_RE = /(?:u[žz]stat[ao]|[i1l]\W?stat[o0]|[i1l]\W?statas?)/i;
+// Multipack COUNT from a bottle-deposit line: Lidl prints the pack size in
+// parentheses as "(N x M)" — N bottles at M deposit each ("0002004 Uzstatas
+// 0,4 (4X0,1)" → 4). This is the reliable count for a beer 4-pack, whose
+// product-line "4x0,568" is count×VOLUME (not a price multibuy), so no
+// unit-line regex extracts a quantity from it.
+const DEPOSIT_COUNT_RE = new RegExp(`\\(\\s*(\\d{1,2})\\s*[${X_MARK}]\\s*\\d`, 'i');
 // Non-catalog checkout bags. Match the bag word anywhere on the
 // line so OCR-fragmented forms (`irk.maišeli`, `Pop-pr` + bag
 // tail) still trip the skip. The stem suffix is required —
@@ -258,6 +294,35 @@ const DISCOUNT_HEADER_RE = /(?:lidl\s*plus|nuo[li]a[li]d[aos]?)/i;
 // findHeaderEnd's reach, it won't get absorbed.
 const RECEIPT_NO_RE = /^#\d{4,}/;
 const KVITAS_ROW_RE = /^\s*kvitas\s+\d+\s*\/\s*\d+/i;
+// ── date/time bail hardening (IKI T_DATE_RE / T_TIME_RE idioms) ──
+// Lidl prints `YYYY-MM-DD HH:MM` on ONE footer line and parseFooter's
+// combined same-line regex stays the FIRST preference. But a single
+// garbled character in either half used to lose BOTH (→ the app-level
+// RETAKE bail for the whole receipt), so date and time are additionally
+// scanned INDEPENDENTLY:
+//   date — separators may DOUBLE ("2025-06--18") or read as dots, and
+//   OCR may inject a space around them. The year is pinned to `20\d{2}`
+//   and month/day are range-checked at the call site so footer codes
+//   ("SM-000022355", loterija ids) can't masquerade as a date.
+const DATE_TOLERANT_RE =
+    /(20\d{2})\s?[-.]{1,2}\s?(\d{2})\s?(?:[-.]{1,2}|\s)\s?(\d{2})(?!\d)/;
+//   time — Lidl prints HH:MM (no seconds). A seconds-bearing form is
+//   tried first with IKI's tolerant FIRST separator ("12-20:35" — the
+//   strict second colon keeps dates from misreading as times); the bare
+//   HH:MM form keeps its colon REQUIRED (a dot would match prices) but
+//   tolerates the OCR space after it ("18: 33"). Hour/minute are
+//   range-checked at the call site.
+const TIME_SECONDS_TOLERANT_RE = /(\d{1,2})[:.\-]\s?(\d{2})\s?:\s?(\d{2})(?!\d)/;
+const TIME_TOLERANT_RE = /(?:^|[^\d:])(\d{1,2})\s?:\s?(\d{2})(?!\d)/;
+// Weighed-quantity signal that survives unit-line garble: Lidl prints
+// weighed quantities with THREE decimals ("4,032 kg", "0,343 kg") while
+// packaged sizes inside product names use 0-2 ("1 kg", "1,5 kg") — the
+// 3-decimal fraction is the discriminator that keeps a packaged product
+// from being flipped to weighable. OCR digit class on both sides.
+const KG_WEIGHED_QTY_RE = new RegExp(
+    `(${D}+[.,_]\\s?${D}{3})\\s*kg\\b`,
+    'i',
+);
 
 /**
  * NFD-strip diacritics before matching footer markers. OCR reads the
@@ -267,6 +332,27 @@ const KVITAS_ROW_RE = /^\s*kvitas\s+\d+\s*\/\s*\d+/i;
  */
 function stripDiacritics(s: string): string {
     return s.normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
+}
+
+// OCR homoglyph folds for characters that NEVER appear in a real Lithuanian
+// receipt, so the fold is unambiguous:
+//   ¿ (inverted question mark U+00BF) → į (i-ogonek) — the ogonek tail reads
+//     as the inverted-? hook ("Karam.ledai su karam. ¿daru" → "…įdaru").
+// Cyrillic lookalikes → Latin (iki-parser parity): Vision emits Cyrillic
+// glyphs for visually identical Latin letters — the VAT letter "А" (U+0410)
+// killed a product's anchor outright (08.14 "9,99 А": PRICE_RE's [A-Z] is
+// ASCII-only, no anchor → "Sparč. fiksavimo spaustuvai" vanished). Lithuanian
+// receipts never print Cyrillic, so the fold is unconditional. NOTE: the
+// multiplier X_MARK class keeps its own Cyrillic entries — folding х→x/к→k
+// upstream only makes those redundant, never wrong.
+const LIDL_CYRILLIC: Record<string, string> = {
+    'А': 'A', 'В': 'B', 'Е': 'E', 'К': 'K', 'М': 'M', 'Н': 'H', 'О': 'O', 'Р': 'P', 'С': 'C', 'Т': 'T', 'Х': 'X', 'У': 'Y', 'І': 'I',
+    'а': 'a', 'е': 'e', 'о': 'o', 'р': 'p', 'с': 'c', 'у': 'y', 'х': 'x', 'і': 'i', 'ѕ': 's', 'к': 'k', 'м': 'm', 'т': 't', 'в': 'b', 'н': 'h',
+};
+function foldLidlHomoglyphs(s: string): string {
+    let t = s.replace(/¿/g, 'į');
+    if (/[Ѐ-ӿ]/.test(t)) t = t.replace(/[Ѐ-ӿ]/g, (c) => LIDL_CYRILLIC[c] ?? c);
+    return t;
 }
 
 function parseNum(str: string): number {
@@ -293,10 +379,19 @@ function regionOf(lines: LidlLine[]): Region {
 
 export function isLidlReceipt(lines: string[]): boolean {
     const full = lines.join(' ').toUpperCase();
-    // Tolerant: `LIDL`, `LDL` (first-letter dropped on some receipts'
-    // header `LDL Verta.`), `UAB "Lidl`. No other Lithuanian grocery
-    // chain matches any of these substrings.
-    return /\bLID?L\b|LIDL\s+LIETUVA/.test(full);
+    // Multi-signal, any-one-suffices — Lidl's word appears many times on a
+    // receipt (header, footer, www.lidl.lt), and the PVM payer code is a
+    // second independent anchor for when every "LIDL" token got OCR-garbled:
+    //   1. `LIDL` / `LDL` anywhere (first-letter dropped on `LDL Verta.`);
+    //   2. `LIDL.LT` domain;
+    //   3. Lidl's fixed PVM-payer code LT117910113 (tolerant of OCR digit
+    //      confusion via the O/o/I/l/L class).
+    if (/\bLID?L\b|LIDL\s*\.?\s*LT|LIDL\s+LIETUVA/.test(full)) return true;
+    // PVM-payer code LT117910113 — an independent anchor for when every
+    // "LIDL" token got garbled. Digit positions carry the O→0 / I→1 OCR
+    // confusion class; the LT prefix stays literal so it isn't corrupted.
+    if (/LT[1I][1I]79[1I][0O][1I][1I]3/.test(full.replace(/\s+/g, ''))) return true;
+    return false;
 }
 
 // ───────── boundaries ─────────
@@ -444,11 +539,102 @@ function parseHeader(lines: LidlLine[]): LidlHeader {
  */
 function stripBarcodePrefix(name: string): string {
     const m = name.match(BARCODE_PREFIX_RE);
-    return m ? m[2].trim() : name;
+    if (!m) return name;
+    let rest = m[2].trim();
+    // SPLIT article code: OCR breaks the 7-digit code in two ("76051 02
+    // Popier.rankšluosčiai…") — the first strip leaves the tail digits on
+    // the name. Absorb a 1-3 digit continuation ONLY when base + tail =
+    // exactly the 7-digit Lidl code length, so a legit digit-leading name
+    // is never eaten.
+    const cont = rest.match(/^(\d{1,3})\s+(.+)$/);
+    if (cont && m[1].length + cont[1].length === 7) rest = cont[2].trim();
+    return rest;
 }
 
 
 // ───────── footer ─────────
+
+/**
+ * Resolve the Lidl document / receipt number from a set of OCR lines.
+ *
+ * Lidl prints it in up to three forms, and MLKit frequently line-splits the
+ * labelled one — which is why the old same-line-only capture returned null and
+ * receipt numbers came back missing:
+ *   1. "Dokumento numeris:"   — value often on the NEXT line   (most authoritative)
+ *   2. "Kvitas NNNNN/NN"      — header row, can also split across two lines
+ *   3. "#00NNNNN" / "00NNNNN" — zero-padded document line (header + VMI footer block)
+ *
+ * Every candidate is collected and the value the MOST sources agree on wins, so a
+ * single garbled read (e.g. "80151269" for "00151269") can't take over; ties break
+ * by the priority order above. Returns null when no source yields a number.
+ */
+export function extractReceiptNo(lines: LidlLine[]): { value: string; line: LidlLine } | null {
+    const cands: { value: string; line: LidlLine; priority: number }[] = [];
+    for (let i = 0; i < lines.length; i++) {
+        const t = lines[i].text.trim();
+
+        // (1) Dokumento numeris — same line, else the digits on the next line.
+        if (/dokumento\s+numeris/i.test(t)) {
+            const same = t.match(/dokumento\s+numeris\s*:?\s*(\d{4,})/i);
+            if (same) {
+                cands.push({ value: same[1], line: lines[i], priority: 0 });
+            } else {
+                const nx = lines[i + 1];
+                // The next line must be the bare doc number, NOT another
+                // labelled row — "Saugos modulio numeris: SM-000025027"
+                // sits right below "Dokumento numeris:" on some layouts and
+                // its SM id was grabbed as the receipt number (08.18: real
+                // no. 47609). Reject any next line carrying a label/SM prefix.
+                const isLabelledOther = nx && /SM-|modulio|saugos|numeris|kvit/i.test(nx.text);
+                const m = !isLabelledOther ? nx?.text.match(/(\d{4,})/) : null;
+                if (m && nx) cands.push({ value: m[1], line: nx, priority: 0 });
+            }
+        }
+
+        // (2) Kvitas NNNNN/NN — same line, else "NNNNN/NN" on the next line.
+        const kv = t.match(/^kvitas\s+(\d{4,})\s*\/\s*\d+/i);
+        if (kv) {
+            cands.push({ value: kv[1], line: lines[i], priority: 1 });
+        } else if (/^kvitas$/i.test(t)) {
+            const nx = lines[i + 1];
+            const m = nx?.text.match(/^\s*(\d{4,})\s*\/\s*\d+/);
+            if (m && nx) cands.push({ value: m[1], line: nx, priority: 1 });
+        }
+
+        // (3) Zero-padded document line "#00NNNNN" / "00NNNNN". Strip the pad and
+        //     keep only 4–7 digit results, so the 10-digit merchant number
+        //     ("0017300621") and other long ids can't masquerade as the doc number.
+        const doc = t.match(/^#?(0{2,}\d{2,})$/);
+        if (doc) {
+            const v = doc[1].replace(/^0+/, '');
+            if (v.length >= 4 && v.length <= 7) {
+                cands.push({ value: v, line: lines[i], priority: 2 });
+            }
+        }
+    }
+    if (!cands.length) return null;
+
+    // Self-heal: the value with the most corroborating sources wins; ties break
+    // by the most authoritative source (Dokumento numeris > Kvitas > #00NNNNN).
+    const byValue = new Map<string, { count: number; priority: number; line: LidlLine }>();
+    for (const c of cands) {
+        const e = byValue.get(c.value);
+        if (!e) {
+            byValue.set(c.value, { count: 1, priority: c.priority, line: c.line });
+        } else {
+            e.count++;
+            if (c.priority < e.priority) { e.priority = c.priority; e.line = c.line; }
+        }
+    }
+    let best: { value: string; count: number; priority: number; line: LidlLine } | null = null;
+    for (const [value, e] of byValue) {
+        if (!best || e.count > best.count
+            || (e.count === best.count && e.priority < best.priority)) {
+            best = { value, count: e.count, priority: e.priority, line: e.line };
+        }
+    }
+    return best ? { value: best.value, line: best.line } : null;
+}
 
 function parseFooter(lines: LidlLine[]): LidlFooter {
     let total: number | null = null;
@@ -476,24 +662,39 @@ function parseFooter(lines: LidlLine[]): LidlFooter {
     for (let i = 0; i < lines.length; i++) {
         const t = lines[i].text.trim();
 
-        if (/^mok[eė]ti\b/i.test(t)) {
+        // Keyword tolerates the trailing i→1/l/! rot ("Mokėt1", 07.30/iOS —
+        // total lost with 46,10 printed right beside it). "Mokėta (Banko
+        // kortelė)" stays excluded: 'a' is not in the class.
+        if (/^mok[eė]t[i1lI!]\b/i.test(t)) {
             const sameLine = t.match(/(\d+[.,]\s?\d{1,2})/);
             if (sameLine) {
                 total = parseNum(sameLine[1]);
                 trackLine(lines[i], 'total');
             } else {
+                // The amount prints to the RIGHT of the "Mokėti" label as a
+                // separate box on the SAME physical row. Match it by y-overlap,
+                // NOT array order — the amount box can sort just before the
+                // label (lower yTop), so the old "next line" scan grabbed the
+                // FOLLOWING row's "50,00 (grynieji)" cash-tendered figure as
+                // the total (08.08: real total 23,25). Same-row first; only
+                // then adjacent lines, and never a cash/change ("grynieji" /
+                // "Grąža") row.
+                const mok = lines[i];
+                const mokH = Math.max(1, mok.yBottom - mok.yTop);
+                const amtRe = /(\d+[.,]\s?\d{1,2})/;
+                const isCashRow = (s: string) => /grynie|gr[aą][zž]a/i.test(s);
+                const sameRow = lines.find((o) => o !== mok
+                    && Math.min(o.yBottom, mok.yBottom) - Math.max(o.yTop, mok.yTop) >= 0.4 * mokH
+                    && amtRe.test(o.text) && !isCashRow(o.text));
                 const next = lines[i + 1];
                 const prev = lines[i - 1];
-                const nextMatch = next?.text.match(/(\d+[.,]\s?\d{1,2})/);
-                const prevMatch = prev?.text.match(/(\d+[.,]\s?\d{1,2})/);
-                if (nextMatch) {
-                    total = parseNum(nextMatch[1]);
+                const pick = sameRow
+                    ?? (next && amtRe.test(next.text) && !isCashRow(next.text) ? next : null)
+                    ?? (prev && amtRe.test(prev.text) && !isCashRow(prev.text) ? prev : null);
+                if (pick) {
+                    total = parseNum(pick.text.match(amtRe)![1]);
                     trackLine(lines[i], 'total');
-                    trackLine(next, 'total');
-                } else if (prevMatch) {
-                    total = parseNum(prevMatch[1]);
-                    trackLine(lines[i], 'total');
-                    trackLine(prev, 'total');
+                    trackLine(pick, 'total');
                 }
             }
         }
@@ -508,13 +709,43 @@ function parseFooter(lines: LidlLine[]): LidlFooter {
             time = dtMatch[2].replace(/\s/g, '');
             trackLine(lines[i], 'dateTime');
         }
-        if (!receiptNo) {
-            const rn = t.match(/dokumento\s+numeris\s*:?\s*(\d+)/i);
-            if (rn) {
-                receiptNo = rn[1];
-                trackLine(lines[i], 'receiptNo');
+    }
+
+    // Date/time bail hardening: the combined same-line match above stays
+    // the first preference, but ONE garbled character in either half used
+    // to lose BOTH fields → app-level RETAKE bail. Re-scan the footer for
+    // each field INDEPENDENTLY with OCR-tolerant separators (doubled
+    // hyphens, dots, spaces around separators, split date/time boxes).
+    // Range checks keep footer codes from masquerading as dates/times.
+    if (!date || !time) {
+        for (const l of lines) {
+            const t = l.text.trim();
+            if (!date) {
+                const m = t.match(DATE_TOLERANT_RE);
+                if (m && +m[2] >= 1 && +m[2] <= 12 && +m[3] >= 1 && +m[3] <= 31) {
+                    date = `${m[1]}-${m[2]}-${m[3]}`;
+                    trackLine(l, 'date');
+                }
             }
+            if (!time) {
+                const m = t.match(TIME_SECONDS_TOLERANT_RE) ?? t.match(TIME_TOLERANT_RE);
+                if (m && +m[1] <= 23 && +m[2] <= 59) {
+                    time = `${m[1]}:${m[2]}`;
+                    trackLine(l, 'time');
+                }
+            }
+            if (date && time) break;
         }
+    }
+
+    // Receipt number via the multi-source, self-healing resolver. Handles MLKit
+    // splitting the "Dokumento numeris" label from its value onto separate lines
+    // (the old same-line `\d+` capture missed it) and cross-checks the zero-padded
+    // document line, so the band lands on whichever line actually carries it.
+    const rn = extractReceiptNo(lines);
+    if (rn) {
+        receiptNo = rn.value;
+        trackLine(rn.line, 'receiptNo');
     }
 
     lineRegions.sort((a, b) => a.yTop - b.yTop);
@@ -546,13 +777,34 @@ function parseFooter(lines: LidlLine[]): LidlFooter {
  * (`extractLidlProduct`).
  */
 export function parseLidlReceipt(
-    rawLines: LidlLine[],
+    rawLinesIn: LidlLine[],
     options: LidlParseOptions = {},
 ): LidlParseResult {
+    // Entry normalisation: fold unambiguous OCR homoglyphs (¿→į) once, so
+    // every downstream pass (header, footer, bands, names) sees clean text.
+    const rawLines = rawLinesIn.map((l) => ({ ...l, text: foldLidlHomoglyphs(l.text) }));
     const headerEnd = findHeaderEnd(rawLines);
     const footerStart = findFooterStart(rawLines, headerEnd);
     const header = parseHeader(rawLines.slice(0, headerEnd));
     const footer = parseFooter(rawLines.slice(footerStart));
+
+    // Resolve the receipt number from the WHOLE receipt, not just the footer
+    // slice: corroboration across the header "Kvitas NNNNN/NN" + "#00NNNNN"
+    // rows outvotes a lone footer id (08.18 grabbed the VMI-block "7040122"
+    // / the "SM-000025027" security-module number instead of the real 47609).
+    // The header Kvitas is the canonical receipt number, so the full-receipt
+    // vote overrides the footer-only read.
+    const rnFull = extractReceiptNo(rawLines);
+    if (rnFull) footer.receiptNo = rnFull.value;
+    // LAST RESORT (IKI idiom): no printed identifier survived OCR but
+    // date + time + total did — synthesise a stable dedup id from them
+    // so a readable receipt never RETAKE-bails on the missing receipt
+    // number alone. Shape mirrors ikiParser's synthetic fallback.
+    if (!footer.receiptNo && footer.date && footer.time && footer.total !== null) {
+        footer.receiptNo =
+            `${footer.date.replace(/-/g, '')}-${footer.time.replace(/:/g, '')}` +
+            `-${Math.round(footer.total * 100)}-lidl-receipt`;
+    }
     const plan = findReceiptBandsLidl(rawLines, options);
     const products: LidlProduct[] = [];
     for (const internal of plan.productInternals) {
@@ -563,6 +815,37 @@ export function parseLidlReceipt(
             if (product.promoPrice !== null) {
                 product.promoPrice =
                     Math.round((product.promoPrice / product.quantity) * 100) / 100;
+            }
+        } else if (
+            product.pricePerUnit === null &&
+            product.price > 0 &&
+            product.quantity > 0 &&
+            product.quantity !== 1
+        ) {
+            // OCR dropped the unit-line's per-unit number ("<ppu> x <qty> vnt") but the
+            // qty survived: `price` here is still the LINE TOTAL, and emitting it as-is
+            // with quantity > 1 breaks the per-unit contract every other chain honors —
+            // the server would write the multi-buy TOTAL as the SP's reference price.
+            // Derive the unit price instead (total ÷ qty — same convention as IKI's
+            // multi-buy recovery). Holds for weighed lines too: total ÷ kg-qty = €/kg —
+            // including FRACTION-of-a-kg quantities (0,343 kg), which the old
+            // `quantity > 1` gate missed, leaving the fraction's line total as the
+            // "price" (a poisoned €/kg reference).
+            const unit = Math.round((product.price / product.quantity) * 100) / 100;
+            if (product.unit === 'kg' && (unit <= 0 || unit >= 1000)) {
+                // PRICE-POISONING GUARD: the derived €/kg is implausible — the kg
+                // quantity must be OCR-garbled. Show the line, never write price
+                // (server skips price<=0 writes; see the ikiParser guard).
+                product.price = 0;
+                product.pricePerUnit = null;
+                product.promoPrice = null;
+            } else {
+                product.pricePerUnit = unit;
+                product.price = unit;
+                if (product.promoPrice !== null) {
+                    product.promoPrice =
+                        Math.round((product.promoPrice / product.quantity) * 100) / 100;
+                }
             }
         }
         products.push(product);
@@ -953,43 +1236,14 @@ const mergeRowFragmentsLidl = (
     rawLines: LidlLine[],
     options: { iosOcr?: boolean } = {},
 ): LidlLine[] => {
-    if (options.iosOcr) {
-        return mergeRowFragmentsLidlIosOrdered(rawLines);
-    }
-    // ─── Android path (unchanged) ─────────────────────────────────
-    // In-place growing-cluster merge in encounter order. Keeps
-    // bit-identical behaviour for the Android pipeline.
-    const out: LidlLine[] = [];
-    for (const line of rawLines) {
-        const last = out.length > 0 ? out[out.length - 1] : null;
-        if (!last) {
-            out.push({ ...line });
-            continue;
-        }
-        const yDiff = Math.abs(line.yTop - last.yTop);
-        const minH = Math.min(
-            line.yBottom - line.yTop,
-            last.yBottom - last.yTop,
-        );
-        const lineCenter = (line.yTop + line.yBottom) / 2;
-        const lastCenter = (last.yTop + last.yBottom) / 2;
-        const sameRow =
-            yDiff < ROW_MERGE_YTOP_THRESHOLD_PX &&
-            minH > 0 &&
-            Math.abs(lineCenter - lastCenter) < minH * ROW_MERGE_CENTER_RATIO;
-        if (!sameRow) {
-            out.push({ ...line });
-            continue;
-        }
-        last.text = `${last.text.trim()} ${line.text.trim()}`
-            .replace(/\s+/g, ' ')
-            .trim();
-        last.yTop = Math.min(last.yTop, line.yTop);
-        last.yBottom = Math.max(last.yBottom, line.yBottom);
-        last.xLeft = Math.min(last.xLeft, line.xLeft);
-        last.xRight = Math.max(last.xRight, line.xRight);
-    }
-    return out;
+    // Both paths now cluster-by-row and DEDUP same-row double-reads (a
+    // garbled second OCR of a row that MLKit occasionally emits — Android
+    // hit it too on photographed receipts: "Sausainiai Gaidelis" +
+    // "DausaLlILaL UaLuCLls"). They differ only in concat order: iOS boxes
+    // arrive out of reading order so must sort by xLeft; Android boxes are
+    // already left-to-right, so encounter order is kept (bit-compatible with
+    // the old Android merge on single-box rows, which cluster to size 1).
+    return mergeRowFragmentsLidlClustered(rawLines, options.iosOcr ? 'xleft' : 'encounter');
 };
 
 /**
@@ -1002,7 +1256,10 @@ const mergeRowFragmentsLidl = (
  * the physical receipt (`<barcode> <name> <price> <VAT>` for Lidl)
  * which the existing `FUSED_PRICE_TAIL_RE` already handles.
  */
-const mergeRowFragmentsLidlIosOrdered = (rawLines: LidlLine[]): LidlLine[] => {
+const mergeRowFragmentsLidlClustered = (
+    rawLines: LidlLine[],
+    order: 'xleft' | 'encounter',
+): LidlLine[] => {
     if (rawLines.length === 0) return [];
     // First pass: build clusters from already-y-sorted input. Two
     // adjacent lines join the same cluster when their y-centers fall
@@ -1021,13 +1278,22 @@ const mergeRowFragmentsLidlIosOrdered = (rawLines: LidlLine[]): LidlLine[] => {
             line.yBottom - line.yTop,
             curBbox.yBottom - curBbox.yTop,
         );
-        const lineCenter = (line.yTop + line.yBottom) / 2;
-        const clusterCenter = (curBbox.yTop + curBbox.yBottom) / 2;
         const yDiff = Math.abs(line.yTop - curBbox.yTop);
+        // Same physical row = the box y-OVERLAPS the cluster by ≥50% of the
+        // smaller height. A center-distance gate mis-handles HALF-HEIGHT
+        // boxes: a garbled double-read is often ~half the clean box's height
+        // (07.30 "DausaLlILaL" h=12 vs "Sausainiai Gaidelis" h=26), so its
+        // center sits 5 px off — enough to fail 0.4×minH and land in its own
+        // cluster, where it never gets deduped. The two fully overlap in y,
+        // so an overlap gate keeps them together while still splitting truly
+        // distinct rows (which don't overlap). The yTop cap is the backstop
+        // against a runaway tall cluster.
+        const yOverlap =
+            Math.min(line.yBottom, curBbox.yBottom) - Math.max(line.yTop, curBbox.yTop);
         const sameRow =
             yDiff < ROW_MERGE_YTOP_THRESHOLD_PX &&
             minH > 0 &&
-            Math.abs(lineCenter - clusterCenter) < minH * ROW_MERGE_CENTER_RATIO;
+            yOverlap >= 0.5 * minH;
         if (sameRow) {
             clusters[clusters.length - 1].push(line);
             curBbox.yTop = Math.min(curBbox.yTop, line.yTop);
@@ -1040,8 +1306,14 @@ const mergeRowFragmentsLidlIosOrdered = (rawLines: LidlLine[]): LidlLine[] => {
 
     const out: LidlLine[] = [];
     for (const cluster of clusters) {
+        // Vision reads a price's leading 0 as ')' ("),49" for 0,49 —
+        // 08.03: the melisa anchor vanished and TWO products fused into one
+        // band, losing melisa). Fold a token-leading ')' before ,dd back to
+        // 0 — no printed lidl token ever starts with ')'.
+        const foldParen = (t: string): string =>
+            t.replace(/(^|\s)\)\s?,\s?(\d{2})(?=\s|$)/g, '$10,$2');
         if (cluster.length === 1) {
-            out.push({ ...cluster[0] });
+            out.push({ ...cluster[0], text: foldParen(cluster[0].text) });
             continue;
         }
         // In-cluster dedup. MLKit on iOS occasionally emits two boxes
@@ -1076,6 +1348,8 @@ const mergeRowFragmentsLidlIosOrdered = (rawLines: LidlLine[]): LidlLine[] => {
             let score = 0;
             let letters = 0;
             let digits = 0;
+            let midCaps = 0;
+            let prev = '';
             for (const ch of s) {
                 // Lithuanian diacritics get a bonus — they're unique
                 // to the language and a strong signal that this is
@@ -1085,11 +1359,25 @@ const mergeRowFragmentsLidlIosOrdered = (rawLines: LidlLine[]): LidlLine[] => {
                 if (/[ĄČĘĖĮŠŲŪŽąčęėįšųūž]/.test(ch)) { score += 1.5; letters++; }
                 else if (/[A-Za-z]/.test(ch)) { score += 1; letters++; }
                 else if (/\d/.test(ch)) { score += 1; digits++; }
-                else if (/[\s.,'\-%]/.test(ch)) score += 0.5;
+                else if (/[.,'\-%]/.test(ch)) score += 0.5;
+                // Whitespace scores 0: garbled twins INJECT mid-word spaces
+                // ("Jav .Dalon. su pan. Ir sok•" = 6 spaces vs the clean
+                // read's 1) and the old +0.5 per space let the garble
+                // outscore the clean read on sheer length (07.28/iOS).
+                // Vision bullets are pure garble markers — never printed.
+                else if (ch === '•' || ch === '·') score -= 2;
                 // Special chars (`|`, `]`, etc.) contribute 0 —
                 // penalises OCR-mangled twins like "Bande]es" or
                 // "UOTTy4|" that interleave noise punctuation with
                 // legitimate text.
+                // MID-TOKEN CAPITAL: an uppercase letter directly after a
+                // lowercase one ("DausaLlILaL", "UaLuCLls"). Real names
+                // capitalise only word-initial letters (or run ALLCAPS), so
+                // this is the signature of a garbled double-read. Without it
+                // the garbage twin can outscore the clean read purely by
+                // being a character longer.
+                if (/[a-ząčęėįšųūž]/.test(prev) && /[A-ZĄČĘĖĮŠŲŪŽ]/.test(ch)) midCaps++;
+                prev = ch;
             }
             // ABSOLUTE score — longer cleaner reading wins. But
             // penalize letter intrusions inside a mostly-numeric
@@ -1101,6 +1389,18 @@ const mergeRowFragmentsLidlIosOrdered = (rawLines: LidlLine[]): LidlLine[] => {
             if (digits > 4 && digits > letters * 3) {
                 score -= letters * 2;
             }
+            score -= midCaps * 2.5;
+            // Real product info: percentages and decimals ("3,2%", "82 %")
+            // are common in clean names and effectively never in a garbled
+            // twin. Without this, an all-letters lowercase gibberish twin
+            // ("rlellas o,corcl") outscored the clean "Pienas 3,2% PET" purely
+            // on letter count.
+            score += (s.match(/%/g)?.length ?? 0) * 2;
+            score += (s.match(/\d[.,]\d/g)?.length ?? 0) * 1.5;
+            // A COMMA between two letters is a garble artifact ("o,corcl") —
+            // real commas separate sizes/percentages, and Lidl abbreviations
+            // use PERIODS ("Sok.plombyras"), which are left untouched.
+            score -= (s.match(/[A-Za-zĄČĘĖĮŠŲŪŽąčęėįšųūž],[A-Za-zĄČĘĖĮŠŲŪŽąčęėįšųūž]/g)?.length ?? 0) * 2.5;
             return score;
         };
         // Two structurally-distinct dedup cases in the wild:
@@ -1138,6 +1438,30 @@ const mergeRowFragmentsLidlIosOrdered = (rawLines: LidlLine[]): LidlLine[] => {
                 const seenNorm = normForSim(seenText);
                 const seenW = seen.xRight - seen.xLeft;
 
+                // Case (C): SINGLE-GLYPH SHARD. A 1-2 char box whose width is
+                // a sliver of a name-like box it x-overlaps is a double-read
+                // shard ("V"/"P" from 08.03 gluing onto "Varšk. surelis…").
+                // Shards start AT the name's left edge, so case (B)'s
+                // barcode protection excludes them, and (A') needs 2+
+                // letters. Barcodes are 4+ chars; the VAT column never
+                // x-overlaps names — both structurally unaffected.
+                const shardOverlap = Math.min(box.xRight, seen.xRight) - Math.max(box.xLeft, seen.xLeft);
+                const nameLikeRe = /[A-Za-zĄČĘĖĮŠŲŪŽąčęėįšųūž]{2,}/;
+                if (
+                    boxText.length <= 2 && boxW < seenW * 0.15 &&
+                    shardOverlap > 0 && nameLikeRe.test(seenText)
+                ) {
+                    dupAction = { kind: 'drop', idx: di };
+                    break;
+                }
+                if (
+                    seenText.length <= 2 && seenW < boxW * 0.15 &&
+                    shardOverlap > 0 && nameLikeRe.test(boxText)
+                ) {
+                    dupAction = { kind: 'replace', idx: di };
+                    break;
+                }
+
                 // Case (A): same-column. Both xLeft and xRight close,
                 // similar widths (>50% length ratio).
                 const xLeftDist = Math.abs(box.xLeft - seen.xLeft);
@@ -1146,13 +1470,38 @@ const mergeRowFragmentsLidlIosOrdered = (rawLines: LidlLine[]): LidlLine[] => {
                     Math.max(boxW, seenW || 1);
                 const sameColumn =
                     xLeftDist < 100 && xRightDist < 100 && widthRatio > 0.5;
-                if (sameColumn) {
-                    // Pick the cleaner reading by quality score.
-                    if (qualityScore(boxText) > qualityScore(seenText)) {
-                        dupAction = { kind: 'replace', idx: di };
-                    } else {
-                        dupAction = { kind: 'drop', idx: di };
+                // Case (A′): SAME LEFT EDGE re-read. Two name-like boxes that
+                // start at the same x (within 60 px) on this row are re-reads
+                // of the same content, even when one is a shorter/partial read
+                // whose xRight differs (08.14 "Val saes urlerele su" x235-581
+                // vs "Varškes … žalumynais" x238-776; 08.18 "Pop." vs "Pop.
+                // rankšluosčiai …"). A row carries ONE left-anchored name, so
+                // keep the cleaner. Both must carry letters — a left-column
+                // barcode is digit-only and excluded.
+                const bothNameLike =
+                    /[A-Za-zĄČĘĖĮŠŲŪŽąčęėįšųūž]{2,}/.test(boxText) &&
+                    /[A-Za-zĄČĘĖĮŠŲŪŽąčęėįšųūž]{2,}/.test(seenText);
+                const sameLeftEdge = xLeftDist < 60 && bothNameLike;
+                if (sameColumn || sameLeftEdge) {
+                    // Pick the cleaner reading by quality score. NEAR-TIE
+                    // (Δ ≤ 1 — "Virta Liaulienne dačra" vs "Virta kiaulienos
+                    // dešra" score identically, 08.18/iOS): fall back to ROW-
+                    // CONSENSUS Y — the garbled second read drifts vertically,
+                    // while the clean read aligns with the row's other boxes
+                    // (barcode, VAT anchor). Keep the read whose yTop is
+                    // nearer the median yTop of the cluster's OTHER members.
+                    const qb = qualityScore(boxText);
+                    const qs = qualityScore(seenText);
+                    let keepBox = qb > qs;
+                    if (Math.abs(qb - qs) < 0.25) {
+                        const others = cluster.filter((c) => c !== box && c !== seen);
+                        if (others.length > 0) {
+                            const ys = others.map((c) => c.yTop).sort((x, y) => x - y);
+                            const cons = ys[Math.floor(ys.length / 2)];
+                            keepBox = Math.abs(box.yTop - cons) < Math.abs(seen.yTop - cons);
+                        }
                     }
+                    dupAction = keepBox ? { kind: 'replace', idx: di } : { kind: 'drop', idx: di };
                     break;
                 }
 
@@ -1160,12 +1509,49 @@ const mergeRowFragmentsLidlIosOrdered = (rawLines: LidlLine[]): LidlLine[] => {
                 // (not at the left edge). Smaller corrupted fragment.
                 const xLeftOffset = box.xLeft - seen.xLeft;
                 const xRightOverhang = box.xRight - seen.xRight;
+                // 0.85, not 0.7: a fused barcode+name box's width includes
+                // the code prefix, so its clean name twin measured 74% and
+                // slipped through (08.24 sūrio užtepėlė doubled). Two texts
+                // overlapping 70–85% of a row's width can't be separate
+                // columns (same physical argument as the maxima/rimi gates).
                 const boxIsMidContained =
                     xLeftOffset > 50 &&
                     xRightOverhang < 20 &&
-                    boxW < seenW * 0.7;
+                    boxW < seenW * 0.85;
+                // SAME-CONTENT escape (07.30/iOS): the container can be the
+                // GARBLED read that absorbed the barcode column ("/003/05
+                // Varskes deserlas su cele gab." over the clean nested
+                // "Varškės desertas su želė gab.") — positional containment
+                // alone then drops/keeps the WRONG one. When the contained
+                // text ≈ the container's tail (aligned ≥ 0.55), they are two
+                // reads of the SAME row: pick by quality instead.
+                const tailSim = (shortN: string, longN: string): number => {
+                    if (!shortN.length) return 0;
+                    const tail = longN.slice(-shortN.length);
+                    let m = 0;
+                    for (let k = 0; k < shortN.length; k++) if (shortN[k] === tail[k]) m++;
+                    return m / shortN.length;
+                };
+                // Same-content picks compare quality DENSITY (score/char):
+                // the container absorbed the barcode column's characters, so
+                // its ABSOLUTE score wins on sheer length even though every
+                // real word is dirtier than the clean nested read.
+                const qDensity = (t: string): number =>
+                    t.length > 0 ? qualityScore(t) / t.length : 0;
+                // A container that BEGINS with a barcode-shaped run ([\d/]{4,})
+                // is a fused barcode+name SECOND READ of the row, not a wider
+                // clean read ("330544SvLeslas oz7o" over the nested clean
+                // "Sviestas 82%", 08.24 — heavy rot defeats tailSim, but no
+                // printed lidl NAME ever starts with 4+ digits). Same-content
+                // ⇒ decide by quality density either way.
+                const barcodeFused = (t: string): boolean => /^[\d/]{4,}/.test(t.trim());
                 if (boxIsMidContained) {
-                    dupAction = { kind: 'drop', idx: di };
+                    if (tailSim(boxNorm, seenNorm) >= 0.55 || barcodeFused(seenText)) {
+                        dupAction = qDensity(boxText) > qDensity(seenText)
+                            ? { kind: 'replace', idx: di } : { kind: 'drop', idx: di };
+                    } else {
+                        dupAction = { kind: 'drop', idx: di };
+                    }
                     break;
                 }
                 // Mirror: seen contained inside box.
@@ -1174,9 +1560,14 @@ const mergeRowFragmentsLidlIosOrdered = (rawLines: LidlLine[]): LidlLine[] => {
                 const seenIsMidContained =
                     seenLeftOffset > 50 &&
                     seenRightOverhang < 20 &&
-                    seenW < boxW * 0.7;
+                    seenW < boxW * 0.85;
                 if (seenIsMidContained) {
-                    dupAction = { kind: 'replace', idx: di };
+                    if (tailSim(seenNorm, boxNorm) >= 0.55 || barcodeFused(boxText)) {
+                        dupAction = qDensity(boxText) > qDensity(seenText)
+                            ? { kind: 'replace', idx: di } : { kind: 'drop', idx: di };
+                    } else {
+                        dupAction = { kind: 'replace', idx: di };
+                    }
                     break;
                 }
 
@@ -1263,10 +1654,12 @@ const mergeRowFragmentsLidlIosOrdered = (rawLines: LidlLine[]): LidlLine[] => {
             }
         }
 
-        const ordered = deduped.slice().sort((a, b) => a.xLeft - b.xLeft);
+        const ordered = order === 'xleft'
+            ? deduped.slice().sort((a, b) => a.xLeft - b.xLeft)
+            : deduped;
         out.push({
             text: ordered
-                .map((l) => l.text.trim())
+                .map((l) => foldParen(l.text.trim()))
                 .filter(Boolean)
                 .join(' ')
                 .replace(/\s+/g, ' ')
@@ -1629,16 +2022,32 @@ const computeBandsContextLidlV2 = (
             label: 'nr',
         });
     }
+    // Datetime band: clean combined `YYYY-MM-DD HH:MM` line first; fall
+    // back to any footer line carrying an OCR-tolerant date (doubled/
+    // dotted separators) so the band still renders when the printed
+    // datetime is garbled but recoverable (see DATE_TOLERANT_RE).
+    let dtBandLine: LidlLine | null = null;
     for (const line of footerSlice) {
         if (/(\d{4}-\d{2}-\d{2})\s+(\d{1,2}:\d{2})/.test(line.text)) {
-            bands.push({
-                kind: 'datetime',
-                yTop: line.yTop,
-                yBottom: line.yBottom,
-                label: 'date',
-            });
+            dtBandLine = line;
             break;
         }
+    }
+    if (!dtBandLine) {
+        for (const line of footerSlice) {
+            if (DATE_TOLERANT_RE.test(line.text.trim())) {
+                dtBandLine = line;
+                break;
+            }
+        }
+    }
+    if (dtBandLine) {
+        bands.push({
+            kind: 'datetime',
+            yTop: dtBandLine.yTop,
+            yBottom: dtBandLine.yBottom,
+            label: 'date',
+        });
     }
     // Total band — prefer `Mokėti` (final amount paid) over
     // `Tarpinė suma` (subtotal before discounts/redemptions). On
@@ -1793,7 +2202,30 @@ export function extractLidlProduct(internal: LidlBandInternal): LidlExtractResul
     let unit = 'vnt';
     let pricePerUnit: number | null = null;
     let promoPrice: number | null = null;
+    // kg-signal tracking for the weighed price-poisoning guard.
+    //   weighed     — ANY surviving kg signal: clean unit line, split
+    //                 tail half, Cat X lenient tail, orphan `€/kg`, or
+    //                 a 3-decimal "N,NNN kg" weight inside a name line.
+    //   kgQtyKnown  — a usable kg quantity was actually parsed. This
+    //                 distinguishes a REAL "1,000 kg" (total == €/kg,
+    //                 fine) from the DEFAULT quantity=1 of a weighed
+    //                 line whose numbers all rotted (poisoning case).
+    //   unitResolved — an explicit unit line decided kg-vs-vnt; blocks
+    //                 the weaker in-name weight signal from overriding.
+    let weighed = false;
+    let kgQtyKnown = false;
+    let unitResolved = false;
     const nameLines: string[] = [];
+    // Discount plausibility clamp (IKI idiom): a discount can never
+    // exceed the line total — a negative paid means the discount was
+    // OCR-inflated or mis-attributed. DROP the promo (keep the base
+    // price) rather than ship a negative/implausible promo price.
+    const applyDiscount = (text: string) => {
+        const d = extractDiscountAmount(text);
+        if (d === null || promoPrice !== null || d <= 0) return;
+        const paid = Math.round((price - d) * 100) / 100;
+        if (paid >= 0) promoPrice = paid;
+    };
 
     // preName walk: collect the product name and detect the
     // multi-buy / weighable unit-line. Lidl's UNIT_LINE_RE shape
@@ -1810,12 +2242,9 @@ export function extractLidlProduct(internal: LidlBandInternal): LidlExtractResul
         if (PRICE_DEPOSIT_RE.test(text)) continue;
         // Discount fragment that y-sorted ahead of the name (rare
         // for Lidl; the usual position is postAnchor). Capture
-        // promo if it's the first one seen.
+        // promo if it's the first one seen (plausibility-clamped).
         if (DISCOUNT_HEADER_RE.test(text) || DISCOUNT_RE.test(text)) {
-            const d = extractDiscountAmount(text);
-            if (d !== null && promoPrice === null) {
-                promoPrice = Math.round((price - d) * 100) / 100;
-            }
+            applyDiscount(text);
             continue;
         }
         // Product unit-line: `<ppu> x <qty> <unit>`. Captures qty
@@ -1828,13 +2257,121 @@ export function extractLidlProduct(internal: LidlBandInternal): LidlExtractResul
             }
             quantity = parseNum(unitMatch[2]);
             unit = /kg/i.test(unitMatch[3] || '') ? 'kg' : 'vnt';
+            unitResolved = true;
+            if (unit === 'kg') {
+                weighed = true;
+                kgQtyKnown = quantity > 0;
+            }
             continue;
         }
+        // OCR-split unit-line halves. The band walk already recognises
+        // them ('unit' reason) but extraction used to drop them into
+        // the NAME — losing the qty and, for weighables, the whole kg
+        // signal. Head `0,59 x` carries the per-unit price; tail
+        // `4,032 kg` / `2,000 €/vnt.` carries qty + unit. A kg tail
+        // must carry the weighed 3-decimal fraction so a packaged size
+        // fragment ("1 kg") can never flip a per-piece product.
+        const headMatch = text.match(UNIT_HEAD_RE);
+        if (headMatch) {
+            if (pricePerUnit === null) pricePerUnit = parseNum(headMatch[1]);
+            continue;
+        }
+        const tailMatch = text.match(UNIT_TAIL_RE);
+        if (tailMatch) {
+            const isKg = /kg/i.test(tailMatch[2]);
+            if (!isKg || KG_WEIGHED_QTY_RE.test(text)) {
+                const q = parseNum(tailMatch[1]);
+                if (q > 0) quantity = q;
+                unitResolved = true;
+                if (isKg) {
+                    unit = 'kg';
+                    weighed = true;
+                    kgQtyKnown = q > 0;
+                }
+                continue;
+            }
+            // kg tail WITHOUT the weighed fraction — likely a packaged
+            // size fragment; fall through to the name path unchanged.
+        }
+        // Cat HH — unit line whose `€/vnt.`/`kg` suffix was lost or
+        // mashed with the next row's text ("0,35 x 10,000yimo
+        // spaustuvai 4"): capture ppu + qty from the leading
+        // `N,NN x N,NNN` and drop the trailing garbage instead of
+        // leaking the whole string into the name.
+        const lenientMatch = text.match(UNIT_LENIENT_RE);
+        if (lenientMatch) {
+            if (pricePerUnit === null) pricePerUnit = parseNum(lenientMatch[1]);
+            const q = parseNum(lenientMatch[2]);
+            if (q > 0) quantity = q;
+            continue;
+        }
+        // Cat X — weighable tail with a garbled PREFIX ("CEoX 0,343
+        // kg"): the x-marker + weight tail survive even when the
+        // leading €/kg rotted. Same 3-decimal gate as the tail half.
+        const weightLenient = text.match(UNIT_WEIGHT_LENIENT_RE);
+        if (weightLenient) {
+            const isKg = /kg/i.test(weightLenient[2]);
+            if (!isKg || KG_WEIGHED_QTY_RE.test(text)) {
+                const q = parseNum(weightLenient[1]);
+                if (q > 0) quantity = q;
+                unitResolved = true;
+                if (isKg) {
+                    unit = 'kg';
+                    weighed = true;
+                    kgQtyKnown = q > 0;
+                }
+                // MASHED name+calc row ("Arbūzai mažai sėklų 0,59 х 4,032
+                // kg"): the calc is at the END, but there's real NAME text
+                // before it — strip only the "[ppu] × qty kg" tail and keep
+                // the name instead of consuming the whole line (which lost
+                // the name → product skipped). A pure calc line ("0,59 х
+                // 4,032 kg") has no leading letters, so it's fully consumed
+                // as before.
+                const nameHead = text
+                    .replace(new RegExp(`\\s*(?:\\d+[.,_]\\s?${D}{1,2}\\s*)?[>|]?\\s*[${X_MARK}]{1,2}\\s*\\d+[.,_]\\s?${D}{3}\\s*kg\\s*$`, 'i'), '')
+                    .trim();
+                if (/[A-Za-zĄČĘĖĮŠŲŪŽąčęėįšųūž]{3,}/.test(nameHead)) {
+                    nameLines.push(nameHead);
+                }
+                continue;
+            }
+        }
         // Bare unit-fragment (`€/vnt.` alone) and pure-barcode
-        // lines — neither contributes to the name.
-        if (UNIT_ORPHAN_RE.test(text)) continue;
+        // lines — neither contributes to the name. An orphan `€/kg`
+        // is additionally a kg SIGNAL: the weighed row's numbers all
+        // dropped, so weighed-ness must be flagged here or the line
+        // total (a fraction of a kg) poisons the €/kg reference.
+        if (UNIT_ORPHAN_RE.test(text)) {
+            if (/kg/i.test(text) && !unitResolved) {
+                weighed = true;
+                unit = 'kg';
+            }
+            continue;
+        }
         if (BARCODE_ONLY_RE.test(text)) continue;
+        // Lenient price-like fragment (".99", "O, 90 A", ",29 A") —
+        // an OCR-mangled price that lost its anchor shape. It can't
+        // rescue a lost anchor on its own, but it must not pollute
+        // the product name either.
+        if (PRICE_LIKE_RE.test(text)) continue;
 
+        // kg-signal that survives unit-line garble: a weighed
+        // 3-decimal weight ("0,343 kg") embedded in a line that reads
+        // as name text (the unit line mashed into the name / too
+        // rotted for the unit regexes). Signal + qty only — the text
+        // still contributes to the name so nothing visible is lost.
+        if (!unitResolved) {
+            const wm = text.match(KG_WEIGHED_QTY_RE);
+            if (wm) {
+                weighed = true;
+                unit = 'kg';
+                const q = parseNum(wm[1]);
+                if (q > 0 && !kgQtyKnown) {
+                    quantity = q;
+                    kgQtyKnown = true;
+                }
+            }
+        }
         nameLines.push(text);
     }
 
@@ -1847,11 +2384,19 @@ export function extractLidlProduct(internal: LidlBandInternal): LidlExtractResul
         if (DEPOSIT_RETURN_RE.test(text)) continue;
         if (NEGATIVE_DEPOSIT_PRICE_RE.test(text)) continue;
         if (DISCOUNT_HEADER_RE.test(text) || DISCOUNT_RE.test(text)) {
-            const d = extractDiscountAmount(text);
-            if (d !== null && promoPrice === null) {
-                promoPrice = Math.round((price - d) * 100) / 100;
-            }
+            applyDiscount(text);
             continue;
+        }
+        // Multipack count from the deposit cluster: adopt "(N x M)" as the
+        // quantity when the product line carried no unit-line qty (a beer
+        // 4-pack — the "4x0,568" name spec is count×volume, not a price
+        // multibuy). Guard: deposit-shaped line, no qty resolved yet.
+        if (!unitResolved && quantity === 1 && DEPOSIT_RE.test(text)) {
+            const dm = text.match(DEPOSIT_COUNT_RE);
+            if (dm) {
+                const n = parseInt(dm[1], 10);
+                if (n >= 2 && n <= 99) quantity = n;
+            }
         }
         // Deposit name + bare deposit-price + deposit unit-line —
         // present in the band for visual completeness but contribute
@@ -1865,10 +2410,28 @@ export function extractLidlProduct(internal: LidlBandInternal): LidlExtractResul
     let head = nameLines.join(' ').replace(/\s+/g, ' ').trim();
     head = stripBarcodePrefix(head);
     head = head.replace(new RegExp(`\\s+${BC}{4,10}\\s*$`), '').trim();
+    // Strip a trailing weighable CALC that OCR mashed onto the name row
+    // ("Arbuzai mažai sėklu 0,59 х 4,032 kg" → "Arbuzai mažai sėklu"). The
+    // qty/€kg were already read off it above; leaving the "ppu × qty kg"
+    // tail in the display name is pure duplication. Anchored to the end and
+    // requires the 3-decimal weighed qty + kg so a real "…, 1kg" pack size
+    // is untouched.
+    head = head
+        .replace(
+            new RegExp(`\\s*(?:\\d+[.,_]\\s?${D}{1,2}\\s*)?[>|]?\\s*[${X_MARK}]{1,2}\\s*\\d+[.,_]\\s?${D}{3}\\s*kg\\s*$`, 'i'),
+            '',
+        )
+        .trim();
     const name = head;
 
     if (!name) {
         return { product: null, warnings: ['skip:no-name'] };
+    }
+    // Pure separator/punctuation "name" — the dashes row Lidl prints just
+    // above "Tarpinė suma" got paired with the total (3,47) into a phantom
+    // product (08.29 "----"). No letter or digit → not a product.
+    if (!/[A-Za-zĄČĘĖĮŠŲŪŽąčęėįšųūž0-9]/.test(name)) {
+        return { product: null, warnings: [`skip:separator "${name.slice(0, 20)}"`] };
     }
     if (NON_CATALOG_RE.test(name)) {
         return {
@@ -1895,14 +2458,33 @@ export function extractLidlProduct(internal: LidlBandInternal): LidlExtractResul
         ...internal.postAnchor.map((e) => e.line),
     ];
 
+    // PRICE-POISONING GUARD ("show it, never write price" — IKI idiom):
+    // a WEIGHED line (kg signal seen) whose €/kg is unrecoverable — no
+    // per-kg price survived AND no kg quantity to derive one from
+    // (total ÷ kg). The anchor total covers a FRACTION of a kg, so
+    // emitting it as the price would let the server write it as the
+    // per-kg reference. Emit price=0 / pricePerUnit=null instead — the
+    // server skips price<=0 writes; the item still SHOWS on the receipt
+    // (unit 'kg', isWeighable true).
+    const weighedNoPpu = weighed && pricePerUnit === null && !kgQtyKnown;
+    if (weighedNoPpu) warnings.push(`weighed-no-ppu "${name.slice(0, 40)}"`);
+
     return {
         product: {
             name,
-            price,
-            promoPrice,
-            quantity,
+            price: weighedNoPpu ? 0 : price,
+            promoPrice: weighedNoPpu ? null : promoPrice,
+            quantity: weighedNoPpu ? 1 : quantity,
             unit,
             pricePerUnit,
+            // Emitted on EVERY product (true = sold by weight) so the
+            // server resolver can gate weighable-vs-packaged matching.
+            isWeighable: unit === 'kg',
+            // Weighable → 1 kg reference (rimiParser parity). Lets the
+            // receipt render "1 kg" and the matcher prefer the weighable
+            // SP; null for per-piece lines.
+            parsedAmount: unit === 'kg' ? 1 : null,
+            parsedUnit: unit === 'kg' ? 'kg' : null,
             rawLines: allLines.map((l) => l.text),
             region: regionOf(allLines),
         },
