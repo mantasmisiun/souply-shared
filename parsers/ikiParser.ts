@@ -776,14 +776,17 @@ const foldDateDigits = (s: string): string =>
 // space after a colon ("19:36: 13" → time lost before, receipt-221).
 const T_TIME_RE = /(\d{2})[:.\-]\s*(\d{2})\s*:\s*(\d{2})/;
 // "Kvito" itself rots heavily on IKI thermal: the K→A and v→o/u/y swaps give "Koito"/"AVito"
-// (receipt-198) and "Kyito" (receipt-199), so the stem is [KA][vouy]ito. The mandatory "Nr"/"numer"
+// (receipt-198) and "Kyito" (receipt-199); Vision additionally reads the K as "<"/"‹"
+// ("<vito Nr. 24/626/117680", staging r189 — the miss that let a duplicate through as a
+// synthetic-only row), so the stem is [KA<‹][vouy]it[ao]?[son]?. The mandatory "Nr"/"numer"
 // context (and the captured digits) keeps it from matching the other "Kvito …" lines (kodas/parašas).
 // Label tolerates BOTH inflections — "Kvito Nr." and the older "Kvitas Nr."
-// (receipt-401: the Kvitas form fell through to the synthetic id). The capture
+// (receipt-401: the Kvitas form fell through to the synthetic id) plus the trailing-vowel
+// rot "Kvitn" (r189's VMI line). The capture
 // starts at a DIGIT and follows the slashed multi-part id across single spaces
 // around slashes ("529 /62A/22A416", r383) and digit-shaped letter garbles
 // inside groups ("RASA0", r390) — healSlashedReceiptId() normalizes after.
-const T_RECEIPTNO_RE = /[KA][vouy]ita?[so]?\s+Nr?[.,]?\s*([0-9][0-9A-Za-z]*(?:\s?\/\s?[0-9A-Za-z]+)*)/i;   // OCR reads "Nr." / "Nr," / "N." (dropped r)
+const T_RECEIPTNO_RE = /[KA<‹][vouy]it[ao]?[son]?\s+Nr?[.,]?\s*([0-9][0-9A-Za-z]*(?:\s?\/\s?[0-9A-Za-z]+)*)/i;   // OCR reads "Nr." / "Nr," / "N." (dropped r)
 // REVERSED form: Apple Vision splits the printed row into an id box and a label
 // box, and the row merge x-interleaves them id-FIRST ("27/616/115706 Kaca 0022
 // Kvito Nr.", receipts 383/393/394 on iOS). A slashed multi-part id (≥2 groups —
@@ -797,7 +800,7 @@ const T_KVITAS_RE = /\bKvitas[\s.:]*(\d{3,6})\b/i;
 // A THIRD IKI identifier — "Kvito numeris 104148" in the VMI footer block (the sequence number,
 // an INDEPENDENT OCR read of the tail of "Kvito Nr."). OCR splits "numeris" → "numer i s", so the
 // stem is tolerant. Captured for the receiptNos array + its own band; never the canonical id.
-const T_KVITONUM_RE = /[KA][vouyx]ito\s+numer[a-z]*\s*i?\s*s?\s*[:.]?\s*([0-9/]{4,})/i;   // [vouyx]: Vision reads the v as x ("Kxito numeris", r387/iOS)
+const T_KVITONUM_RE = /[KA<‹][vouyx]it[oan]?\s+numer[a-z]*\s*i?\s*s?\s*[:.]?\s*([0-9/]{4,})/i;   // [vouyx]: v→x ("Kxito", r387/iOS); [oan]?: o→n ("Kvitn numer is", staging r189); [KA<‹]: K→</‹ (Vision)
 // Canonical total line, amount on EITHER side of SUMA — OCR flips the order:
 // "SUMA 26,52 EUR" and "26,52 EUR SUMA" both seen. Requires EUR so the multi-
 // column VAT header ("…Suma su PVM Be PVM…") with no EUR can't false-match.
