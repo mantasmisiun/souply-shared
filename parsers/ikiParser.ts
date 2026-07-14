@@ -4341,9 +4341,20 @@ function parseIkiThermal(lines: IkiLine[]): IkiParseResult {
       segmentWitness = [...segs.slice(0, -1), kvitoNumVal].join('/');
     }
   }
+  // SYNTHETIC-ID WITNESS: the date+time+total synthetic id is ALWAYS added as an extra
+  // dedup witness — even when a printed identifier WAS captured. A scan that loses the
+  // printed number falls back to the synthetic as its ONLY id; without this witness, a
+  // second scan of the same receipt that DOES capture the printed number shares no
+  // identifier with the first row and the duplicate sails through (iOS lost the Kvito
+  // Nr., Android read it → two rows). The synthetic is deterministic from the printed
+  // date/time/total, so both scans derive the same witness and the overlap-based check
+  // (getReceiptByAnyReceiptNoAndUser) catches the pair in either scan order.
+  const syntheticWitness = (date && time && total !== null)
+    ? `${date.replace(/-/g, '')}-${time.replace(/:/g, '')}-${Math.round(total * 100)}-iki-receipt`
+    : '';
   // Array: canonical first, then any other distinct identifier (dedupe, keep order). Falls back to
   // just the canonical (incl. the synthetic id) when no printed identifier survived OCR.
-  const receiptNos = [...new Set([rnVal, kvitoVal, kvitoNumVal, kvitasVal, segmentWitness].filter(Boolean))];
+  const receiptNos = [...new Set([rnVal, kvitoVal, kvitoNumVal, kvitasVal, segmentWitness, syntheticWitness].filter(Boolean))];
   if (receiptNos.length === 0 && receiptNo) receiptNos.push(receiptNo);
   footerRegions.sort((a, b) => a.yTop - b.yTop);
 
