@@ -2471,8 +2471,17 @@ export function parseIkiColumnar(lines: IkiLine[], start: number, end: number, s
     // name with no word box). Attach the value to the open product BEFORE this name
     // boundary flushes it. Guarded to an open product that already has a total so a
     // stray leading-row minus can't invent a discount. (receipt-99 RAUDONOSIOS/POMIDORAI.)
+    // DEDUP (receipt-117 salmon): the fused trailDisc is the SAME physical discount as
+    // one the open product already captured on its OWN row — OCR glued the "-7,48" onto
+    // the next name (trailDisc) AND the word-boxed "-7,48 A" was re-homed to the product's
+    // own "SU KORTELE" row (a real discount row). Applying both double-counts it (18.15 −
+    // 7.48 − 7.48 → promo 2,99 instead of 9,99). If the open product ALREADY has a discount
+    // row equal to this trailDisc, it's that same amount duplicated → don't re-apply. A
+    // GENUINE fused discount (receipt-109: the discount exists ONLY as the glued trailDisc,
+    // no own row) has no matching row, so it still attaches.
+    const trailDupOfOwnDisc = cur.rows.some((pr) => pr.discount > 0 && Math.abs(pr.discount - r.trailDisc) < 0.005);
     if (
-      r.trailDisc > 0 && cur.top != null && cur.total != null &&
+      r.trailDisc > 0 && cur.top != null && cur.total != null && !trailDupOfOwnDisc &&
       // PLAUSIBILITY GUARD (user rule): a discount can't exceed the item's own total, so
       // a lost discount only belongs to the open previous product when that product's net
       // stays non-negative (gross − already-applied − this ≥ 0). The salmon takes the
