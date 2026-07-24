@@ -1774,24 +1774,38 @@ function ikiClassifyRow(ws: EWord[], lines: IkiLine[]): ERow {
   // row then carries its OWN total + discount (selfDisc, not trailDisc — it must not leak
   // to the previous product). Receipt reconciliation corroborates downstream.
   if (!/EUR\s*\/|\bvnt\b|\bkg\b/i.test(text)) {
-    const toks = text.split(/\s+/).filter(Boolean);
-    const amounts: number[] = [];
-    const heads: string[] = [];
+    // Walk the WORDS (not the joined text) so each amount carries its own Y — needed for the
+    // same-row guard below. Word texts are single tokens, so this matches the old token split.
+    const amounts: { v: number; yc: number }[] = [];
+    const heads: { t: string; yc: number }[] = [];
     let vatSeen = 0; let bad = false;
     const nameToks: string[] = [];
-    for (const t of toks) {
-      if (/^-?\d{1,4}[.,]\d{1,2}$/.test(t)) { amounts.push(parseNum(t)); continue; }
-      if (/^-?\d{1,4}[.,]$/.test(t)) { if (heads.length >= 2) { bad = true; break; } heads.push(t); continue; }
-      if (/^\d{2}$/.test(t) && heads.length) { amounts.push(parseNum(heads.shift()! + t)); continue; }
+    for (const w of ws) {
+      const t = w.text.trim();
+      const yc = (w.yTop + w.yBottom) / 2;
+      if (/^-?\d{1,4}[.,]\d{1,2}$/.test(t)) { amounts.push({ v: parseNum(t), yc }); continue; }
+      if (/^-?\d{1,4}[.,]$/.test(t)) { if (heads.length >= 2) { bad = true; break; } heads.push({ t, yc }); continue; }
+      if (/^\d{2}$/.test(t) && heads.length) { const h = heads.shift()!; amounts.push({ v: parseNum(h.t + t), yc: (h.yc + yc) / 2 }); continue; }
       if (/^[ABC]$/.test(t)) { vatSeen++; continue; }
       nameToks.push(t);
     }
-    const pos = amounts.filter((v) => v > 0);
-    const neg = amounts.filter((v) => v < 0);
+    const pos = amounts.filter((a) => a.v > 0);
+    const neg = amounts.filter((a) => a.v < 0);
     const soupName = nameToks.join(' ');
+    // OWN-DISCOUNT GUARD (receipt-118 KETO vs receipt-161 LAVAZZA): IKI prints a product's card
+    // discount on the line BELOW its price, so in a genuine soup row (OCR merged name+price+discount)
+    // the negative sits AT or BELOW the positive total. When the negative is a whole row ABOVE the
+    // positive, it's the PREVIOUS product's discount SHEARED DOWN onto this product's name row
+    // (MAGIJA #2's -0,26 landing ~31px above KETO's own 2,59). Keep the total either way, but when the
+    // negative is above, it isn't THIS product's own — hand it to the PREVIOUS product as a trailDisc
+    // (deduped there against its own discount row) instead of minting a phantom promo here.
+    const wh = emedian(ws.map((w) => w.yBottom - w.yTop)) || 40;
     if (!bad && heads.length === 0 && pos.length === 1 && neg.length === 1 && vatSeen >= 1 &&
-        pos[0] + neg[0] >= -0.005 && ikiStrongName(soupName) && !isTDiscount(soupName)) {
-      return { ...base, total: pos[0], selfDisc: Math.abs(neg[0]), leftText: soupName };
+        pos[0].v + neg[0].v >= -0.005 && ikiStrongName(soupName) && !isTDiscount(soupName)) {
+      const negAbove = pos[0].yc - neg[0].yc > wh * 0.5;
+      return negAbove
+        ? { ...base, total: pos[0].v, trailDisc: Math.abs(neg[0].v), leftText: soupName }
+        : { ...base, total: pos[0].v, selfDisc: Math.abs(neg[0].v), leftText: soupName };
     }
   }
   // PRICE-SHAPED but UNREADABLE decimals ("3, 4: A" — ':' resolves to no digit): every value
@@ -2124,30 +2138,48 @@ function enforceTileSeamsBy(items: Array<{ top: number; region: Region }>): void
 }
 
 // Tile PRODUCTS + SKIPPED bands into ONE seam-to-seam partition in DE-SKEWED space, then re-skew
-// every band to the single receipt tilt `g`. Each item carries its de-skewed content extent
-// [dt, db] (computed from its own words / box, NOT the possibly-inflated band edges). The seam
-// between consecutive items (sorted by content-top) is max(upper.db, lower.dt):
-//   • upper.db  → the upper band NEVER loses its own rows. The receipt-142 case: a weighed
+// every band to the single receipt tilt `g`. Each item carries its de-skewed content extent PER
+// COLUMN — [dtL,dbL] from its LEFT-column words (the name), [dtR,dbR] from its RIGHT-column words
+// (price / discount). The seam between consecutive items (sorted by name-top) is computed for the
+// left and right channels INDEPENDENTLY, each = max(upper.dbX, lower.dtX):
+//   • upper.dbX → the upper band NEVER loses its own rows. The receipt-142 case: a weighed
 //     product's price ("3,87 A") OCR-landed on the next coupon's row, so the product's content
 //     extends BELOW the coupon's top; the band must still reach that price, not be cut at the
 //     coupon and let the grey skip band "abduct" it.
-//   • lower.dt  → the lower band isn't cut into.
+//   • lower.dtX → the lower band isn't cut into.
 //   • the max of the two → no gap, no overlap.
-// Re-skewing both edges at `g` makes EVERY band — incl. the grey skipped ones — a parallelogram
-// that BENDS with the receipt, exactly like the product bands (fixes flat skip bands). When the
-// seam pushes an item's top past its own bottom (its content was fully claimed by the band
-// above), it collapses to a thin sliver at the seam rather than inverting.
-function tileByContent(items: Array<{ dt: number; db: number; region: Region }>, g: number, x0: number, x1: number): void {
-  const tile = items.filter((it) => !!it.region && it.db > it.dt).sort((a, b) => a.dt - b.dt);
+// WHY per column (receipt-118): a sheared receipt interleaves columns — an upper product's
+// right-column price/discount ("-4,50 A") AND its own left/mid-column discount LABEL ("Nuolaida su
+// kortele") both sit BELOW the next product's left-column NAME. A single content extent (max over
+// BOTH columns) tilted to both corners drags the upper band's bottom-LEFT down across that name,
+// clipping the next product's first word. Seaming each column on its OWN content, PLUS one rule —
+//   • RIGHT channel: seam = max(upper.dbR, lower.dtR) — never cut, so the upper band keeps its
+//     price/discount VALUES (prices are always right-column in IKI). receipt-142 preserved.
+//   • LEFT channel: when the LOWER item is a PRODUCT, its NAME-top wins outright (seam = lower.dtL)
+//     — the only left-column content an upper band has below its own name is a disposable discount
+//     LABEL, never a value, so cutting it from the crop is fine and a name is NEVER clipped. When
+//     the lower is a SKIP (coupon/bag — no name to protect), fall back to max() so the upper still
+//     never loses a price that OCR-landed on the skip's row (receipt-142).
+// On a clean, un-sheared receipt lower.dtL already sits below upper.dbL, so max() and "lower wins"
+// agree and this is identical to the old single-extent tiling.
+// Re-skewing each edge at `g` makes EVERY band — incl. the grey skipped ones — bend with the
+// receipt (fixes flat skip bands). When a seam pushes a column's top past its own bottom (its
+// content was fully claimed by the band above), it collapses to a sliver rather than inverting.
+function tileByContent(items: Array<{ dt: number; db: number; dtL: number; dbL: number; dtR: number; dbR: number; isSkip: boolean; region: Region }>, g: number, x0: number, x1: number): void {
+  // ONE ordering (by left-column name-top = reading order) so a product's left and right edges
+  // always tile to the SAME neighbour — the two channels differ only in seam VALUE, never order.
+  const tile = items.filter((it) => !!it.region && it.db > it.dt).sort((a, b) => a.dtL - b.dtL);
   for (let i = 1; i < tile.length; i++) {
-    const seam = Math.max(tile[i - 1].db, tile[i].dt);
-    tile[i - 1].db = seam;
-    tile[i].dt = Math.min(seam, tile[i].db);   // never invert: clamp top at this item's own bottom
+    // LEFT: a lower PRODUCT's name-top wins outright; a lower SKIP keeps max() (receipt-142).
+    const seamL = tile[i].isSkip ? Math.max(tile[i - 1].dbL, tile[i].dtL) : tile[i].dtL;
+    tile[i - 1].dbL = seamL; tile[i].dtL = Math.min(seamL, tile[i].dbL);   // never invert
+    const seamR = Math.max(tile[i - 1].dbR, tile[i].dtR);
+    tile[i - 1].dbR = seamR; tile[i].dtR = Math.min(seamR, tile[i].dbR);
   }
   for (const it of tile) {
     const r = it.region;
-    r.yLeftTop = it.dt + g * x0; r.yRightTop = it.dt + g * x1;
-    r.yLeftBottom = it.db + g * x0; r.yRightBottom = it.db + g * x1;
+    r.yLeftTop = it.dtL + g * x0; r.yRightTop = it.dtR + g * x1;
+    r.yLeftBottom = it.dbL + g * x0; r.yRightBottom = it.dbR + g * x1;
     r.yTop = Math.min(r.yLeftTop, r.yRightTop);
     r.yBottom = Math.max(r.yLeftBottom, r.yRightBottom);
     r.xLeft = x0; r.xRight = x1;
@@ -3066,14 +3098,22 @@ export function parseIkiColumnar(lines: IkiLine[], start: number, end: number, s
     const prodRegions = metas.map((m) => m.o.p.region).filter((r): r is Region => !!r);
     const sx0 = Math.min(...prodRegions.map((r) => r.xLeft), ...skipped.map((r) => r.xLeft));
     const sx1 = Math.max(...prodRegions.map((r) => r.xRight), ...skipped.map((r) => r.xRight));
-    const items: Array<{ dt: number; db: number; region: Region }> = [
+    const items: Array<{ dt: number; db: number; dtL: number; dbL: number; dtR: number; dbR: number; isSkip: boolean; region: Region }> = [
       ...metas.filter((m) => !!m.o.p.region).map((m) => {
         const ws = m.o.rows.flatMap((r) => r.words);
-        return { dt: Math.min(...ws.map(dT)), db: Math.max(...ws.map(dB)), region: m.o.p.region! };
+        const dt = Math.min(...ws.map(dT)), db = Math.max(...ws.map(dB));
+        // Split the product's OWN words into columns (names left, prices/discounts right) so each
+        // band edge seams on its own column — see tileByContent. Empty column → fall back to the
+        // overall extent (a name-only or price-only line still tiles sanely).
+        const lw = ws.filter((w) => cx(w) < Xmid), rw = ws.filter((w) => cx(w) >= Xmid);
+        const dtL = lw.length ? Math.min(...lw.map(dT)) : dt, dbL = lw.length ? Math.max(...lw.map(dB)) : db;
+        const dtR = rw.length ? Math.min(...rw.map(dT)) : dt, dbR = rw.length ? Math.max(...rw.map(dB)) : db;
+        return { dt, db, dtL, dbL, dtR, dbR, isSkip: false, region: m.o.p.region! };
       }),
       ...skipped.map((r) => {
         const cxr = (r.xLeft + r.xRight) / 2;                       // de-skew the box about its own centre
-        return { dt: (r.yLeftTop ?? r.yTop) - g * cxr, db: (r.yLeftBottom ?? r.yBottom) - g * cxr, region: r };
+        const dt = (r.yLeftTop ?? r.yTop) - g * cxr, db = (r.yLeftBottom ?? r.yBottom) - g * cxr;
+        return { dt, db, dtL: dt, dbL: db, dtR: dt, dbR: db, isSkip: true, region: r };   // a box has no columns
       }),
     ];
     tileByContent(items, g, sx0, sx1);
