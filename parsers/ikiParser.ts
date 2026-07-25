@@ -125,6 +125,13 @@ export interface IkiFooter {
    *  onto products (which product(s) form the bundle is unknown — distributing would poison
    *  per-product reference prices). Additive field — old consumers ignore it. */
   comboDiscount: number | null;
+  /** Indices (into `products`) of the lines the set-deal was printed UNDER —
+   *  IKI prints RINKINYS directly beneath the items that earned it, so this says
+   *  WHICH lines the deal belongs to. Empty when the position couldn't be
+   *  resolved; consumers then fall back to their own heuristic. DISPLAY ONLY —
+   *  the discount is still a footer-level adjustment and is never folded into a
+   *  line's price (see comboDiscount above). */
+  comboDiscountAnchors: number[];
   /** Phase-2 receipt reconciliation: true = Σ line-paids + dropped charges − combo equals the
    *  printed total to the cent (prices corroborated); false = the books don't balance or an
    *  unknown couldn't be pinned (honest flag); undefined = not checked (legacy engine /
@@ -612,6 +619,7 @@ function parseFooter(lines: IkiLine[]): IkiFooter {
     receiptNos: [],
     totalSavings,
     comboDiscount: null,
+    comboDiscountAnchors: [],
     rawText: lines.map((l) => l.text).join("\n"),
     region: regionOf(lines),
     lineRegions,
@@ -2186,7 +2194,7 @@ function tileByContent(items: Array<{ dt: number; db: number; dtL: number; dbL: 
   }
 }
 
-export function parseIkiColumnar(lines: IkiLine[], start: number, end: number, skipped?: Region[], headerAddr?: string, combo?: { amount: number }, recon?: { adjust: number; orphanDiscs?: Array<{ amount: number; beforeIdx: number }> }): IkiProduct[] {
+export function parseIkiColumnar(lines: IkiLine[], start: number, end: number, skipped?: Region[], headerAddr?: string, combo?: { amount: number; rowYs?: number[] }, recon?: { adjust: number; orphanDiscs?: Array<{ amount: number; beforeIdx: number }> }): IkiProduct[] {
   const words = ikiCollectWords(lines, start, end);
   if (words.length < 2) return [];
   const lineH = emedian(words.map((w) => w.yBottom - w.yTop).filter((h) => h > 0)) || 24;
@@ -2586,7 +2594,7 @@ export function parseIkiColumnar(lines: IkiLine[], start: number, end: number, s
     // guard silently discards it — receipt-229's "IKI most expensive" bug). The row stays
     // visible as a grey skip band.
     if (r.discount > 0 && isIkiComboSetName(r.leftText || '')) {
-      if (combo) combo.amount = round2(combo.amount + r.discount);
+      if (combo) { combo.amount = round2(combo.amount + r.discount); combo.rowYs?.push(r.topY); }
       if (skipped && r.words.length) {
         skipped.push({
           xLeft: Math.min(...r.words.map((w) => w.xLeft)),
@@ -3866,7 +3874,11 @@ function parseIkiThermal(lines: IkiLine[]): IkiParseResult {
   // `combo` accumulates the dropped bare-RINKINYS deal discounts (→ footer.comboDiscount);
   // reset before the fallback engine so a columnar attempt that yielded 0 products can't
   // leave a stale amount behind.
-  const combo = { amount: 0, regions: [] as Region[] };
+  // `rowYs` = the printed Y of each set-deal row. IKI prints RINKINYS directly
+  // UNDER the items it applies to, so this is the only reliable signal for WHICH
+  // lines earned the deal. Captured as a Y (not an index) because products are
+  // re-sorted after assembly — an index taken mid-assembly would not survive.
+  const combo = { amount: 0, regions: [] as Region[], rowYs: [] as number[] };
   // Receipt-reconciliation side-channel: charges/negatives the engine drops from products
   // (deposits, bag charges, IKI Taškais ±, coupons) but the PRINTED TOTAL includes.
   const recon = { adjust: 0, orphanDiscs: [] as Array<{ amount: number; beforeIdx: number }> };
@@ -4612,6 +4624,22 @@ function parseIkiThermal(lines: IkiLine[]): IkiParseResult {
     footer: {
       total, date, time, receiptNo, receiptNos, totalSavings,
       comboDiscount: combo.amount > 0 ? round2(combo.amount) : null,
+      // Each set-deal row → the LAST product that STARTS above it. Anchoring on
+      // region TOPS, not bottoms: product bands are tiled seam-to-seam, so a band
+      // routinely extends down past the RINKINYS row it precedes — matching on
+      // bottoms picked the wrong (much earlier) line. Deduped + ascending.
+      comboDiscountAnchors: (() => {
+        const idx = new Set<number>();
+        for (const y of combo.rowYs) {
+          let best = -1, bestTop = -Infinity;
+          products.forEach((p, i) => {
+            const t = p.region?.yTop;
+            if (t != null && t <= y && t > bestTop) { bestTop = t; best = i; }
+          });
+          if (best >= 0) idx.add(best);
+        }
+        return [...idx].sort((a, b) => a - b);
+      })(),
       reconciled, reconDelta,
       rawText, region: unionOf(footerRegions), lineRegions: footerRegions,
     },
