@@ -1,0 +1,11 @@
+# Extends the built-in rule set rather than replacing it, so new default
+# rules arrive with a gitleaks upgrade instead of needing a copy-paste.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Template files carry placeholders by definition"
+paths = [
+  '''\.env\.(example|sample|template)$''',
+  '''\.gitleaks\.toml$''',
+]
