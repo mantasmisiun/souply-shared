@@ -357,6 +357,26 @@ export const RECOGNITION = {
     fishTimeBudgetMs: 2500,
   },
 
+  // ── List-scoped candidate BOOSTING (listScopedMatcher.fishListScopedCandidates) ──
+  // When a receipt is linked to a shopping list, the list's products become a strong
+  // same-chain hint for the receipt's still-UNLINKED (S2/S3) lines: fish each list
+  // product's same-chain SP, re-score its name against the OCR line at the SAME relaxed
+  // floor the price fisher uses (price.fishMinNameScore), and APPEND survivors to
+  // altMatches flagged `viaList`. Purely ADDITIVE + human-gated: never auto-links, never
+  // filters — an off-list line keeps its normal ladder untouched. A confirm via Card-B
+  // teaches the vocabulary alias so the next receipt matches directly.
+  list: {
+    /** Ranking bonus for a list-anchored candidate when ordering altMatches / picking
+     *  the proposed Card-B (never used for auto-linking). Set EQUAL to price.fishPriceBonus
+     *  (0.2): a planned-list hit and an exact-regular-price hit are both strong same-chain
+     *  corroboration of comparable strength, so neither evidence source should structurally
+     *  dominate the other in the proposal ranking — and either way the user still confirms
+     *  the pick on the swipe card, so the bonus only orders proposals, it never links. */
+    listBonus: 0.2,
+    /** Max list-anchored candidates appended per line (mirrors price.fishMaxPerLine). */
+    fishMaxPerLine: 2,
+  },
+
   // ── Unified per-item confidence score (NEW — computed in priceRound2Matcher) ──
   // Veto-caps-name model: base(name×ocr) + confirmers, then the LOWEST veto cap
   // wins so a strong-but-wrong name can never reach a confirmed band. All
@@ -438,7 +458,16 @@ export const RECOGNITION = {
     mandatoryCrossStore: 1,   // 1 cross-store card (most-expensive qualifying line)
     // Voluntary "Help identify products" flow.
     voluntaryBatchSize: 10,
-    voluntaryReceiptHalf: 5,  // 5 receipt-resolution + 5 receipt-related global
+    voluntaryReceiptHalf: 5,  // slot-2c receipt-orphan backfill depth (K)
+    /**
+     * Comfort cap on receipt-resolution CROP cards (Card-B) in a receipt-scoped
+     * voluntary session. Crops are the highest-value cards (the receipt's own OCR
+     * lines) so they fill FIRST up to this many of the 10 slots; the remainder goes
+     * to the receipt's slot-2 688 rescues, then its slot-1/3 identity cards. Higher
+     * than voluntaryReceiptHalf (5) because a receipt-scoped deck no longer reserves
+     * space for community/global cards — it's relevance-only, so crops can breathe.
+     */
+    voluntaryCropComfortCap: 7,
     /**
      * Relatedness gate (Decision 3) for the voluntary GLOBAL cards: a card is
      * "related to your receipt" only if its product is in a category you bought
@@ -446,6 +475,35 @@ export const RECOGNITION = {
      * Keeps the pool finite + never asks about unbought types (no hair dye).
      */
     relatednessNameFloor: 0.2,
+  },
+  // ── Retake / heal — when to surface the "retake" affordance, and how the
+  //    consensus heal merges a retake against the stored parse
+  //    (souply-api/src/services/receiptHealService.ts). ──────────────────────
+  retake: {
+    /** Surface "retake" when this fraction of lines are UNREADABLE (no usable
+     *  name / price ≤ 0 / priceImplausible / needsHuman). Unmatched-but-clean
+     *  lines don't count — retake fixes OCR quality, not catalogue gaps. */
+    unreadableLineFrac: 0.4,
+    /** …or when this fraction of lines are UNMATCHED. Set high (a strong bad-scan
+     *  signal): in a mature catalogue, most-lines-unmatched almost always means
+     *  garbled OCR, not a receipt full of genuinely-new products. */
+    unmatchedLineFrac: 0.6,
+    /** …or when the line-total sum vs the receipt total is off by more than this
+     *  fraction (missed/misread lines). Either signal trips the banner. */
+    reconcileGapFrac: 0.1,
+    /** Heal alignment: two printed amounts count as the SAME line when within
+     *  this absolute € OR this fraction of the larger. */
+    priceMatchAbsEur: 0.02,
+    priceMatchFrac: 0.02,
+    /** Name similarity (0..1 token overlap) that lifts a price-anchored pair;
+     *  below it the pair leans on price + position alone. */
+    nameSimFloor: 0.34,
+    /** Gap penalty in the sequence alignment (per skipped line) — small enough
+     *  that inserts/deletes at the ends or in runs aren't over-penalised. */
+    alignGapPenalty: 0.5,
+    /** Same-receipt guard: a retake must agree on identity or the heal aborts
+     *  (→ offer full replace). Totals within this fraction count as agreeing. */
+    sameReceiptTotalFrac: 0.15,
   },
   // NB: intentionally NOT `as const` — consumers assign these into plain `number`
   // locals; literal types ('0.6') would reject a later widened assignment. Values
